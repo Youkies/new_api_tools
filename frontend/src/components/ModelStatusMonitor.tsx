@@ -42,11 +42,13 @@ interface ModelStatusMonitorProps {
   isEmbed?: boolean
 }
 
+type VisualStatus = 'idle' | 'green' | 'yellow' | 'red'
+
 const STATUS_COLORS = {
+  idle: 'bg-emerald-200 dark:bg-emerald-900/45',
   green: 'bg-green-500',
   yellow: 'bg-yellow-500',
   red: 'bg-red-500',
-  empty: 'bg-gray-200 dark:bg-gray-700',  // No requests - neutral gray
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -243,6 +245,28 @@ const STATUS_LABELS = {
   red: '异常',
 }
 
+const STATUS_LEGEND = [
+  { status: 'idle' as VisualStatus, label: '无调用', description: '无调用' },
+  { status: 'green' as VisualStatus, label: '正常', description: '有调用且无错误' },
+  { status: 'yellow' as VisualStatus, label: '轻微错误', description: '存在少量错误' },
+  { status: 'red' as VisualStatus, label: '明显异常', description: '错误较多' },
+]
+
+function getStatusLabel(status: VisualStatus) {
+  if (status === 'idle') return '无调用'
+  return STATUS_LABELS[status]
+}
+
+function getModelVisualStatus(model: Pick<ModelStatus, 'total_requests' | 'current_status'>): VisualStatus {
+  if (model.total_requests === 0) return 'idle'
+  return model.current_status
+}
+
+function getSlotVisualStatus(slot: Pick<SlotStatus, 'total_requests' | 'status'>): VisualStatus {
+  if (slot.total_requests === 0) return 'idle'
+  return slot.status
+}
+
 // Time window options
 const TIME_WINDOWS = [
   { value: '1h', label: '1小时', slots: 60 },
@@ -321,7 +345,7 @@ const CUSTOM_ORDER_KEY = 'model_status_custom_order'
 type SortMode = 'default' | 'availability' | 'custom'
 
 // Status filter type
-type StatusFilter = 'all' | 'green' | 'yellow' | 'red'
+type StatusFilter = 'all' | VisualStatus
 
 export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps) {
   const { token } = useAuth()
@@ -733,9 +757,9 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
   // Status counts for overview
   const statusCounts = useMemo(() => {
-    const counts = { green: 0, yellow: 0, red: 0 }
+    const counts: Record<VisualStatus, number> = { idle: 0, green: 0, yellow: 0, red: 0 }
     modelStatuses.forEach(m => {
-      counts[m.current_status]++
+      counts[getModelVisualStatus(m)]++
     })
     return counts
   }, [modelStatuses])
@@ -745,8 +769,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     const counts: Record<string, number> = { all: 0 }
     customGroups.forEach(g => { counts[g.id] = 0 })
     tokenGroups.forEach(g => { counts[`token:${g.group_name}`] = 0 })
-    // Count only models that are actually displayed (with requests > 0)
-    const visibleModels = modelStatuses.filter(m => m.total_requests > 0)
+    const visibleModels = modelStatuses
     counts.all = visibleModels.length
     visibleModels.forEach(m => {
       customGroups.forEach(g => {
@@ -819,7 +842,11 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
     switch (sortMode) {
       case 'availability':
         // Sort by success rate descending
-        result = [...modelStatuses].sort((a, b) => b.success_rate - a.success_rate)
+        result = [...modelStatuses].sort((a, b) => {
+          if (a.total_requests === 0 && b.total_requests > 0) return 1
+          if (b.total_requests === 0 && a.total_requests > 0) return -1
+          return b.success_rate - a.success_rate
+        })
         break
       case 'custom':
         if (customOrder.length === 0) {
@@ -841,9 +868,6 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
         result = modelStatuses
     }
 
-    // Hide models with 0 requests
-    result = result.filter(m => m.total_requests > 0)
-
     // Apply group filter
     if (groupFilter !== 'all') {
       if (groupFilter.startsWith('token:')) {
@@ -864,7 +888,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
 
     // Apply status filter
     if (statusFilter !== 'all') {
-      result = result.filter(m => m.current_status === statusFilter)
+      result = result.filter(m => getModelVisualStatus(m) === statusFilter)
     }
 
     return result
@@ -1012,6 +1036,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                       <span>平均成功率 <span className={cn("font-semibold tabular-nums", avgSuccessRate >= 95 ? 'text-green-600' : avgSuccessRate >= 80 ? 'text-yellow-600' : 'text-red-600')}>{avgSuccessRate}%</span></span>
                       <span className="text-muted-foreground/40">·</span>
                       <span className="flex items-center gap-1.5">
+                        <span className="inline-flex items-center gap-1"><span className={cn("w-2 h-2 rounded-full", STATUS_COLORS.idle)} /><span className="font-medium text-emerald-700 dark:text-emerald-300 tabular-nums">{statusCounts.idle}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-green-500" /><span className="font-medium text-green-600 tabular-nums">{statusCounts.green}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-yellow-500" /><span className="font-medium text-yellow-600 tabular-nums">{statusCounts.yellow}</span></span>
                         <span className="inline-flex items-center gap-1"><span className="w-2 h-2 rounded-full bg-red-500" /><span className="font-medium text-red-600 tabular-nums">{statusCounts.red}</span></span>
@@ -1019,6 +1044,18 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
                     </>
                   )}
                 </p>
+                {modelStatuses.length > 0 && (
+                  <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <span className="font-medium text-foreground/70">图示</span>
+                    {STATUS_LEGEND.map(item => (
+                      <span key={item.status} className="inline-flex items-center gap-1.5 rounded-full border border-border/60 bg-background/60 px-2.5 py-1">
+                        <span className={cn("h-2.5 w-2.5 rounded-full", STATUS_COLORS[item.status])} />
+                        <span>{item.label}</span>
+                        <span className="text-muted-foreground/70">{item.description}</span>
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             <div className="flex items-center gap-3">
               {/* Time Window Selector */}
@@ -1515,7 +1552,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       {showGroupManager && (
         <GroupManagerModal
           groups={customGroups}
-          allModels={modelStatuses.filter(m => m.total_requests > 0).map(m => m.model_name)}
+          allModels={modelStatuses.map(m => m.model_name)}
           onSave={(groups) => {
             saveCustomGroups(groups)
             // Reset filter if the active group was deleted
@@ -1595,7 +1632,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
       )}
 
       {/* Legend */}
-      <Card className="bg-muted/30 border-dashed">
+      <Card className="hidden bg-muted/30 border-dashed">
         <CardContent className="px-4 py-3">
           <div className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs text-muted-foreground">
             <span className="font-medium text-foreground/70">图例</span>
@@ -2250,18 +2287,28 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
   }
 
   const timeLabels = getTimeLabels()
+  const visualStatus = getModelVisualStatus(model)
 
   // Success rate color based on status
-  const rateColorClass = model.current_status === 'green' ? 'text-green-600 dark:text-green-400'
-    : model.current_status === 'yellow' ? 'text-yellow-600 dark:text-yellow-400'
-      : 'text-red-600 dark:text-red-400'
+  const rateColorClass = visualStatus === 'idle' ? 'text-emerald-700 dark:text-emerald-300'
+    : visualStatus === 'green' ? 'text-green-600 dark:text-green-400'
+      : visualStatus === 'yellow' ? 'text-yellow-600 dark:text-yellow-400'
+        : 'text-red-600 dark:text-red-400'
 
   // Card border/bg classes based on status
-  const cardStatusClass = model.current_status === 'red'
+  const cardStatusClass = visualStatus === 'red'
     ? 'border-l-[3px] border-l-red-500 bg-red-500/[0.03]'
-    : model.current_status === 'yellow'
+    : visualStatus === 'yellow'
       ? 'border-l-[3px] border-l-yellow-500 bg-yellow-500/[0.03]'
-      : ''
+      : visualStatus === 'idle'
+        ? 'border-l-[3px] border-l-emerald-300 dark:border-l-emerald-700 bg-emerald-500/[0.04]'
+        : 'border-l-[3px] border-l-green-500 bg-green-500/[0.03]'
+
+  const badgeVariant = visualStatus === 'green' ? 'success' : visualStatus === 'yellow' ? 'warning' : visualStatus === 'red' ? 'destructive' : 'outline'
+  const badgeClassName = visualStatus === 'idle'
+    ? 'border-emerald-200 bg-emerald-50 text-emerald-800 dark:border-emerald-800 dark:bg-emerald-950/40 dark:text-emerald-300'
+    : ''
+  const statText = model.total_requests === 0 ? '无调用' : `${model.success_rate}%`
 
   return (
     <Card className={cn(
@@ -2287,13 +2334,13 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
             {model.model_name}
           </span>
           <Badge
-            variant={model.current_status === 'green' ? 'success' : model.current_status === 'yellow' ? 'warning' : 'destructive'}
-            className="text-[10px] px-1.5 py-0 h-5 flex-shrink-0"
+            variant={badgeVariant}
+            className={cn("text-[10px] px-1.5 py-0 h-5 flex-shrink-0", badgeClassName)}
           >
-            {STATUS_LABELS[model.current_status]}
+            {getStatusLabel(visualStatus)}
           </Badge>
           <div className="ml-auto text-xs text-muted-foreground flex-shrink-0 tabular-nums">
-            <span className={cn("font-semibold", rateColorClass)}>{model.success_rate}%</span>
+            <span className={cn("font-semibold", rateColorClass)}>{statText}</span>
             <span className="mx-1 text-muted-foreground/40">·</span>
             <span>{model.total_requests.toLocaleString()}</span>
           </div>
@@ -2311,7 +2358,7 @@ function ModelStatusCard({ model, dragHandleProps }: ModelStatusCardProps) {
                   index === 0 ? "rounded-l-md rounded-r-sm" :
                     index === model.slot_data.length - 1 ? "rounded-r-md rounded-l-sm" :
                       "rounded-sm",
-                  slot.total_requests === 0 ? STATUS_COLORS.empty : STATUS_COLORS[slot.status],
+                  STATUS_COLORS[getSlotVisualStatus(slot)],
                   "animate-in fade-in-0 duration-300"
                 )}
                 style={{ animationDelay: `${index * 15}ms` }}
