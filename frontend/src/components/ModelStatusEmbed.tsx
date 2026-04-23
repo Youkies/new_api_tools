@@ -33,6 +33,8 @@ interface ModelStatus {
   slot_data: SlotStatus[]
 }
 
+type VisualStatus = 'idle' | 'green' | 'yellow' | 'red'
+
 type ThemeId = 'obsidian' | 'daylight' | 'minimal' | 'neon' | 'forest' | 'ocean' | 'terminal' | 'cupertino' | 'material' | 'openai' | 'anthropic' | 'vercel' | 'linear' | 'stripe' | 'github' | 'discord' | 'tesla'
 
 // Token group from abilities table (system-defined)
@@ -534,27 +536,27 @@ const themeStyles: Record<ThemeId, {
 
   // ========== ANTHROPIC (Human Style) ==========
   anthropic: {
-    container: 'min-h-screen bg-[#f4f1ea] text-[#191919] p-6 font-sans',
+    container: 'min-h-screen bg-[linear-gradient(180deg,#f7f4ed_0%,#f3eee4_55%,#efe7db_100%)] text-[#191919] p-6 font-sans',
     headerTitle: 'text-3xl font-serif font-medium text-[#191919] tracking-tight',
     headerSubtitle: 'text-sm text-[#6b665c] mt-1.5 font-serif',
     countdownBox: 'flex items-center gap-2 px-0 py-0 text-sm bg-transparent text-[#6b665c]',
     countdownText: 'text-[#d97757] font-serif italic',
     countdownLabel: 'text-[#6b665c] font-serif italic',
-    card: 'bg-white border border-[#e6e1d6] rounded-xl p-6 shadow-sm transition-all duration-300',
-    cardHover: 'hover:border-[#d97757]/30 hover:shadow-md',
+    card: 'bg-[linear-gradient(180deg,rgba(255,252,247,0.98)_0%,rgba(255,250,244,0.96)_100%)] border border-[#e2d8c8] rounded-[1.1rem] p-6 shadow-[0_12px_30px_rgba(92,74,50,0.06)] transition-all duration-300',
+    cardHover: 'hover:border-[#cfa57d]/55 hover:shadow-[0_18px_38px_rgba(92,74,50,0.1)]',
     modelName: 'font-serif font-medium text-[#191919] truncate max-w-md text-xl',
     statsText: 'text-sm text-[#6b665c] font-serif',
     statsValue: 'text-[#191919] font-medium font-sans',
-    statusGreen: 'bg-[#2d4f43]', // Dark Green used by Anthropic
-    statusYellow: 'bg-[#e3b26c]',
-    statusRed: 'bg-[#d97757]', // Terracotta
-    statusEmpty: 'bg-[#e6e1d6]',
+    statusGreen: 'bg-[#2f5d50]', // Warm deep green
+    statusYellow: 'bg-[#d7a65a]',
+    statusRed: 'bg-[#cf7457]', // Refined terracotta
+    statusEmpty: 'bg-[#d9e4da]',
     statusHover: 'hover:scale-y-110 origin-bottom transition-transform',
-    badgeGreen: 'bg-[#eef3f1] text-[#2d4f43] border border-[#d6e3de] px-2 py-0.5 text-xs font-serif rounded',
-    badgeYellow: 'bg-[#fff9ed] text-[#b38641] border border-[#faecd1] px-2 py-0.5 text-xs font-serif rounded',
-    badgeRed: 'bg-[#fdf3f0] text-[#d97757] border border-[#f5dcd6] px-2 py-0.5 text-xs font-serif rounded',
+    badgeGreen: 'bg-[#edf3ef] text-[#2f5d50] border border-[#d4e1d7] px-2 py-0.5 text-xs font-serif rounded',
+    badgeYellow: 'bg-[#fff7ea] text-[#a87934] border border-[#f2dfbc] px-2 py-0.5 text-xs font-serif rounded',
+    badgeRed: 'bg-[#fbf0eb] text-[#cf7457] border border-[#f0d5c9] px-2 py-0.5 text-xs font-serif rounded',
     timeLabel: 'text-xs text-[#9c9485] font-serif italic',
-    tooltip: 'bg-white border border-[#e6e1d6] rounded-lg shadow-[0_4px_20px_rgba(0,0,0,0.08)] p-4 z-[9999]',
+    tooltip: 'bg-[#fffaf4] border border-[#e2d8c8] rounded-lg shadow-[0_10px_28px_rgba(92,74,50,0.12)] p-4 z-[9999]',
     tooltipTitle: 'font-serif font-medium text-[#191919] mb-2 pb-2 border-b border-[#f4f1ea]',
     tooltipLabel: 'text-[#6b665c] font-serif text-xs',
     tooltipValue: 'text-[#191919] font-sans',
@@ -773,6 +775,26 @@ const STATUS_LABELS = {
   red: '异常',
 }
 
+function getModelVisualStatus(model: Pick<ModelStatus, 'total_requests' | 'current_status'>): VisualStatus {
+  if (model.total_requests === 0) return 'idle'
+  return model.current_status
+}
+
+function getVisualStatusLabel(status: VisualStatus) {
+  if (status === 'idle') return '无调用'
+  return STATUS_LABELS[status]
+}
+
+function getVisualBadgeColor(status: VisualStatus, styles: typeof themeStyles.obsidian, theme: ThemeId) {
+  if (status === 'idle') {
+    if (theme === 'anthropic') {
+      return 'bg-[#eef1ea] text-[#5f7468] border border-[#d7dfd5] px-2 py-0.5 text-xs font-serif rounded'
+    }
+    return 'bg-slate-100 text-slate-500 border border-slate-200 px-2 py-0.5 text-xs rounded'
+  }
+  return getBadgeColor(status, styles)
+}
+
 // Time window options
 const TIME_WINDOWS = [
   { value: '1h', label: '1小时' },
@@ -815,6 +837,11 @@ function getStatusColor(status: 'green' | 'yellow' | 'red', styles: typeof theme
 function getBadgeColor(status: 'green' | 'yellow' | 'red', styles: typeof themeStyles.obsidian) {
   return status === 'green' ? styles.badgeGreen :
          status === 'yellow' ? styles.badgeYellow : styles.badgeRed
+}
+
+function getVisualStatusDot(status: VisualStatus) {
+  if (status === 'idle') return '◌'
+  return status === 'green' ? '●' : status === 'yellow' ? '◐' : '○'
 }
 
 // ============================================================================
@@ -1076,7 +1103,7 @@ export function ModelStatusEmbed({
               theme === 'cupertino' && 'bg-white/60 backdrop-blur-md rounded-2xl shadow-sm',
               theme === 'material' && 'bg-[#fdfcff] rounded-2xl shadow-sm',
               theme === 'openai' && 'bg-[#40414f] rounded-md',
-              theme === 'anthropic' && 'bg-white border border-[#e6e1d6] rounded-xl shadow-sm',
+              theme === 'anthropic' && 'bg-[linear-gradient(180deg,rgba(255,252,247,0.96)_0%,rgba(252,246,239,0.94)_100%)] border border-[#e2d8c8] rounded-[1.1rem] shadow-[0_10px_24px_rgba(92,74,50,0.06)]',
               theme === 'vercel' && 'bg-[#111] border border-[#333] rounded-lg',
               theme === 'linear' && 'bg-[#16171d] border border-[#282930] rounded-xl',
               theme === 'stripe' && 'bg-white rounded-lg shadow-[0_2px_5px_-1px_rgba(50,50,93,0.15)]',
@@ -1331,7 +1358,11 @@ interface EmbedModelCardProps {
 }
 
 function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCardProps) {
-  
+  const visualStatus = getModelVisualStatus(model)
+  const statusLabel = getVisualStatusLabel(visualStatus)
+  const statusBadgeClass = getVisualBadgeColor(visualStatus, styles, theme)
+  const successText = visualStatus === 'idle' ? '无调用' : `${model.success_rate}%`
+
   const handleMouseEnter = (slot: SlotStatus, event: React.MouseEvent) => {
     const rect = event.currentTarget.getBoundingClientRect()
     onHover(slot, rect)
@@ -1373,20 +1404,20 @@ function EmbedModelCard({ model, theme, styles, onHover, onLeave }: EmbedModelCa
           {!isMinimal && (
             <span className={cn(
               "px-2 py-0.5 text-xs rounded-full font-medium",
-              getBadgeColor(model.current_status, styles)
+              statusBadgeClass
             )}>
-              {STATUS_LABELS[model.current_status]}
+              {statusLabel}
             </span>
           )}
           {isMinimal && (
-            <span className={getBadgeColor(model.current_status, styles)}>
-              {model.current_status === 'green' ? '●' : model.current_status === 'yellow' ? '◐' : '○'}
+            <span className={statusBadgeClass}>
+              {getVisualStatusDot(visualStatus)}
             </span>
           )}
         </div>
         <div className={styles.statsText}>
-          <span className={styles.statsValue}>{model.success_rate}%</span>
-          {!isMinimal && ' 成功率'}
+          <span className={styles.statsValue}>{successText}</span>
+          {!isMinimal && visualStatus !== 'idle' && ' 成功率'}
           <span className={isMinimal ? 'mx-1' : 'mx-2 opacity-30'}>·</span>
           <span>{model.total_requests.toLocaleString()}</span>
           {!isMinimal && ' 请求'}
