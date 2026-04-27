@@ -714,6 +714,7 @@ class RiskMonitoringService:
         
         # 分析IP切换模式（传入地理信息用于双栈检测）
         ip_switch_analysis = self._analyze_ip_switches(ip_sequence, ip_geo_map)
+        shared_ip_analysis = self._get_shared_ip_analysis(user_id, start_time, now, min_users=3, limit=20)
 
         # Calculate derived metrics
         total_requests = int(summary.get("total_requests") or 0)
@@ -744,6 +745,9 @@ class RiskMonitoringService:
         real_switch_count = ip_switch_analysis.get("real_switch_count", ip_switch_analysis.get("switch_count", 0))
         if avg_ip_duration < 30 and real_switch_count >= 3:
             risk_flags.append("IP_HOPPING")
+
+        if shared_ip_analysis.get("shared_ip_count", 0) > 0:
+            risk_flags.append("MULTI_USER_SHARED_IP")
 
         # 检查用户是否在白名单中（延迟导入避免循环依赖）
         try:
@@ -787,6 +791,7 @@ class RiskMonitoringService:
                 "avg_quota_per_request": avg_quota_per_request,
                 "risk_flags": risk_flags,
                 "ip_switch_analysis": ip_switch_analysis,
+                "shared_ip_analysis": shared_ip_analysis,
             },
             "top_models": [
                 {
@@ -834,6 +839,73 @@ class RiskMonitoringService:
                 }
                 for r in (recent_logs or [])
             ],
+        }
+
+    def _get_shared_ip_analysis(
+        self,
+        user_id: int,
+        start_time: int,
+        end_time: int,
+        min_users: int = 3,
+        limit: int = 20,
+    ) -> Dict[str, Any]:
+        """Detect whether this user uses IPs shared by multiple users."""
+        empty = {"shared_ip_count": 0, "max_users_per_ip": 0, "ips": []}
+        min_users = max(2, min_users)
+
+        sql = """
+            WITH user_ips AS (
+                SELECT DISTINCT ip
+                FROM logs
+                WHERE user_id = :user_id
+                    AND created_at >= :start_time AND created_at <= :end_time
+                    AND ip IS NOT NULL AND ip <> ''
+            )
+            SELECT
+                l.ip,
+                COUNT(DISTINCT l.user_id) as user_count,
+                COUNT(DISTINCT l.token_id) as token_count,
+                COUNT(*) as request_count
+            FROM logs l
+            INNER JOIN user_ips ui ON ui.ip = l.ip
+            WHERE l.created_at >= :start_time AND l.created_at <= :end_time
+                AND l.ip IS NOT NULL AND l.ip <> ''
+                AND l.user_id IS NOT NULL
+            GROUP BY l.ip
+            HAVING COUNT(DISTINCT l.user_id) >= :min_users
+            ORDER BY user_count DESC, request_count DESC
+            LIMIT :limit
+        """
+
+        try:
+            rows = self.db.execute(sql, {
+                "user_id": user_id,
+                "start_time": start_time,
+                "end_time": end_time,
+                "min_users": min_users,
+                "limit": limit,
+            }) or []
+        except Exception as e:
+            logger.db_error(f"获取用户共用 IP 分析失败: {e}")
+            return empty
+
+        if not rows:
+            return empty
+
+        items = [
+            {
+                "ip": row.get("ip") or "",
+                "user_count": int(row.get("user_count") or 0),
+                "token_count": int(row.get("token_count") or 0),
+                "request_count": int(row.get("request_count") or 0),
+            }
+            for row in rows
+        ]
+
+        return {
+            "shared_ip_count": len(items),
+            "max_users_per_ip": max((item["user_count"] for item in items), default=0),
+            "ips": items,
         }
 
     def _analyze_ip_switches(self, ip_sequence: List[Dict[str, Any]], ip_geo_map: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

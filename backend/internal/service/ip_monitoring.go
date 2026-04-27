@@ -203,6 +203,118 @@ func (s *IPMonitoringService) GetSharedIPs(window string, minTokens, limit int) 
 	return result, nil
 }
 
+// GetSharedUserIPs returns IPs used by multiple users with per-user ban status.
+func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit int) (map[string]interface{}, error) {
+	seconds, ok := WindowSeconds[window]
+	if !ok {
+		seconds = 86400
+	}
+	if minUsers < 2 {
+		minUsers = 2
+	}
+	startTime := time.Now().Unix() - seconds
+
+	cacheKey := fmt.Sprintf("ip:shared_users:%s:%d:%d", window, minUsers, limit)
+	cm := cache.Get()
+	var cached map[string]interface{}
+	found, _ := cm.GetJSON(cacheKey, &cached)
+	if found {
+		return cached, nil
+	}
+
+	query := s.db.RebindQuery(`
+		SELECT l.ip,
+			COUNT(DISTINCT l.user_id) as user_count,
+			COUNT(DISTINCT l.token_id) as token_count,
+			COUNT(DISTINCT CASE WHEN u.status = 2 THEN l.user_id ELSE NULL END) as banned_count,
+			COUNT(*) as request_count
+		FROM logs l
+		LEFT JOIN users u ON l.user_id = u.id AND u.deleted_at IS NULL
+		WHERE l.created_at >= ? AND l.ip IS NOT NULL AND l.ip <> ''
+			AND l.user_id IS NOT NULL
+		GROUP BY l.ip
+		HAVING COUNT(DISTINCT l.user_id) >= ?
+		ORDER BY user_count DESC, request_count DESC
+		LIMIT ?`)
+
+	rows, err := s.db.Query(query, startTime, minUsers, limit)
+	if err != nil {
+		return map[string]interface{}{
+			"items":     []interface{}{},
+			"total":     0,
+			"window":    window,
+			"min_users": minUsers,
+		}, nil
+	}
+
+	if len(rows) > 0 {
+		ips := make([]interface{}, 0, len(rows))
+		for _, row := range rows {
+			if ip, _ := row["ip"].(string); ip != "" {
+				ips = append(ips, ip)
+			}
+		}
+
+		if len(ips) > 0 {
+			placeholders := buildPlaceholders(s.db.IsPG, len(ips), 2)
+			args := []interface{}{startTime}
+			args = append(args, ips...)
+
+			userQuery := s.db.RebindQuery(fmt.Sprintf(`
+				SELECT l.ip,
+					l.user_id,
+					COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), NULLIF(MAX(l.username), ''), '') as username,
+					COALESCE(NULLIF(MAX(u.display_name), ''), '') as display_name,
+					COALESCE(MAX(u.status), 0) as status,
+					COUNT(DISTINCT l.token_id) as token_count,
+					COUNT(*) as request_count,
+					MIN(l.created_at) as first_seen,
+					MAX(l.created_at) as last_seen
+				FROM logs l
+				LEFT JOIN users u ON l.user_id = u.id AND u.deleted_at IS NULL
+				WHERE l.created_at >= ? AND l.ip IN (%s)
+					AND l.ip IS NOT NULL AND l.ip <> ''
+					AND l.user_id IS NOT NULL
+				GROUP BY l.ip, l.user_id
+				ORDER BY l.ip, request_count DESC`, placeholders))
+
+			userRows, err := s.db.Query(userQuery, args...)
+			if err == nil {
+				usersByIP := map[string][]map[string]interface{}{}
+				for _, ur := range userRows {
+					ip := toString(ur["ip"])
+					delete(ur, "ip")
+					if len(usersByIP[ip]) < 20 {
+						usersByIP[ip] = append(usersByIP[ip], ur)
+					}
+				}
+				for _, row := range rows {
+					ip := toString(row["ip"])
+					if users, ok := usersByIP[ip]; ok {
+						row["users"] = users
+					} else {
+						row["users"] = []interface{}{}
+					}
+				}
+			} else {
+				for _, row := range rows {
+					row["users"] = []interface{}{}
+				}
+			}
+		}
+	}
+
+	result := map[string]interface{}{
+		"items":     rows,
+		"total":     len(rows),
+		"window":    window,
+		"min_users": minUsers,
+	}
+
+	cm.Set(cacheKey, result, 5*time.Minute)
+	return result, nil
+}
+
 // GetMultiIPTokens returns tokens used from multiple IPs with IP details
 func (s *IPMonitoringService) GetMultiIPTokens(window string, minIPs, limit int) (map[string]interface{}, error) {
 	seconds, ok := WindowSeconds[window]

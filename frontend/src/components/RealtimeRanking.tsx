@@ -44,6 +44,8 @@ const REASON_STYLES: Record<string, string> = {
   'IP_RAPID_SWITCH': 'bg-pink-50 text-pink-700 border-pink-100 dark:bg-pink-900/20 dark:text-pink-400',
   'IP跳动异常': 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-100 dark:bg-fuchsia-900/20 dark:text-fuchsia-400',
   'IP_HOPPING': 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-100 dark:bg-fuchsia-900/20 dark:text-fuchsia-400',
+  '多用户共用': 'bg-rose-50 text-rose-700 border-rose-100 dark:bg-rose-900/20 dark:text-rose-400',
+  'MULTI_USER_SHARED_IP': 'bg-rose-50 text-rose-700 border-rose-100 dark:bg-rose-900/20 dark:text-rose-400',
   '账号共享': 'bg-purple-50 text-purple-700 border-purple-100 dark:bg-purple-900/20 dark:text-purple-400',
   '令牌泄露': 'bg-indigo-50 text-indigo-700 border-indigo-100 dark:bg-indigo-900/20 dark:text-indigo-400',
   '滥用': 'bg-rose-50 text-rose-700 border-rose-100 dark:bg-rose-900/20 dark:text-rose-400',
@@ -70,6 +72,16 @@ const renderReasonBadge = (reason: string | null) => {
       {reason}
     </Badge>
   )
+}
+
+const renderUserStatusBadge = (status: number) => {
+  if (status === 2) {
+    return <Badge variant="destructive" className="h-5 px-2 text-[10px]">已封禁</Badge>
+  }
+  if (status === 1) {
+    return <Badge variant="success" className="h-5 px-2 text-[10px]">正常</Badge>
+  }
+  return <Badge variant="outline" className="h-5 px-2 text-[10px]">未知</Badge>
 }
 
 function formatNumber(n: number) {
@@ -143,6 +155,26 @@ interface BannedUserItem {
   ban_context: Record<string, any> | null
 }
 
+interface AIPendingReviewItem {
+  id: string
+  user_id: number
+  username: string
+  window: WindowKey | string
+  source: string
+  status: string
+  risk_score: number
+  confidence: number
+  reason: string
+  action: string
+  risk_flags: string[]
+  total_requests: number
+  unique_ips: number
+  shared_user_ips?: number
+  max_shared_ip_users?: number
+  created_at: number
+  updated_at?: number
+}
+
 // IP Monitoring Types
 interface IPStats {
   total_users: number
@@ -156,8 +188,19 @@ interface SharedIPItem {
   ip: string
   token_count: number
   user_count: number
+  banned_count?: number
   request_count: number
-  tokens: Array<{
+  users: Array<{
+    user_id: number
+    username: string
+    display_name?: string
+    status: number
+    token_count: number
+    request_count: number
+    first_seen: number
+    last_seen: number
+  }>
+  tokens?: Array<{
     token_id: number
     token_name: string
     user_id: number
@@ -424,10 +467,17 @@ export function RealtimeRanking() {
     failure_rate: number
     unique_ips: number
     rapid_switch_count: number
+    shared_user_ips?: number
+    max_shared_ip_users?: number
   }>>([])
+  const [aiPendingReviews, setAiPendingReviews] = useState<AIPendingReviewItem[]>([])
+  const [aiPendingTotal, setAiPendingTotal] = useState(0)
+  const [aiPendingLoading, setAiPendingLoading] = useState(false)
+  const [aiLearningStats, setAiLearningStats] = useState<any>(null)
   const [aiLoading, setAiLoading] = useState(false)
   const [aiScanning, setAiScanning] = useState(false)
   const [aiAssessing, setAiAssessing] = useState<number | null>(null)
+  const [pendingResolveAfterBan, setPendingResolveAfterBan] = useState<string | null>(null)
   const [aiAssessResult, setAiAssessResult] = useState<{
     user_id: number
     username: string
@@ -699,7 +749,7 @@ export function RealtimeRanking() {
     try {
       const [statsRes, sharedRes, tokensRes, usersRes] = await Promise.all([
         fetch(`${apiUrl}/api/ip/stats`, { headers: getAuthHeaders() }),
-        fetch(`${apiUrl}/api/ip/shared-ips?window=${ipWindow}&min_tokens=2&limit=200${noCache}`, { headers: getAuthHeaders() }),
+        fetch(`${apiUrl}/api/ip/shared-users?window=${ipWindow}&min_users=2&limit=200${noCache}`, { headers: getAuthHeaders() }),
         fetch(`${apiUrl}/api/ip/multi-ip-tokens?window=${ipWindow}&min_ips=2&limit=200${noCache}`, { headers: getAuthHeaders() }),
         fetch(`${apiUrl}/api/ip/multi-ip-users?window=${ipWindow}&min_ips=3&limit=200${noCache}`, { headers: getAuthHeaders() }),
       ])
@@ -943,7 +993,7 @@ export function RealtimeRanking() {
   const fetchAiSuspiciousUsers = useCallback(async (showSuccessToast = false) => {
     setAiLoading(true)
     try {
-      const response = await fetch(`${apiUrl}/api/ai-ban/suspicious-users?window=1h&limit=20`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/ai-ban/suspicious-users?window=1h&limit=50`, { headers: getAuthHeaders() })
       const res = await response.json()
       if (res.success) {
         setAiSuspiciousUsers(res.data?.items || [])
@@ -959,6 +1009,50 @@ export function RealtimeRanking() {
     }
   }, [apiUrl, getAuthHeaders, showToast])
 
+  const fetchAiPendingReviews = useCallback(async (showSuccessToast = false) => {
+    setAiPendingLoading(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/ai-ban/pending-reviews?status=pending&limit=50`, { headers: getAuthHeaders() })
+      const res = await response.json()
+      if (res.success) {
+        setAiPendingReviews(res.data?.items || [])
+        setAiPendingTotal(res.data?.total || 0)
+        setAiLearningStats(res.data?.learning_stats || null)
+        if (showSuccessToast) showToast('success', '待处理列表已刷新')
+      } else {
+        showToast('error', res.message || '获取待处理列表失败')
+      }
+    } catch (e) {
+      console.error('Failed to fetch pending reviews:', e)
+      showToast('error', '获取待处理列表失败')
+    } finally {
+      setAiPendingLoading(false)
+    }
+  }, [apiUrl, getAuthHeaders, showToast])
+
+  const resolveAiPendingReview = useCallback(async (reviewId: string, action: string, note = '') => {
+    try {
+      const response = await fetch(`${apiUrl}/api/ai-ban/pending-reviews/resolve`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ review_id: reviewId, action, note }),
+      })
+      const res = await response.json()
+      if (res.success) {
+        setAiPendingReviews(prev => prev.filter(item => item.id !== reviewId))
+        setAiPendingTotal(prev => Math.max(0, prev - 1))
+        fetchAiPendingReviews()
+        return true
+      }
+      showToast('error', res.message || '处理失败')
+      return false
+    } catch (e) {
+      console.error('Failed to resolve pending review:', e)
+      showToast('error', '处理失败')
+      return false
+    }
+  }, [apiUrl, getAuthHeaders, showToast, fetchAiPendingReviews])
+
   const handleAiAssess = async (userId: number) => {
     setAiAssessing(userId)
     setAiAssessResult(null)
@@ -971,6 +1065,7 @@ export function RealtimeRanking() {
       const res = await response.json()
       if (res.success) {
         setAiAssessResult(res.data)
+        fetchAiPendingReviews()
         showToast('success', 'AI 评估完成')
       } else {
         showToast('error', res.message || 'AI 评估失败')
@@ -986,15 +1081,16 @@ export function RealtimeRanking() {
   const handleAiScan = async () => {
     setAiScanning(true)
     try {
-      const response = await fetch(`${apiUrl}/api/ai-ban/scan?window=1h&limit=10`, {
+      const response = await fetch(`${apiUrl}/api/ai-ban/scan?window=1h&limit=30`, {
         method: 'POST',
         headers: getAuthHeaders(),
       })
       const res = await response.json()
       if (res.success) {
         const stats = res.data?.stats || {}
-        showToast('success', `扫描完成: 处理 ${stats.total_processed || 0} 人, 封禁 ${stats.banned || 0} 人, 告警 ${stats.warned || 0} 人`)
+        showToast('success', `扫描完成: 处理 ${stats.total_processed || 0} 人, 待处理 ${stats.queued || 0} 人, 极高危 ${stats.auto_ban_candidates || 0} 人`)
         fetchAiSuspiciousUsers()
+        fetchAiPendingReviews()
         fetchBanRecords(1)
       } else {
         showToast('error', res.message || '扫描失败')
@@ -1269,7 +1365,16 @@ export function RealtimeRanking() {
   }
 
   const handleQuickBanUser = (userId: number, username: string) => {
-    openUserAnalysisFromIP(userId, username)
+    setBanConfirmDialog({
+      open: true,
+      type: 'ban',
+      userId,
+      username,
+      displayName: username,
+      reason: '多 IP / 共用 IP 风险',
+      disableTokens: true,
+      enableTokens: false,
+    })
   }
 
   const openUserAnalysisFromIP = (userId: number, username: string) => {
@@ -1346,6 +1451,7 @@ export function RealtimeRanking() {
     fetchIPData,
     fetchAiConfig,
     fetchAiSuspiciousUsers,
+    fetchAiPendingReviews,
     fetchAiAuditLogs,
   })
 
@@ -1358,6 +1464,7 @@ export function RealtimeRanking() {
       fetchIPData,
       fetchAiConfig,
       fetchAiSuspiciousUsers,
+      fetchAiPendingReviews,
       fetchAiAuditLogs,
     }
   })
@@ -1372,6 +1479,7 @@ export function RealtimeRanking() {
     if (view === 'ai_ban') {
       fns.fetchAiConfig()
       fns.fetchAiSuspiciousUsers()
+      fns.fetchAiPendingReviews()
       fns.fetchAiAuditLogs()
     }
   }, [view])  // 只依赖 view，避免函数引用变化导致重复请求
@@ -1445,7 +1553,7 @@ export function RealtimeRanking() {
   const handleRefreshSharedIps = async () => {
     setIpRefreshing(prev => ({ ...prev, shared: true }))
     try {
-      const response = await fetch(`${apiUrl}/api/ip/shared-ips?window=${ipWindow}&min_tokens=2&limit=200&no_cache=true`, { headers: getAuthHeaders() })
+      const response = await fetch(`${apiUrl}/api/ip/shared-users?window=${ipWindow}&min_users=2&limit=200&no_cache=true`, { headers: getAuthHeaders() })
       const res = await response.json()
       if (res.success) {
         setSharedIps(res.data?.items || [])
@@ -2550,10 +2658,10 @@ export function RealtimeRanking() {
                 <CardContent className="p-4">
                   <div className="flex items-center justify-between">
                     <div>
-                      <div className="text-[11px] text-muted-foreground mb-1.5 uppercase tracking-wider font-semibold">共享 IP (多令牌)</div>
+                      <div className="text-[11px] text-muted-foreground mb-1.5 uppercase tracking-wider font-semibold">多用户共用 IP</div>
                       <div className="text-3xl font-bold tabular-nums text-orange-600">{sharedIps.length}</div>
                       <div className="text-[11px] text-muted-foreground mt-1.5">
-                        可能的账号共享行为
+                        可能的账号共享或批量账号
                       </div>
                     </div>
                     <div className="p-2.5 bg-orange-50 dark:bg-orange-900/20 rounded-full">
@@ -2593,7 +2701,7 @@ export function RealtimeRanking() {
                     <div className="flex items-center justify-between">
                       <CardTitle className="text-base flex items-center gap-2">
                         <AlertTriangle className="h-4 w-4 text-orange-500" />
-                        多令牌共用 IP
+                        多用户共用 IP
                         <Badge variant="secondary" className="ml-2 bg-background font-mono">{sharedIps.length}</Badge>
                       </CardTitle>
                       <Button
@@ -2624,8 +2732,11 @@ export function RealtimeRanking() {
                                     <Badge className="bg-orange-100 text-orange-700 border-orange-200 hover:bg-orange-100 px-1.5 py-0 text-[10px] font-bold">CF</Badge>
                                   )}
                                   <div className="flex gap-2">
-                                    <Badge variant="outline" className="font-normal bg-background">{item.token_count} 令牌</Badge>
                                     <Badge variant="outline" className="font-normal bg-background">{item.user_count} 用户</Badge>
+                                    <Badge variant="outline" className="font-normal bg-background">{item.token_count} 令牌</Badge>
+                                    {(item.banned_count || 0) > 0 && (
+                                      <Badge variant="destructive" className="font-normal">{item.banned_count} 已封禁</Badge>
+                                    )}
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-2">
@@ -2642,29 +2753,69 @@ export function RealtimeRanking() {
                               </div>
                               {expandedSharedIps.has(item.ip) && (
                                 <div className="mt-3 pl-4 space-y-2 animate-in slide-in-from-top-1 duration-200">
-                                  {item.tokens.map((t) => (
-                                    <div key={t.token_id} className="flex items-center justify-between text-sm bg-muted/40 rounded-lg px-3 py-2 border border-border/40">
-                                      <div className="flex items-center gap-2">
-                                        <span className="font-semibold text-primary/80">{t.token_name || `Token#${t.token_id}`}</span>
-                                        <div
-                                          className="flex items-center gap-2 px-2 py-1 rounded-full bg-muted/50 hover:bg-primary/10 hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20 w-fit group/user"
-                                          onClick={(e) => {
-                                            e.stopPropagation()
-                                            openUserAnalysisFromIP(t.user_id, t.username)
-                                          }}
-                                        >
-                                          <div className="w-4 h-4 rounded-full bg-blue-500/10 text-blue-600 flex items-center justify-center font-bold text-[10px] border border-blue-500/20 group-hover/user:bg-blue-500/20">
-                                            {t.username[0]?.toUpperCase()}
+                                  {(item.users || []).map((user) => {
+                                    const displayName = user.display_name || user.username || `User#${user.user_id}`
+                                    const isBanned = user.status === 2
+                                    return (
+                                      <div key={`${item.ip}-${user.user_id}`} className="flex items-center justify-between text-sm bg-muted/40 rounded-lg px-3 py-2 border border-border/40 group/user-row">
+                                        <div className="flex items-center gap-2 min-w-0">
+                                          <div
+                                            className="flex items-center gap-2 px-2 py-1 rounded-full bg-muted/50 hover:bg-primary/10 hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20 w-fit group/user"
+                                            onClick={(e) => {
+                                              e.stopPropagation()
+                                              openUserAnalysisFromIP(user.user_id, displayName)
+                                            }}
+                                          >
+                                            <div className="w-5 h-5 rounded-full bg-blue-500/10 text-blue-600 flex items-center justify-center font-bold text-[10px] border border-blue-500/20 group-hover/user:bg-blue-500/20 shrink-0">
+                                              {displayName[0]?.toUpperCase()}
+                                            </div>
+                                            <div className="flex flex-col leading-tight min-w-0">
+                                              <span className="text-xs font-semibold truncate max-w-[150px]">{displayName}</span>
+                                              <span className="text-[9px] text-muted-foreground font-mono">ID: {user.user_id}</span>
+                                            </div>
                                           </div>
-                                          <span className="text-xs font-semibold whitespace-nowrap">{t.username || t.user_id}</span>
+                                          {renderUserStatusBadge(user.status)}
+                                          <Badge variant="outline" className="h-5 px-2 text-[10px] bg-background">
+                                            {user.token_count} 令牌
+                                          </Badge>
+                                        </div>
+                                        <div className="flex items-center gap-2">
+                                          <div className="flex items-center gap-1.5 opacity-80">
+                                            <span className="text-foreground font-bold tabular-nums font-mono text-xs">{formatNumber(user.request_count)}</span>
+                                            <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-tighter opacity-60">reqs</span>
+                                          </div>
+                                          {!isBanned && (
+                                            <Button
+                                              variant="ghost"
+                                              size="icon"
+                                              className="h-7 w-7 text-red-500 hover:text-red-600 hover:bg-red-500/10"
+                                              title="一键封禁"
+                                              onClick={(e) => {
+                                                e.stopPropagation()
+                                                setBanConfirmDialog({
+                                                  open: true,
+                                                  type: 'ban',
+                                                  userId: user.user_id,
+                                                  username: user.username || displayName,
+                                                  displayName,
+                                                  reason: '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)',
+                                                  disableTokens: true,
+                                                  enableTokens: false,
+                                                })
+                                              }}
+                                            >
+                                              <ShieldBan className="h-3.5 w-3.5" />
+                                            </Button>
+                                          )}
                                         </div>
                                       </div>
-                                      <div className="flex items-center gap-1.5 opacity-80">
-                                        <span className="text-foreground font-bold tabular-nums font-mono text-xs">{formatNumber(t.request_count)}</span>
-                                        <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-tighter opacity-60">reqs</span>
-                                      </div>
+                                    )
+                                  })}
+                                  {(!item.users || item.users.length === 0) && (
+                                    <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
+                                      暂无用户详情
                                     </div>
-                                  ))}
+                                  )}
                                 </div>
                               )}
                             </div>
@@ -2988,7 +3139,7 @@ export function RealtimeRanking() {
       {view === 'ai_ban' && (
         <div className="mt-4 space-y-6">
           {/* 顶栏状态卡片 */}
-          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
             <div className="bg-white rounded-xl p-4 shadow-sm border border-slate-100 flex items-center gap-4">
               <div className={cn(
                 "w-12 h-12 rounded-xl flex items-center justify-center shrink-0",
@@ -3039,6 +3190,18 @@ export function RealtimeRanking() {
                 <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider">可疑用户</span>
                 <span className="text-lg font-bold text-rose-600">
                   {aiSuspiciousUsers.length}
+                </span>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-xl p-4 shadow-sm border border-slate-100 flex items-center gap-4">
+              <div className="w-12 h-12 rounded-xl bg-amber-50 text-amber-600 flex items-center justify-center shrink-0">
+                <Clock className="w-6 h-6" />
+              </div>
+              <div className="flex flex-col">
+                <span className="text-xs text-muted-foreground font-medium uppercase tracking-wider">待处理</span>
+                <span className="text-lg font-bold text-amber-600">
+                  {aiPendingTotal}
                 </span>
               </div>
             </div>
@@ -3369,6 +3532,167 @@ export function RealtimeRanking() {
             </div>
           </div>
 
+          {/* Pending Review Queue */}
+          <Card className="rounded-xl shadow-sm border border-amber-200 overflow-hidden">
+            <CardHeader className="px-6 py-4 border-b border-amber-100 bg-amber-50/70 flex flex-row items-center justify-between">
+              <div>
+                <h3 className="font-bold text-lg text-amber-900">待处理复核区</h3>
+                <p className="text-xs text-amber-700/80 mt-1">
+                  AI 先扩大审查范围，默认把中高风险样本放入这里，由管理员最终确认。
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                {aiLearningStats?.total_feedback > 0 && (
+                  <Badge variant="secondary" className="bg-white text-amber-700 border border-amber-200">
+                    已学习 {aiLearningStats.total_feedback} 次反馈
+                  </Badge>
+                )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => fetchAiPendingReviews(true)}
+                  disabled={aiPendingLoading}
+                  className="bg-white border-amber-200 text-amber-700 hover:bg-amber-50"
+                >
+                  <RefreshCw className={cn("h-4 w-4 mr-2", aiPendingLoading && "animate-spin")} />
+                  刷新
+                </Button>
+              </div>
+            </CardHeader>
+            <CardContent className="p-0 bg-white">
+              {aiPendingLoading ? (
+                <div className="h-44 flex items-center justify-center text-muted-foreground">
+                  <Loader2 className="h-6 w-6 animate-spin text-amber-500/60" />
+                </div>
+              ) : aiPendingReviews.length > 0 ? (
+                <Table>
+                  <TableHeader>
+                    <TableRow className="bg-amber-50/30 hover:bg-amber-50/30">
+                      <TableHead className="w-[190px]">用户</TableHead>
+                      <TableHead>风险依据</TableHead>
+                      <TableHead className="text-right w-[90px]">评分</TableHead>
+                      <TableHead className="text-right w-[90px]">置信度</TableHead>
+                      <TableHead className="text-center w-[150px]">操作</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {aiPendingReviews.map((item) => (
+                      <TableRow key={item.id} className="hover:bg-amber-50/20">
+                        <TableCell className="py-4">
+                          <div className="flex items-center gap-3">
+                            <div className="w-9 h-9 rounded-full bg-amber-100 text-amber-700 flex items-center justify-center font-bold text-sm border border-amber-200">
+                              {(item.username || 'U')[0]?.toUpperCase()}
+                            </div>
+                            <div className="min-w-0">
+                              <div className="font-semibold text-sm truncate">{item.username || `User#${item.user_id}`}</div>
+                              <div className="text-xs text-muted-foreground">ID: {item.user_id} · {item.window}</div>
+                            </div>
+                          </div>
+                        </TableCell>
+                        <TableCell className="py-4">
+                          <div className="flex flex-wrap gap-1.5 mb-1.5">
+                            {(item.risk_flags || []).map((flag) => (
+                              <Badge key={flag} variant="outline" className={cn("rounded px-2 py-0.5 text-[11px]", getReasonStyle(flag))}>
+                                {RISK_FLAG_LABELS[flag] || flag}
+                              </Badge>
+                            ))}
+                          </div>
+                          <div className="text-xs text-slate-600 line-clamp-2">{item.reason}</div>
+                          <div className="text-[10px] text-muted-foreground mt-1">
+                            请求 {formatNumber(item.total_requests || 0)} · IP {item.unique_ips || 0}
+                            {(item.shared_user_ips || 0) > 0 && ` · 共用 IP ${item.shared_user_ips}`}
+                          </div>
+                        </TableCell>
+                        <TableCell className="py-4 text-right">
+                          <span className={cn(
+                            "font-mono font-bold",
+                            item.risk_score >= 9 ? "text-rose-600" : item.risk_score >= 6 ? "text-amber-600" : "text-slate-600"
+                          )}>
+                            {item.risk_score}
+                          </span>
+                        </TableCell>
+                        <TableCell className="py-4 text-right font-mono text-sm text-slate-600">
+                          {Math.round((item.confidence || 0) * 100)}%
+                        </TableCell>
+                        <TableCell className="py-4">
+                          <div className="flex items-center justify-center gap-1">
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-blue-600 hover:text-blue-700 hover:bg-blue-50"
+                              title="查看分析"
+                              onClick={() => {
+                                const mockItem: LeaderboardItem = {
+                                  user_id: item.user_id,
+                                  username: item.username,
+                                  user_status: 1,
+                                  request_count: item.total_requests || 0,
+                                  failure_requests: 0,
+                                  failure_rate: 0,
+                                  quota_used: 0,
+                                  prompt_tokens: 0,
+                                  completion_tokens: 0,
+                                  unique_ips: item.unique_ips || 0,
+                                }
+                                openUserDialog(mockItem, (item.window as WindowKey) || '1h')
+                              }}
+                            >
+                              <Eye className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-red-600 hover:text-red-700 hover:bg-red-50"
+                              title="确认封禁"
+                              onClick={() => {
+                                setPendingResolveAfterBan(item.id)
+                                setBanConfirmDialog({
+                                  open: true,
+                                  type: 'ban',
+                                  userId: item.user_id,
+                                  username: item.username || `User#${item.user_id}`,
+                                  reason: `[AI待处理] ${item.reason}`,
+                                  disableTokens: true,
+                                  enableTokens: false,
+                                })
+                              }}
+                            >
+                              <ShieldBan className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-emerald-600 hover:text-emerald-700 hover:bg-emerald-50"
+                              title="标记观察"
+                              onClick={() => resolveAiPendingReview(item.id, 'monitor', '管理员选择继续观察')}
+                            >
+                              <EyeOff className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-slate-500 hover:text-slate-700 hover:bg-slate-50"
+                              title="误报"
+                              onClick={() => resolveAiPendingReview(item.id, 'false_positive', '管理员标记为误报')}
+                            >
+                              <X className="h-4 w-4" />
+                            </Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              ) : (
+                <div className="h-44 flex flex-col items-center justify-center text-muted-foreground bg-amber-50/10">
+                  <ShieldCheck className="h-10 w-10 mb-2 text-emerald-500/20" />
+                  <p className="text-sm font-medium">暂无待处理样本</p>
+                  <p className="text-xs mt-1">执行 AI 扫描后，中高风险用户会先进入这里</p>
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
           {/* Suspicious Users Table */}
           <Card className="rounded-xl shadow-sm border border-slate-200 overflow-hidden">
             <CardHeader className="px-6 py-4 border-b border-slate-100 bg-white">
@@ -3408,7 +3732,7 @@ export function RealtimeRanking() {
                         </TableCell>
                         <TableCell className="py-4">
                           <div className="flex flex-wrap gap-1.5">
-                            {user.risk_flags.map((flag) => (
+                            {(user.risk_flags || []).map((flag) => (
                               <Badge key={flag} variant="destructive" className="rounded px-2 py-0.5 text-[11px] font-medium border-0 opacity-90">
                                 {RISK_FLAG_LABELS[flag] || flag}
                               </Badge>
@@ -3425,7 +3749,14 @@ export function RealtimeRanking() {
                             {user.empty_rate}%
                           </span>
                         </TableCell>
-                        <TableCell className="py-4 text-right font-mono text-sm text-slate-600">{user.unique_ips}</TableCell>
+                        <TableCell className="py-4 text-right">
+                          <div className="font-mono text-sm text-slate-600">{user.unique_ips}</div>
+                          {(user.shared_user_ips || 0) > 0 && (
+                            <div className="text-[10px] text-rose-600 mt-0.5">
+                              共用 {user.shared_user_ips} 个
+                            </div>
+                          )}
+                        </TableCell>
                         <TableCell className="py-4">
                           <div className="flex items-center justify-center gap-1">
                             <Button
@@ -3522,8 +3853,9 @@ export function RealtimeRanking() {
                       aiAssessResult.assessment.action === 'ban' ? "text-red-600" :
                         aiAssessResult.assessment.action === 'warn' ? "text-amber-600" : "text-green-600"
                     )}>
-                      {aiAssessResult.assessment.action === 'ban' ? '建议封禁' :
-                        aiAssessResult.assessment.action === 'warn' ? '风险告警' :
+                    {aiAssessResult.assessment.action === 'ban' ? '建议封禁' :
+                      aiAssessResult.assessment.action === 'warn' ? '风险告警' :
+                        aiAssessResult.assessment.action === 'review' ? '进入待处理' :
                           aiAssessResult.assessment.action === 'monitor' ? '继续观察' : '正常'}
                     </div>
                     <div className="text-xs text-muted-foreground mt-1">AI 决策</div>
@@ -4247,7 +4579,10 @@ export function RealtimeRanking() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={banConfirmDialog.open} onOpenChange={(open) => setBanConfirmDialog(prev => ({ ...prev, open }))}>
+      <Dialog open={banConfirmDialog.open} onOpenChange={(open) => {
+        setBanConfirmDialog(prev => ({ ...prev, open }))
+        if (!open) setPendingResolveAfterBan(null)
+      }}>
         <DialogContent className="max-w-[600px] w-full rounded-xl gap-6 p-6 overflow-visible">
           <DialogHeader className="space-y-2">
             <DialogTitle className="flex items-center gap-2 text-lg">
@@ -4303,7 +4638,10 @@ export function RealtimeRanking() {
           <DialogFooter className="gap-2 sm:gap-0 mt-2">
             <Button
               variant="ghost"
-              onClick={() => setBanConfirmDialog(prev => ({ ...prev, open: false }))}
+              onClick={() => {
+                setPendingResolveAfterBan(null)
+                setBanConfirmDialog(prev => ({ ...prev, open: false }))
+              }}
               disabled={mutating}
               className="flex-1 sm:flex-none"
             >
@@ -4333,11 +4671,17 @@ export function RealtimeRanking() {
                     const res = await response.json()
                     if (res.success) {
                       showToast('success', res.message || '已封禁')
+                      if (pendingResolveAfterBan) {
+                        await resolveAiPendingReview(pendingResolveAfterBan, 'approved_ban', '管理员确认封禁')
+                        setPendingResolveAfterBan(null)
+                      }
                       setBanConfirmDialog(prev => ({ ...prev, open: false }))
                       setDialogOpen(false)
                       fetchLeaderboards()
+                      fetchIPData()
                       fetchBannedUsers(1)
                       fetchBanRecords(1)
+                      fetchAiPendingReviews()
                     } else {
                       showToast('error', res.message || '封禁失败')
                     }
@@ -4376,6 +4720,7 @@ export function RealtimeRanking() {
                       setBanConfirmDialog(prev => ({ ...prev, open: false }))
                       setDialogOpen(false)
                       fetchLeaderboards()
+                      fetchIPData()
                       fetchBannedUsers(bannedPage)
                       fetchBanRecords(recordsPage)
                     } else {
@@ -4679,6 +5024,8 @@ export function RealtimeRanking() {
                     <span>{'{rapid_switch_count}'} - 快速切换</span>
                     <span>{'{avg_ip_duration}'} - 平均停留</span>
                     <span>{'{min_switch_interval}'} - 最短间隔</span>
+                    <span>{'{shared_ip_count}'} - 共用IP数</span>
+                    <span>{'{max_shared_ip_users}'} - 单IP用户数</span>
                     <span>{'{risk_flags}'} - 风险标签</span>
                     <span>{'{user_ips}'} - 用户使用的IP</span>
                     <span>{'{whitelist_ips}'} - 系统白名单IP</span>

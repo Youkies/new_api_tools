@@ -57,12 +57,17 @@ class AIAssessmentResult:
 
 
 # 配置常量
-AI_ASSESSMENT_COOLDOWN = 24 * 3600  # 24小时冷却期
-RISK_SCORE_BAN_THRESHOLD = 8        # 风险分 >= 8 才自动封禁
-CONFIDENCE_THRESHOLD = 0.8          # 置信度 >= 0.8 才自动执行
+AI_ASSESSMENT_COOLDOWN = 6 * 3600   # 6小时冷却期，允许更频繁复核
+RISK_SCORE_BAN_THRESHOLD = 9        # 风险分 >= 9 才建议封禁
+CONFIDENCE_THRESHOLD = 0.92         # 置信度 >= 0.92 才进入强建议
+AUTO_BAN_SCORE_THRESHOLD = 10       # 自动执行仅用于极明显特征
+AUTO_BAN_CONFIDENCE_THRESHOLD = 0.96
+MANUAL_REVIEW_SCORE_FLOOR = 6
 DEFAULT_AI_MODEL = ""    # 不预设模型，用户需手动选择
 DEFAULT_BASE_URL = ""  # 不预设API地址，用户需手动配置
 AI_CONFIG_KEY = "ai_ban_config"     # 本地存储配置键名
+AI_PENDING_REVIEWS_KEY = "ai_ban_pending_reviews"
+AI_LEARNING_STATS_KEY = "ai_ban_learning_stats"
 
 # API 重试配置
 API_MAX_RETRIES = 3                 # 最大重试次数
@@ -92,6 +97,9 @@ DEFAULT_ASSESSMENT_PROMPT = """你是一个 API 风控系统的 AI 助手。请�
 - 快速切换次数（60秒内，排除双栈）: {rapid_switch_count}
 - 平均 IP 停留时间: {avg_ip_duration} 秒
 - 最短切换间隔: {min_switch_interval} 秒
+- 多用户共用 IP 数量: {shared_ip_count}
+- 单个共用 IP 最大用户数: {max_shared_ip_users}
+- 共用 IP 明细: {shared_ip_details}
 - 已触发风险标签: {risk_flags}
 
 ## Token 使用分析
@@ -104,8 +112,9 @@ DEFAULT_ASSESSMENT_PROMPT = """你是一个 API 风控系统的 AI 助手。请�
 2. **长停留时间豁免**：如果平均 IP 停留时间 >= 300秒（5分钟），即使有快速切换也可能是网络波动，应降低风险
 3. **Token 轮换**：使用多个 Token 且每个 Token 请求很少，可能在规避限制
 4. **双栈用户**：同一位置的 IPv4/IPv6 切换是正常行为，不应视为风险
-5. 多项风险标签叠加时风险更高
-6. 该用户已通过请求量门槛（>= 50次），属于活跃用户
+5. **多用户共用 IP**：同一 IP 被多个不同用户使用，尤其单 IP 用户数 >= 3 时，可能是账号池、代理池或多人共享
+6. 多项风险标签叠加时风险更高
+7. 该用户已通过请求量门槛（>= 50次），属于活跃用户
 
 注意：空回复率和失败率不作为判断依据，因为嵌入模型本身不返回文本内容。
 
@@ -120,8 +129,9 @@ DEFAULT_ASSESSMENT_PROMPT = """你是一个 API 风控系统的 AI 助手。请�
 ```
 
 注意：
-- risk_score >= 8 且 confidence >= 0.8 时才会自动封禁
-- 请谨慎判断，避免误封正常用户
+- 默认只进入待处理区，等待管理员复核
+- 只有 risk_score = 10、confidence >= 0.96 且特征非常明显时才可视为自动封禁候选
+- 请谨慎判断，宁可复核也不要误封正常用户
 - 双栈切换是正常行为，应降低风险评分
 - 只返回 JSON，不要有其他内容"""
 
@@ -159,7 +169,7 @@ class AIAutoBanService:
         self._dry_run = stored_config.get("dry_run", True)
 
         # 定时扫描配置（0 表示关闭，单位：分钟）
-        self._scan_interval_minutes = int(stored_config.get("scan_interval_minutes", 0))
+        self._scan_interval_minutes = int(stored_config.get("scan_interval_minutes", 10))
 
         # 自定义提示词配置（空字符串表示使用默认提示词）
         self._custom_prompt = stored_config.get("custom_prompt", "")
@@ -172,6 +182,10 @@ class AIAutoBanService:
         self._excluded_models = stored_config.get("excluded_models", [])
         # 排除分组列表（这些分组的请求不计入风险分析，如高并发专用分组）
         self._excluded_groups = stored_config.get("excluded_groups", [])
+
+        self._pending_review_first = stored_config.get("pending_review_first", True)
+        self._auto_execute_obvious_bans = stored_config.get("auto_execute_obvious_bans", False)
+        self._review_scan_limit = int(stored_config.get("review_scan_limit", 30))
 
         # 白名单用户ID（从本地存储读取）
         whitelist_ids = stored_config.get("whitelist_ids", [])
@@ -407,7 +421,7 @@ class AIAutoBanService:
         # 获取排行榜数据
         leaderboards = self._risk_service.get_leaderboards(
             windows=[window],
-            limit=50,
+            limit=max(50, limit * 2),
             sort_by="requests",
             use_cache=False,
         )
@@ -416,7 +430,7 @@ class AIAutoBanService:
         suspicious = []
 
         # 只关注 IP 相关的风险标签
-        ip_risk_flags = {"MANY_IPS", "IP_RAPID_SWITCH", "IP_HOPPING"}
+        ip_risk_flags = {"MANY_IPS", "IP_RAPID_SWITCH", "IP_HOPPING", "MULTI_USER_SHARED_IP"}
         # 最低请求量门槛
         min_requests_threshold = 50
         # 排除模型/分组的请求占比阈值（超过此比例则跳过）
@@ -518,6 +532,7 @@ class AIAutoBanService:
         summary = analysis.get("summary", {})
         risk = analysis.get("risk", {})
         ip_switch = risk.get("ip_switch_analysis", {})
+        shared_ip = risk.get("shared_ip_analysis", {})
         user = analysis.get("user", {})
 
         # 获取用户使用的 IP 列表
@@ -554,6 +569,9 @@ class AIAutoBanService:
             "rapid_switch_count": ip_switch.get('rapid_switch_count', 0),
             "avg_ip_duration": ip_switch.get('avg_ip_duration', 0),
             "min_switch_interval": ip_switch.get('min_switch_interval', 0),
+            "shared_ip_count": shared_ip.get("shared_ip_count", 0),
+            "max_shared_ip_users": shared_ip.get("max_users_per_ip", 0),
+            "shared_ip_details": shared_ip.get("ips", []),
             "risk_flags": risk.get('risk_flags', []),
             # Token 轮换相关
             "avg_requests_per_token": avg_requests_per_token,
@@ -1103,6 +1121,183 @@ class AIAutoBanService:
             api_duration_ms=api_result.get("duration_ms", 0),
         )
 
+    def _build_assessment_payload(
+        self,
+        assessment: AIAssessmentResult,
+        analysis: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build a serializable assessment payload for API responses and review queue."""
+        summary = analysis.get("summary", {})
+        risk = analysis.get("risk", {})
+        ip_switch = risk.get("ip_switch_analysis", {})
+        shared_ip = risk.get("shared_ip_analysis", {})
+
+        return {
+            "should_ban": assessment.should_ban,
+            "risk_score": assessment.risk_score,
+            "confidence": assessment.confidence,
+            "reason": assessment.reason,
+            "action": assessment.action.value,
+            "model": assessment.model,
+            "prompt_tokens": assessment.prompt_tokens,
+            "completion_tokens": assessment.completion_tokens,
+            "total_tokens": assessment.total_tokens,
+            "api_duration_ms": assessment.api_duration_ms,
+            "risk_flags": risk.get("risk_flags", []),
+            "total_requests": summary.get("total_requests", 0),
+            "unique_ips": summary.get("unique_ips", 0),
+            "unique_tokens": summary.get("unique_tokens", 0),
+            "shared_user_ips": shared_ip.get("shared_ip_count", 0),
+            "max_shared_ip_users": shared_ip.get("max_users_per_ip", 0),
+            "rapid_switch_count": ip_switch.get("rapid_switch_count", 0),
+            "real_switch_count": ip_switch.get("real_switch_count", ip_switch.get("switch_count", 0)),
+            "avg_ip_duration": ip_switch.get("avg_ip_duration", 0),
+            "policy": "pending_review_first",
+            "requires_human_review": not self._is_extreme_auto_ban(assessment),
+        }
+
+    def _is_extreme_auto_ban(self, assessment: AIAssessmentResult) -> bool:
+        return (
+            assessment.action == AIBanAction.BAN
+            and assessment.risk_score >= AUTO_BAN_SCORE_THRESHOLD
+            and assessment.confidence >= AUTO_BAN_CONFIDENCE_THRESHOLD
+        )
+
+    def _get_pending_reviews_raw(self) -> List[Dict[str, Any]]:
+        reviews = self._storage.get_config(AI_PENDING_REVIEWS_KEY, [])
+        return reviews if isinstance(reviews, list) else []
+
+    def queue_pending_review(
+        self,
+        user_id: int,
+        username: str,
+        window: str,
+        source: str,
+        assessment: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        reviews = self._get_pending_reviews_raw()
+        now = int(time.time())
+        review_id = f"{user_id}:{window}"
+
+        item = {
+            "id": review_id,
+            "user_id": user_id,
+            "username": username,
+            "window": window,
+            "source": source,
+            "status": "pending",
+            "risk_score": assessment.get("risk_score", 0),
+            "confidence": assessment.get("confidence", 0),
+            "reason": assessment.get("reason", ""),
+            "action": assessment.get("action", "review"),
+            "risk_flags": assessment.get("risk_flags", []),
+            "total_requests": assessment.get("total_requests", 0),
+            "unique_ips": assessment.get("unique_ips", 0),
+            "shared_user_ips": assessment.get("shared_user_ips", 0),
+            "max_shared_ip_users": assessment.get("max_shared_ip_users", 0),
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        replaced = False
+        for index, existing in enumerate(reviews):
+            same_id = existing.get("id") == review_id
+            same_pending_user = existing.get("user_id") == user_id and existing.get("status") == "pending"
+            if same_id or same_pending_user:
+                item["created_at"] = existing.get("created_at") or now
+                reviews[index] = item
+                replaced = True
+                break
+
+        if not replaced:
+            reviews.insert(0, item)
+
+        self._storage.set_config(AI_PENDING_REVIEWS_KEY, reviews[:500], "AI pending review queue")
+        return item
+
+    def get_pending_reviews(
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        status: str = "pending",
+    ) -> Dict[str, Any]:
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        status = status or "pending"
+
+        reviews = self._get_pending_reviews_raw()
+        filtered = [
+            item for item in reviews
+            if status == "all" or item.get("status") == status
+        ]
+        total = len(filtered)
+        return {
+            "items": filtered[offset:offset + limit],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "learning_stats": self.get_learning_stats(),
+        }
+
+    def resolve_pending_review(
+        self,
+        review_id: str,
+        action: str = "monitor",
+        note: str = "",
+    ) -> Dict[str, Any]:
+        if not review_id:
+            return {"success": False, "message": "缺少 review_id"}
+
+        reviews = self._get_pending_reviews_raw()
+        now = int(time.time())
+        resolved = None
+
+        for item in reviews:
+            if item.get("id") == review_id:
+                item["status"] = action or "monitor"
+                item["admin_note"] = note
+                item["resolved_at"] = now
+                item["updated_at"] = now
+                resolved = item
+                break
+
+        if not resolved:
+            return {"success": False, "message": "待处理项不存在"}
+
+        self._storage.set_config(AI_PENDING_REVIEWS_KEY, reviews, "AI pending review queue")
+        self._record_learning_feedback(resolved, action or "monitor")
+        return {
+            "success": True,
+            "message": "已记录管理员处理结果",
+            "item": resolved,
+        }
+
+    def get_learning_stats(self) -> Dict[str, Any]:
+        stats = self._storage.get_config(AI_LEARNING_STATS_KEY, {})
+        if not isinstance(stats, dict):
+            stats = {}
+        stats.setdefault("total_feedback", 0)
+        stats.setdefault("actions", {})
+        stats.setdefault("risk_flags", {})
+        stats.setdefault("updated_at", 0)
+        return stats
+
+    def _record_learning_feedback(self, item: Dict[str, Any], action: str):
+        stats = self.get_learning_stats()
+        stats["total_feedback"] = int(stats.get("total_feedback", 0)) + 1
+        stats["updated_at"] = int(time.time())
+
+        actions = stats.setdefault("actions", {})
+        actions[action] = int(actions.get(action, 0)) + 1
+
+        flag_stats = stats.setdefault("risk_flags", {})
+        for flag in item.get("risk_flags") or []:
+            per_flag = flag_stats.setdefault(flag, {})
+            per_flag[action] = int(per_flag.get(action, 0)) + 1
+            per_flag["total"] = int(per_flag.get("total", 0)) + 1
+
+        self._storage.set_config(AI_LEARNING_STATS_KEY, stats, "AI review feedback counters")
+
     async def process_user(
         self,
         user_id: int,
@@ -1131,19 +1326,7 @@ class AIAutoBanService:
             result["message"] = f"AI 评估失败: {self._last_error_message or 'API 调用失败或响应解析错误'}"
             return result
         
-        result["assessment"] = {
-            "should_ban": assessment.should_ban,
-            "risk_score": assessment.risk_score,
-            "confidence": assessment.confidence,
-            "reason": assessment.reason,
-            "action": assessment.action.value,
-            # AI API 调用信息
-            "model": assessment.model,
-            "prompt_tokens": assessment.prompt_tokens,
-            "completion_tokens": assessment.completion_tokens,
-            "total_tokens": assessment.total_tokens,
-            "api_duration_ms": assessment.api_duration_ms,
-        }
+        result["assessment"] = self._build_assessment_payload(assessment, analysis)
         result["action"] = assessment.action.value
         
         # 设置冷却期
@@ -1151,11 +1334,25 @@ class AIAutoBanService:
         
         # 根据决策执行
         if assessment.action == AIBanAction.BAN:
-            if self._dry_run:
-                result["message"] = f"[试运行] 建议封禁: {assessment.reason}"
+            can_auto_execute = (
+                self._auto_execute_obvious_bans
+                and not self._dry_run
+                and self._is_extreme_auto_ban(assessment)
+            )
+
+            if not can_auto_execute:
+                review = self.queue_pending_review(
+                    user_id=user_id,
+                    username=username,
+                    window=str(analysis.get("window", "1h")),
+                    source="scan",
+                    assessment=result["assessment"],
+                )
+                result["action"] = "review"
+                result["review"] = review
+                result["message"] = f"已进入待处理复核区: {assessment.reason}"
                 result["executed"] = False
             else:
-                # 执行封禁
                 ban_result = self._user_service.ban_user(
                     user_id=user_id,
                     reason=f"[AI自动封禁] {assessment.reason}",
@@ -1172,20 +1369,31 @@ class AIAutoBanService:
                 result["message"] = ban_result.get("message", "")
         
         elif assessment.action == AIBanAction.WARN:
-            result["message"] = f"风险告警: {assessment.reason}"
-            # 记录告警日志
-            self._storage.add_security_audit(
-                action="ai_warn",
-                user_id=user_id,
-                username=username,
-                operator="AI自动封禁",
-                reason=assessment.reason,
-                context={
-                    "source": "ai_auto_ban",
-                    "risk_score": assessment.risk_score,
-                    "confidence": assessment.confidence,
-                },
-            )
+            if assessment.risk_score >= MANUAL_REVIEW_SCORE_FLOOR:
+                review = self.queue_pending_review(
+                    user_id=user_id,
+                    username=username,
+                    window=str(analysis.get("window", "1h")),
+                    source="scan",
+                    assessment=result["assessment"],
+                )
+                result["action"] = "review"
+                result["review"] = review
+                result["message"] = f"已进入待处理复核区: {assessment.reason}"
+            else:
+                result["message"] = f"风险告警: {assessment.reason}"
+                self._storage.add_security_audit(
+                    action="ai_warn",
+                    user_id=user_id,
+                    username=username,
+                    operator="AI自动封禁",
+                    reason=assessment.reason,
+                    context={
+                        "source": "ai_auto_ban",
+                        "risk_score": assessment.risk_score,
+                        "confidence": assessment.confidence,
+                    },
+                )
         
         elif assessment.action == AIBanAction.MONITOR:
             result["message"] = f"继续观察: {assessment.reason}"
@@ -1195,7 +1403,7 @@ class AIAutoBanService:
         
         return result
 
-    async def run_scan(self, window: str = "1h", limit: int = 10, manual: bool = False) -> Dict[str, Any]:
+    async def run_scan(self, window: str = "1h", limit: int = 30, manual: bool = False) -> Dict[str, Any]:
         """
         执行一次扫描
         
@@ -1228,6 +1436,9 @@ class AIAutoBanService:
                 "api_suspended": True,
             }
         
+        limit = max(limit, self._review_scan_limit, 20)
+        limit = min(limit, 100)
+
         logger.info(f"AI封禁{scan_type}: 开始扫描 (scan_id={scan_id}, window={window}, limit={limit})")
         
         start_time = time.time()
@@ -1242,6 +1453,7 @@ class AIAutoBanService:
             user_id = user_data["user_id"]
             username = user_data["username"]
             analysis = user_data["analysis"]
+            analysis["window"] = window
             
             try:
                 result = await self.process_user(user_id, username, analysis)
@@ -1264,6 +1476,12 @@ class AIAutoBanService:
             "total_processed": len(results),
             "banned": sum(1 for r in results if r.get("action") == "ban" and r.get("executed")),
             "warned": sum(1 for r in results if r.get("action") == "warn"),
+            "queued": sum(1 for r in results if r.get("action") == "review"),
+            "review_candidates": sum(1 for r in results if r.get("action") == "review"),
+            "auto_ban_candidates": sum(
+                1 for r in results
+                if (r.get("assessment") or {}).get("action") == "ban"
+            ),
             "skipped": sum(1 for r in results if r.get("action") in ["skip", "monitor"]),
             "errors": sum(1 for r in results if r.get("action") == "error"),
         }
@@ -1344,6 +1562,20 @@ class AIAutoBanService:
             "confidence_threshold": CONFIDENCE_THRESHOLD,
             "cooldown_hours": AI_ASSESSMENT_COOLDOWN // 3600,
             "scan_interval_minutes": self._scan_interval_minutes,
+            "pending_review_first": self._pending_review_first,
+            "auto_execute_obvious_bans": self._auto_execute_obvious_bans,
+            "review_scan_limit": self._review_scan_limit,
+            "review_policy": {
+                "mode": "pending_review_first",
+                "review_scan_limit": self._review_scan_limit,
+                "pending_review_first": self._pending_review_first,
+                "auto_execute_obvious_bans": self._auto_execute_obvious_bans,
+                "auto_ban_score_threshold": AUTO_BAN_SCORE_THRESHOLD,
+                "auto_ban_confidence_floor": AUTO_BAN_CONFIDENCE_THRESHOLD,
+                "manual_review_score_floor": MANUAL_REVIEW_SCORE_FLOOR,
+                "assessment_cooldown_hours": AI_ASSESSMENT_COOLDOWN // 3600,
+                "review_recommendation_note": "默认进入待处理；仅特征极明显且显式开启自动执行时才自动封禁",
+            },
             # 自定义提示词
             "custom_prompt": self._custom_prompt,
             "default_prompt": DEFAULT_ASSESSMENT_PROMPT,

@@ -18,6 +18,9 @@ func RegisterAIAutoBanRoutes(r *gin.RouterGroup) {
 		g.POST("/reset-api-health", ResetAPIHealth)
 		g.GET("/audit-logs", GetAuditLogs)
 		g.DELETE("/audit-logs", ClearAuditLogs)
+		g.GET("/pending-reviews", GetPendingAIReviews)
+		g.POST("/pending-reviews/resolve", ResolvePendingAIReview)
+		g.GET("/learning-stats", GetAILearningStats)
 		g.GET("/groups", GetAvailableGroupsForBan)
 		g.GET("/available-groups", GetAvailableGroupsForBan)
 		g.GET("/models", GetAvailableModelsForExclude)
@@ -36,6 +39,47 @@ func RegisterAIAutoBanRoutes(r *gin.RouterGroup) {
 		g.POST("/fetch-models", FetchAIModels) // 保持向后兼容
 		g.POST("/test-model", TestAIModel)
 	}
+}
+
+// GET /api/ai-ban/pending-reviews
+func GetPendingAIReviews(c *gin.Context) {
+	limit := parseLimit(c, 20, 200)
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if offset < 0 {
+		offset = 0
+	}
+	status := c.DefaultQuery("status", "pending")
+
+	svc := service.NewAIAutoBanService()
+	data := svc.GetPendingReviews(limit, offset, status)
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// POST /api/ai-ban/pending-reviews/resolve
+func ResolvePendingAIReview(c *gin.Context) {
+	var req struct {
+		ReviewID string `json:"review_id"`
+		Action   string `json:"action"`
+		Note     string `json:"note"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		return
+	}
+
+	svc := service.NewAIAutoBanService()
+	data := svc.ResolvePendingReview(req.ReviewID, req.Action, req.Note)
+	if ok, _ := data["success"].(bool); !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "message": data["message"], "data": data})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data, "message": data["message"]})
+}
+
+// GET /api/ai-ban/learning-stats
+func GetAILearningStats(c *gin.Context) {
+	svc := service.NewAIAutoBanService()
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": svc.GetLearningStats()})
 }
 
 // GET /api/ai-ban/config
@@ -100,7 +144,13 @@ func GetAvailableGroupsForBan(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"count": len(data),
+			"items": data,
+		},
+	})
 }
 
 // GET /api/ai-ban/models
@@ -112,7 +162,13 @@ func GetAvailableModelsForExclude(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"count": len(data),
+			"items": data,
+		},
+	})
 }
 
 // GET /api/ai-ban/suspicious
@@ -130,7 +186,14 @@ func GetSuspiciousUsers(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"window": window,
+			"count":  len(data),
+			"items":  data,
+		},
+	})
 }
 
 // POST /api/ai-ban/assess

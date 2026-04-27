@@ -397,6 +397,125 @@ class IPMonitoringService:
             logger.db_error(f"获取共享 IP 失败: {e}")
             return {"items": [], "total": 0}
 
+    def get_shared_user_ips(
+        self,
+        window_seconds: int,
+        min_users: int = 2,
+        limit: int = 50,
+        now: Optional[int] = None,
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Get IPs that are used by multiple users, including per-user ban status.
+        """
+        if now is None:
+            now = int(time.time())
+        start_time = now - window_seconds
+        min_users = max(2, min_users)
+        window_name = self._get_window_name(window_seconds)
+
+        if use_cache:
+            cached = self.cache.get_ip_monitoring("shared_user_ips", window_name, limit)
+            if cached is not None:
+                return {"items": cached, "total": len(cached)}
+
+        self.db.connect()
+
+        sql = """
+            SELECT
+                l.ip,
+                COUNT(DISTINCT l.user_id) as user_count,
+                COUNT(DISTINCT l.token_id) as token_count,
+                COUNT(DISTINCT CASE WHEN u.status = 2 THEN l.user_id ELSE NULL END) as banned_count,
+                COUNT(*) as request_count
+            FROM logs l
+            LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+            WHERE l.created_at >= :start_time AND l.created_at <= :end_time
+                AND l.ip IS NOT NULL AND l.ip <> ''
+                AND l.user_id IS NOT NULL
+            GROUP BY l.ip
+            HAVING COUNT(DISTINCT l.user_id) >= :min_users
+            ORDER BY user_count DESC, request_count DESC
+            LIMIT :limit
+        """
+
+        try:
+            rows = self.db.execute(sql, {
+                "start_time": start_time,
+                "end_time": now,
+                "min_users": min_users,
+                "limit": limit,
+            })
+
+            ips = [row.get("ip") for row in rows if row.get("ip")]
+            users_by_ip: Dict[str, List[Dict[str, Any]]] = {}
+
+            if ips:
+                placeholders = ",".join([f":ip{i}" for i in range(len(ips))])
+                user_sql = f"""
+                    SELECT
+                        l.ip,
+                        l.user_id,
+                        COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), NULLIF(MAX(l.username), ''), '') as username,
+                        COALESCE(NULLIF(MAX(u.display_name), ''), '') as display_name,
+                        COALESCE(MAX(u.status), 0) as status,
+                        COUNT(DISTINCT l.token_id) as token_count,
+                        COUNT(*) as request_count,
+                        MIN(l.created_at) as first_seen,
+                        MAX(l.created_at) as last_seen
+                    FROM logs l
+                    LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+                    WHERE l.created_at >= :start_time AND l.created_at <= :end_time
+                        AND l.ip IN ({placeholders})
+                        AND l.user_id IS NOT NULL
+                    GROUP BY l.ip, l.user_id
+                    ORDER BY l.ip, request_count DESC
+                """
+                params = {"start_time": start_time, "end_time": now}
+                for i, ip in enumerate(ips):
+                    params[f"ip{i}"] = ip
+
+                for user_row in self.db.execute(user_sql, params) or []:
+                    ip = user_row.get("ip") or ""
+                    users_by_ip.setdefault(ip, [])
+                    if len(users_by_ip[ip]) < 20:
+                        users_by_ip[ip].append({
+                            "user_id": int(user_row.get("user_id") or 0),
+                            "username": user_row.get("username") or "",
+                            "display_name": user_row.get("display_name") or "",
+                            "status": int(user_row.get("status") or 0),
+                            "token_count": int(user_row.get("token_count") or 0),
+                            "request_count": int(user_row.get("request_count") or 0),
+                            "first_seen": int(user_row.get("first_seen") or 0),
+                            "last_seen": int(user_row.get("last_seen") or 0),
+                        })
+
+            items = []
+            for row in rows:
+                ip = row.get("ip") or ""
+                items.append({
+                    "ip": ip,
+                    "token_count": int(row.get("token_count") or 0),
+                    "user_count": int(row.get("user_count") or 0),
+                    "banned_count": int(row.get("banned_count") or 0),
+                    "request_count": int(row.get("request_count") or 0),
+                    "users": users_by_ip.get(ip, []),
+                })
+
+            ttl = _get_cache_ttl()
+            self.cache.set_ip_monitoring("shared_user_ips", window_name, items, ttl)
+            logger.success(
+                "IP监控 缓存更新: shared_user_ips",
+                window=window_name,
+                items=len(items),
+                TTL=f"{ttl}s"
+            )
+            return {"items": items, "total": len(items)}
+
+        except Exception as e:
+            logger.db_error(f"获取多用户共用 IP 失败: {e}")
+            return {"items": [], "total": 0}
+
     def get_multi_ip_tokens(
         self,
         window_seconds: int,

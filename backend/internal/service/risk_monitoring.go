@@ -241,6 +241,7 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		ipSequence = []map[string]interface{}{}
 	}
 	ipSwitchAnalysis := analyzeIPSwitches(ipSequence)
+	sharedIPAnalysis := s.getSharedIPAnalysis(userID, startTime, now, 3, 20)
 
 	// Risk flags
 	riskFlags := []string{}
@@ -263,6 +264,9 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	}
 	if avgIPDuration < 30 && realSwitchCount >= 3 {
 		riskFlags = append(riskFlags, "IP_HOPPING")
+	}
+	if toInt64(sharedIPAnalysis["shared_ip_count"]) > 0 {
+		riskFlags = append(riskFlags, "MULTI_USER_SHARED_IP")
 	}
 
 	// Checkin anomaly detection
@@ -292,6 +296,7 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		"avg_quota_per_request": avgQuotaPerRequest,
 		"risk_flags":            riskFlags,
 		"ip_switch_analysis":    ipSwitchAnalysis,
+		"shared_ip_analysis":    sharedIPAnalysis,
 	}
 	if checkinAnalysisMap != nil {
 		risk["checkin_analysis"] = checkinAnalysisMap
@@ -383,6 +388,58 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	}
 
 	return result, nil
+}
+
+func (s *RiskMonitoringService) getSharedIPAnalysis(userID int64, startTime, endTime int64, minUsers, limit int) map[string]interface{} {
+	empty := map[string]interface{}{
+		"shared_ip_count":  int64(0),
+		"max_users_per_ip": int64(0),
+		"ips":              []map[string]interface{}{},
+	}
+
+	if minUsers < 2 {
+		minUsers = 2
+	}
+
+	query := s.db.RebindQuery(`
+		WITH user_ips AS (
+			SELECT DISTINCT ip
+			FROM logs
+			WHERE user_id = ? AND created_at >= ? AND created_at <= ?
+				AND ip IS NOT NULL AND ip <> ''
+		)
+		SELECT l.ip,
+			COUNT(DISTINCT l.user_id) as user_count,
+			COUNT(DISTINCT l.token_id) as token_count,
+			COUNT(*) as request_count
+		FROM logs l
+		INNER JOIN user_ips ui ON ui.ip = l.ip
+		WHERE l.created_at >= ? AND l.created_at <= ?
+			AND l.ip IS NOT NULL AND l.ip <> ''
+			AND l.user_id IS NOT NULL
+		GROUP BY l.ip
+		HAVING COUNT(DISTINCT l.user_id) >= ?
+		ORDER BY user_count DESC, request_count DESC
+		LIMIT ?`)
+
+	rows, err := s.db.Query(query, userID, startTime, endTime, startTime, endTime, minUsers, limit)
+	if err != nil || len(rows) == 0 {
+		return empty
+	}
+
+	maxUsers := int64(0)
+	for _, row := range rows {
+		userCount := toInt64(row["user_count"])
+		if userCount > maxUsers {
+			maxUsers = userCount
+		}
+	}
+
+	return map[string]interface{}{
+		"shared_ip_count":  int64(len(rows)),
+		"max_users_per_ip": maxUsers,
+		"ips":              rows,
+	}
 }
 
 // GetTokenRotationUsers detects token rotation behavior

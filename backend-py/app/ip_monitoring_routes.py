@@ -71,6 +71,30 @@ async def get_shared_ips(
     return SharedIPsResponse(success=True, data=data)
 
 
+@router.get("/shared-users", response_model=SharedIPsResponse)
+@router.get("/shared-user-ips", response_model=SharedIPsResponse)
+async def get_shared_user_ips(
+    window: str = Query(default="24h", description="时间窗口 (1h/3h/6h/12h/24h/3d/7d)"),
+    min_users: int = Query(default=2, ge=2, le=100, description="最小用户数阈值"),
+    limit: int = Query(default=50, ge=1, le=200, description="返回数量"),
+    no_cache: bool = Query(default=False, description="强制刷新，跳过缓存"),
+    _: str = Depends(verify_auth),
+):
+    """Get IPs used by multiple users, including user ban status."""
+    seconds = WINDOW_SECONDS.get(window)
+    if not seconds:
+        raise InvalidParamsError(message=f"Invalid window: {window}")
+
+    service = get_ip_monitoring_service()
+    data = service.get_shared_user_ips(
+        window_seconds=seconds,
+        min_users=min_users,
+        limit=limit,
+        use_cache=not no_cache,
+    )
+    return SharedIPsResponse(success=True, data=data)
+
+
 @router.get("/multi-ip-tokens", response_model=MultiIPTokensResponse)
 async def get_multi_ip_tokens(
     window: str = Query(default="24h", description="时间窗口 (1h/3h/6h/12h/24h/3d/7d)"),

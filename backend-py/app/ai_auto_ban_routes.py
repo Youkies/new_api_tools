@@ -33,6 +33,9 @@ class SaveConfigRequest(BaseModel):
     blacklist_ips: Optional[list] = None  # IP 黑名单（已知恶意IP）
     excluded_models: Optional[list] = None  # 排除模型列表（这些模型的请求不计入风险分析）
     excluded_groups: Optional[list] = None  # 排除分组列表（这些分组的请求不计入风险分析）
+    pending_review_first: Optional[bool] = None
+    auto_execute_obvious_bans: Optional[bool] = None
+    review_scan_limit: Optional[int] = None
 
 
 class FetchModelsRequest(BaseModel):
@@ -57,6 +60,13 @@ class WhitelistAddRequest(BaseModel):
 class WhitelistRemoveRequest(BaseModel):
     """移除白名单请求"""
     user_id: int
+
+
+class ResolvePendingReviewRequest(BaseModel):
+    """处理 AI 待复核项请求"""
+    review_id: str
+    action: str = "monitor"
+    note: str = ""
 
 
 @router.get("/config")
@@ -89,10 +99,10 @@ async def save_config(
     if request.dry_run is not None:
         config["dry_run"] = request.dry_run
     if request.scan_interval_minutes is not None:
-        # 限制扫描间隔范围：0（关闭）或 15-1440 分钟（15分钟到24小时）
+        # 限制扫描间隔范围：0（关闭）或 5-1440 分钟
         interval = request.scan_interval_minutes
-        if interval != 0 and (interval < 15 or interval > 1440):
-            raise HTTPException(status_code=400, detail="扫描间隔必须为0（关闭）或15-1440分钟")
+        if interval != 0 and (interval < 5 or interval > 1440):
+            raise HTTPException(status_code=400, detail="扫描间隔必须为0（关闭）或5-1440分钟")
         config["scan_interval_minutes"] = interval
     if request.custom_prompt is not None:
         config["custom_prompt"] = request.custom_prompt
@@ -104,6 +114,12 @@ async def save_config(
         config["excluded_models"] = request.excluded_models
     if request.excluded_groups is not None:
         config["excluded_groups"] = request.excluded_groups
+    if request.pending_review_first is not None:
+        config["pending_review_first"] = request.pending_review_first
+    if request.auto_execute_obvious_bans is not None:
+        config["auto_execute_obvious_bans"] = request.auto_execute_obvious_bans
+    if request.review_scan_limit is not None:
+        config["review_scan_limit"] = max(1, min(request.review_scan_limit, 100))
 
     if not config:
         raise HTTPException(status_code=400, detail="没有要保存的配置")
@@ -159,6 +175,52 @@ async def clear_audit_logs(
         "success": True,
         "message": f"已清空 {count} 条记录",
         "count": count,
+    }
+
+
+@router.get("/pending-reviews")
+async def get_pending_reviews(
+    limit: int = Query(default=20, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    status: str = Query(default="pending"),
+    _: str = Depends(verify_auth),
+):
+    """获取 AI 待处理复核列表"""
+    service = get_ai_auto_ban_service()
+    return {
+        "success": True,
+        "data": service.get_pending_reviews(limit=limit, offset=offset, status=status),
+    }
+
+
+@router.post("/pending-reviews/resolve")
+async def resolve_pending_review(
+    request: ResolvePendingReviewRequest,
+    _: str = Depends(verify_auth),
+):
+    """记录管理员对 AI 待复核项的处理结果"""
+    service = get_ai_auto_ban_service()
+    result = service.resolve_pending_review(
+        review_id=request.review_id,
+        action=request.action,
+        note=request.note,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message", "处理失败"))
+    return {
+        "success": True,
+        "message": result.get("message", ""),
+        "data": result,
+    }
+
+
+@router.get("/learning-stats")
+async def get_learning_stats(_: str = Depends(verify_auth)):
+    """获取管理员反馈学习统计"""
+    service = get_ai_auto_ban_service()
+    return {
+        "success": True,
+        "data": service.get_learning_stats(),
     }
 
 
@@ -254,6 +316,8 @@ async def get_suspicious_users(
             "failure_rate": round(analysis.get("summary", {}).get("failure_rate", 0) * 100, 1),
             "unique_ips": analysis.get("summary", {}).get("unique_ips", 0),
             "rapid_switch_count": analysis.get("risk", {}).get("ip_switch_analysis", {}).get("rapid_switch_count", 0),
+            "shared_user_ips": analysis.get("risk", {}).get("shared_ip_analysis", {}).get("shared_ip_count", 0),
+            "max_shared_ip_users": analysis.get("risk", {}).get("shared_ip_analysis", {}).get("max_users_per_ip", 0),
         })
     
     return {
@@ -295,6 +359,17 @@ async def manual_assess(
     
     if not assessment:
         raise HTTPException(status_code=500, detail="AI 评估失败，请检查 API 配置")
+
+    assessment_payload = service._build_assessment_payload(assessment, analysis)
+    review = None
+    if assessment.risk_score >= 6:
+        review = service.queue_pending_review(
+            user_id=request.user_id,
+            username=analysis.get("user", {}).get("username", ""),
+            window=request.window,
+            source="manual_assess",
+            assessment=assessment_payload,
+        )
     
     return {
         "success": True,
@@ -302,17 +377,12 @@ async def manual_assess(
             "user_id": request.user_id,
             "username": analysis.get("user", {}).get("username", ""),
             "window": request.window,
-            "assessment": {
-                "should_ban": assessment.should_ban,
-                "risk_score": assessment.risk_score,
-                "confidence": assessment.confidence,
-                "reason": assessment.reason,
-                "action": assessment.action.value,
-            },
+            "assessment": assessment_payload,
+            "review": review,
             "would_execute": (
-                assessment.action.value == "ban" and 
-                assessment.risk_score >= 8 and 
-                assessment.confidence >= 0.8
+                service._auto_execute_obvious_bans
+                and not service.is_dry_run()
+                and service._is_extreme_auto_ban(assessment)
             ),
         },
     }
@@ -321,7 +391,7 @@ async def manual_assess(
 @router.post("/scan")
 async def run_scan(
     window: str = Query(default="1h", description="时间窗口"),
-    limit: int = Query(default=10, ge=1, le=50, description="最大处理用户数"),
+    limit: int = Query(default=30, ge=1, le=100, description="最大处理用户数"),
     _: str = Depends(verify_auth),
 ):
     """

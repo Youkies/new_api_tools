@@ -18,6 +18,8 @@ func RegisterIPMonitoringRoutes(r *gin.RouterGroup) {
 		g.GET("/stats", GetIPStats)
 		g.GET("/shared", GetSharedIPs)
 		g.GET("/shared-ips", GetSharedIPs)
+		g.GET("/shared-users", GetSharedUserIPs)
+		g.GET("/shared-user-ips", GetSharedUserIPs)
 		g.GET("/multi-ip-tokens", GetMultiIPTokens)
 		g.GET("/multi-ip-users", GetMultiIPUsers)
 		g.POST("/enable-all-recording", EnableAllIPRecording)
@@ -54,6 +56,25 @@ func GetSharedIPs(c *gin.Context) {
 
 	svc := service.NewIPMonitoringService()
 	data, err := svc.GetSharedIPs(window, minTokens, limit)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// GET /api/ip/shared-users
+func GetSharedUserIPs(c *gin.Context) {
+	window := c.DefaultQuery("window", "24h")
+	if !validWindow(window) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid window value", ""))
+		return
+	}
+	minUsers, _ := strconv.Atoi(c.DefaultQuery("min_users", "2"))
+	limit := parseLimit(c, 50, maxIPLimit)
+
+	svc := service.NewIPMonitoringService()
+	data, err := svc.GetSharedUserIPs(window, minUsers, limit)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return

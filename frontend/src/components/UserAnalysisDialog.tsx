@@ -77,6 +77,7 @@ export const RISK_FLAG_LABELS: Record<string, string> = {
     'HIGH_EMPTY_RATE': '空回复率过高',
     'IP_RAPID_SWITCH': 'IP快速切换',
     'IP_HOPPING': 'IP跳动异常',
+    'MULTI_USER_SHARED_IP': '多用户共用IP',
     'CHECKIN_ANOMALY': '签到刷额度异常',
 }
 
@@ -88,6 +89,7 @@ export const BAN_REASONS = [
     { value: '空回复率过高 (HIGH_EMPTY_RATE)', label: '空回复率过高 (HIGH_EMPTY_RATE)' },
     { value: 'IP快速切换 (IP_RAPID_SWITCH)', label: 'IP快速切换 (IP_RAPID_SWITCH)' },
     { value: 'IP跳动异常 (IP_HOPPING)', label: 'IP跳动异常 (IP_HOPPING)' },
+    { value: '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)', label: '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)' },
     { value: '签到刷额度异常 (CHECKIN_ANOMALY)', label: '签到刷额度异常 (CHECKIN_ANOMALY)' },
     { value: '账号共享嫌疑', label: '账号共享嫌疑' },
     { value: '令牌泄露风险', label: '令牌泄露风险' },
