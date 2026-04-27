@@ -20,6 +20,7 @@ import {
   Send,
   Key,
   Shield,
+  ArrowDownUp,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
@@ -90,6 +91,15 @@ interface UserInfo {
   source?: string
 }
 
+type UserSortField = 'quota' | 'used_quota' | 'request_count'
+type SortDirection = 'ASC' | 'DESC'
+
+const USER_SORT_LABELS: Record<UserSortField, string> = {
+  quota: '余额',
+  used_quota: '用量',
+  request_count: '请求数',
+}
+
 export function UserManagement() {
   const { token } = useAuth()
   const { showToast } = useToast()
@@ -104,6 +114,8 @@ export function UserManagement() {
   const [search, setSearch] = useState('')
   const [searchInput, setSearchInput] = useState('')
   const [activityFilter, setActivityFilter] = useState<string>('all')
+  const [orderBy, setOrderBy] = useState<UserSortField>('request_count')
+  const [orderDir, setOrderDir] = useState<SortDirection>('DESC')
   const [deleting, setDeleting] = useState(false)
   const [deletingVeryInactive, setDeletingVeryInactive] = useState(false)
   const [deletingNever, setDeletingNever] = useState(false)
@@ -351,6 +363,8 @@ export function UserManagement() {
       const params = new URLSearchParams({
         page: page.toString(),
         page_size: pageSize.toString(),
+        order_by: orderBy,
+        order_dir: orderDir,
       })
       if (search) params.append('search', search)
       if (activityFilter && activityFilter !== 'all') params.append('activity', activityFilter)
@@ -370,7 +384,7 @@ export function UserManagement() {
     } finally {
       setLoading(false)
     }
-  }, [apiUrl, getAuthHeaders, page, pageSize, search, activityFilter, groupFilter, sourceFilter, showToast])
+  }, [apiUrl, getAuthHeaders, page, pageSize, search, activityFilter, groupFilter, sourceFilter, orderBy, orderDir, showToast])
 
   // 添加用户到 AI 封禁白名单
   const addToWhitelist = useCallback(async (userId: number, username: string) => {
@@ -550,6 +564,38 @@ export function UserManagement() {
 
   const handleKeyPress = (e: React.KeyboardEvent) => {
     if (e.key === 'Enter') handleSearch()
+  }
+
+  const toggleSort = (field: UserSortField) => {
+    setPage(1)
+    if (orderBy === field) {
+      setOrderDir(prev => prev === 'DESC' ? 'ASC' : 'DESC')
+    } else {
+      setOrderBy(field)
+      setOrderDir('DESC')
+    }
+  }
+
+  const renderSortableHead = (field: UserSortField, label: string, className = '') => {
+    const active = orderBy === field
+    return (
+      <TableHead className={cn("text-right", className)}>
+        <Button
+          variant="ghost"
+          size="sm"
+          className={cn(
+            "h-7 px-2 -mr-2 text-xs font-semibold",
+            active ? "text-primary bg-primary/5" : "text-muted-foreground"
+          )}
+          onClick={() => toggleSort(field)}
+          title={`按${label}${active && orderDir === 'DESC' ? '升序' : '降序'}排列`}
+        >
+          {label}
+          <ArrowDownUp className={cn("ml-1 h-3.5 w-3.5", active && "text-primary")} />
+          {active && <span className="ml-1 font-mono text-[10px]">{orderDir === 'DESC' ? '↓' : '↑'}</span>}
+        </Button>
+      </TableHead>
+    )
   }
 
   useEffect(() => {
@@ -883,6 +929,19 @@ export function UserManagement() {
                 ))}
               </Select>
             </div>
+            <div className="w-full sm:w-36">
+              <Select value={orderBy} onChange={(e) => { setOrderBy(e.target.value as UserSortField); setPage(1) }}>
+                {(Object.keys(USER_SORT_LABELS) as UserSortField[]).map((field) => (
+                  <option key={field} value={field}>按{USER_SORT_LABELS[field]}</option>
+                ))}
+              </Select>
+            </div>
+            <div className="w-full sm:w-28">
+              <Select value={orderDir} onChange={(e) => { setOrderDir(e.target.value as SortDirection); setPage(1) }}>
+                <option value="DESC">从高到低</option>
+                <option value="ASC">从低到高</option>
+              </Select>
+            </div>
           </div>
 
           {/* Batch Move */}
@@ -964,9 +1023,9 @@ export function UserManagement() {
                     <TableHead className="hidden sm:table-cell">角色</TableHead>
                     <TableHead>状态</TableHead>
                     <TableHead className="hidden lg:table-cell">Linux.do</TableHead>
-                    <TableHead className="text-right">额度 (USD)</TableHead>
-                    <TableHead className="text-right hidden sm:table-cell">已用</TableHead>
-                    <TableHead className="text-right hidden md:table-cell">请求数</TableHead>
+                    {renderSortableHead('quota', '余额', '')}
+                    {renderSortableHead('used_quota', '已用', 'hidden sm:table-cell')}
+                    {renderSortableHead('request_count', '请求数', 'hidden md:table-cell')}
                     <TableHead className="hidden md:table-cell">最后请求</TableHead>
                     <TableHead>活跃度</TableHead>
                     <TableHead className="w-20">操作</TableHead>

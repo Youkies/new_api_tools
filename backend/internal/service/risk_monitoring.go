@@ -3,6 +3,7 @@ package service
 import (
 	"fmt"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -575,14 +576,56 @@ func (s *RiskMonitoringService) GetSameIPRegistrations(window string, minUsers, 
 	return result, nil
 }
 
-// ListBanRecords returns ban/unban audit records (placeholder - reads from storage)
+// ListBanRecords returns ban/unban audit records stored by moderation actions.
 func (s *RiskMonitoringService) ListBanRecords(page, pageSize int, action string, userID *int64) map[string]interface{} {
+	if page < 1 {
+		page = 1
+	}
+	if pageSize < 1 {
+		pageSize = 50
+	}
+	if pageSize > 200 {
+		pageSize = 200
+	}
+
+	var records []map[string]interface{}
+	cache.Get().GetJSON(securityAuditCacheKey, &records)
+
+	filtered := make([]map[string]interface{}, 0, len(records))
+	for _, record := range records {
+		if action != "" && toString(record["action"]) != action {
+			continue
+		}
+		if userID != nil && toInt64(record["user_id"]) != *userID {
+			continue
+		}
+		filtered = append(filtered, record)
+	}
+
+	sort.SliceStable(filtered, func(i, j int) bool {
+		return toInt64(filtered[i]["created_at"]) > toInt64(filtered[j]["created_at"])
+	})
+
+	total := len(filtered)
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + pageSize - 1) / pageSize
+	}
+	offset := (page - 1) * pageSize
+	if offset > total {
+		offset = total
+	}
+	end := offset + pageSize
+	if end > total {
+		end = total
+	}
+
 	return map[string]interface{}{
-		"items":       []interface{}{},
-		"total":       0,
+		"items":       filtered[offset:end],
+		"total":       total,
 		"page":        page,
 		"page_size":   pageSize,
-		"total_pages": 0,
+		"total_pages": totalPages,
 	}
 }
 

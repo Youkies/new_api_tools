@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/new-api-tools/backend/internal/cache"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/logger"
 )
@@ -19,6 +20,8 @@ const (
 
 	ActiveThreshold   = 7 * 24 * 3600  // 7 days
 	InactiveThreshold = 30 * 24 * 3600 // 30 days
+
+	securityAuditCacheKey = "security:audit"
 )
 
 // UserManagementService handles user queries and operations
@@ -448,28 +451,94 @@ func (s *UserManagementService) DeleteUser(userID int64, hardDelete bool) (int64
 	return affected, nil
 }
 
+func (s *UserManagementService) addSecurityAudit(action string, userID int64, username, operator, reason string, context map[string]interface{}) {
+	if context == nil {
+		context = map[string]interface{}{}
+	}
+
+	cm := cache.Get()
+	var records []map[string]interface{}
+	cm.GetJSON(securityAuditCacheKey, &records)
+
+	entry := map[string]interface{}{
+		"id":         time.Now().UnixNano(),
+		"action":     action,
+		"user_id":    userID,
+		"username":   username,
+		"operator":   operator,
+		"reason":     reason,
+		"context":    context,
+		"created_at": time.Now().Unix(),
+	}
+	records = append([]map[string]interface{}{entry}, records...)
+	if len(records) > 1000 {
+		records = records[:1000]
+	}
+	cm.Set(securityAuditCacheKey, records, 0)
+}
+
 // BanUser sets user status to banned (2)
 func (s *UserManagementService) BanUser(userID int64, disableTokens bool) error {
-	_, err := s.db.Execute(s.db.RebindQuery("UPDATE users SET status = 2 WHERE id = ?"), userID)
+	return s.BanUserWithAudit(userID, disableTokens, "", "System", nil)
+}
+
+// BanUserWithAudit sets user status to banned and records the moderation action.
+func (s *UserManagementService) BanUserWithAudit(userID int64, disableTokens bool, reason, operator string, context map[string]interface{}) error {
+	username := fmt.Sprintf("用户%d", userID)
+	if row, err := s.db.QueryOne(s.db.RebindQuery("SELECT username FROM users WHERE id = ?"), userID); err == nil && row != nil {
+		if value := toString(row["username"]); value != "" {
+			username = value
+		}
+	}
+
+	userAffected, err := s.db.Execute(s.db.RebindQuery("UPDATE users SET status = 2 WHERE id = ?"), userID)
 	if err != nil {
 		return err
 	}
+	tokensAffected := int64(0)
 	if disableTokens {
-		s.db.Execute(s.db.RebindQuery("UPDATE tokens SET status = 2 WHERE user_id = ?"), userID)
+		tokensAffected, _ = s.db.Execute(s.db.RebindQuery("UPDATE tokens SET status = 2 WHERE user_id = ?"), userID)
 	}
+	if context == nil {
+		context = map[string]interface{}{}
+	}
+	context["disable_tokens"] = disableTokens
+	context["user_affected"] = userAffected
+	context["tokens_affected"] = tokensAffected
+	s.addSecurityAudit("ban", userID, username, operator, reason, context)
 	logger.L.Security(fmt.Sprintf("用户 %d 已封禁", userID))
 	return nil
 }
 
 // UnbanUser sets user status to active (1)
 func (s *UserManagementService) UnbanUser(userID int64, enableTokens bool) error {
-	_, err := s.db.Execute(s.db.RebindQuery("UPDATE users SET status = 1 WHERE id = ?"), userID)
+	return s.UnbanUserWithAudit(userID, enableTokens, "", "System", nil)
+}
+
+// UnbanUserWithAudit sets user status to active and records the moderation action.
+func (s *UserManagementService) UnbanUserWithAudit(userID int64, enableTokens bool, reason, operator string, context map[string]interface{}) error {
+	username := fmt.Sprintf("用户%d", userID)
+	if row, err := s.db.QueryOne(s.db.RebindQuery("SELECT username FROM users WHERE id = ?"), userID); err == nil && row != nil {
+		if value := toString(row["username"]); value != "" {
+			username = value
+		}
+	}
+
+	userAffected, err := s.db.Execute(s.db.RebindQuery("UPDATE users SET status = 1 WHERE id = ?"), userID)
 	if err != nil {
 		return err
 	}
+	tokensAffected := int64(0)
 	if enableTokens {
-		s.db.Execute(s.db.RebindQuery("UPDATE tokens SET status = 1 WHERE user_id = ?"), userID)
+		tokensAffected, _ = s.db.Execute(s.db.RebindQuery("UPDATE tokens SET status = 1 WHERE user_id = ?"), userID)
 	}
+	if context == nil {
+		context = map[string]interface{}{}
+	}
+	context["enable_tokens"] = enableTokens
+	context["user_affected"] = userAffected
+	context["tokens_affected"] = tokensAffected
+	s.addSecurityAudit("unban", userID, username, operator, reason, context)
 	logger.L.Security(fmt.Sprintf("用户 %d 已解封", userID))
 	return nil
 }

@@ -209,6 +209,37 @@ interface SharedIPItem {
   }>
 }
 
+interface BulkBanRecord {
+  id: string
+  ip: string
+  reason: string
+  created_at: number
+  user_count: number
+  success_count: number
+  failed_count: number
+  users: Array<{
+    user_id: number
+    username: string
+    display_name?: string
+  }>
+  undone?: boolean
+  undone_at?: number
+  undo_failed_count?: number
+}
+
+const BULK_BAN_RECORDS_KEY = 'risk_center_bulk_ban_records_v1'
+
+function loadBulkBanRecords(): BulkBanRecord[] {
+  try {
+    const raw = window.localStorage.getItem(BULK_BAN_RECORDS_KEY)
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed : []
+  } catch {
+    return []
+  }
+}
+
 interface MultiIPTokenItem {
   token_id: number
   token_name: string
@@ -360,6 +391,13 @@ export function RealtimeRanking() {
   const [sharedIps, setSharedIps] = useState<SharedIPItem[]>([])
   const [multiIpTokens, setMultiIpTokens] = useState<MultiIPTokenItem[]>([])
   const [multiIpUsers, setMultiIpUsers] = useState<MultiIPUserItem[]>([])
+  const [bulkBanRecords, setBulkBanRecords] = useState<BulkBanRecord[]>(loadBulkBanRecords)
+  const [bulkBanLoadingIp, setBulkBanLoadingIp] = useState<string | null>(null)
+  const [undoBulkBanLoading, setUndoBulkBanLoading] = useState<string | null>(null)
+  const latestUndoableBulkBanRecord = useMemo(
+    () => bulkBanRecords.find((record) => !record.undone && record.success_count > 0) || null,
+    [bulkBanRecords]
+  )
 
   // Pagination for IP monitoring
   const [ipPage, setIpPage] = useState({ shared: 1, tokens: 1, users: 1 })
@@ -792,6 +830,200 @@ export function RealtimeRanking() {
       setUserIpsLoading(false)
     }
   }, [apiUrl, getAuthHeaders, showToast])
+
+  const updateBulkBanRecords = useCallback((updater: (records: BulkBanRecord[]) => BulkBanRecord[]) => {
+    setBulkBanRecords((prev) => {
+      const next = updater(prev).slice(0, 20)
+      try {
+        window.localStorage.setItem(BULK_BAN_RECORDS_KEY, JSON.stringify(next))
+      } catch (e) {
+        console.warn('Failed to persist bulk ban records:', e)
+      }
+      return next
+    })
+  }, [])
+
+  const refreshAfterBulkBanChange = useCallback(() => {
+    fetchLeaderboards()
+    fetchIPData(false, false, true)
+    fetchBannedUsers(1)
+    fetchBanRecords(1)
+  }, [fetchLeaderboards, fetchIPData, fetchBannedUsers, fetchBanRecords])
+
+  const performBulkBanSharedIp = useCallback(async (item: SharedIPItem) => {
+    const targets = (item.users || []).filter((user) => user.status !== 2)
+    if (targets.length === 0) {
+      showToast('info', '该 IP 下没有可封禁的未封禁用户')
+      return
+    }
+
+    const batchId = `shared-ip-${item.ip}-${Date.now()}`
+    const reason = '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)'
+    const succeeded: BulkBanRecord['users'] = []
+    let failed = 0
+
+    setBulkBanLoadingIp(item.ip)
+    try {
+      for (const user of targets) {
+        const displayName = user.display_name || user.username || `User#${user.user_id}`
+        try {
+          const response = await fetch(`${apiUrl}/api/users/${user.user_id}/ban`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+              reason,
+              disable_tokens: true,
+              context: {
+                source: 'ip_monitoring_bulk',
+                batch_id: batchId,
+                ip: item.ip,
+                window: ipWindow,
+                user_count: item.user_count,
+                token_count: item.token_count,
+                request_count: item.request_count,
+              },
+            }),
+          })
+          const res = await response.json()
+          if (res.success) {
+            succeeded.push({
+              user_id: user.user_id,
+              username: user.username || displayName,
+              display_name: displayName,
+            })
+          } else {
+            failed += 1
+          }
+        } catch (e) {
+          console.error('Failed to bulk ban user:', e)
+          failed += 1
+        }
+      }
+
+      if (succeeded.length > 0) {
+        updateBulkBanRecords((records) => [
+          {
+            id: batchId,
+            ip: item.ip,
+            reason,
+            created_at: Math.floor(Date.now() / 1000),
+            user_count: targets.length,
+            success_count: succeeded.length,
+            failed_count: failed,
+            users: succeeded,
+          },
+          ...records,
+        ])
+      }
+
+      if (succeeded.length > 0 && failed === 0) {
+        showToast('success', `已封禁 ${succeeded.length} 个用户`)
+      } else if (succeeded.length > 0) {
+        showToast('info', `已封禁 ${succeeded.length} 个用户，${failed} 个失败`)
+      } else {
+        showToast('error', '批量封禁失败')
+      }
+
+      refreshAfterBulkBanChange()
+    } finally {
+      setBulkBanLoadingIp(null)
+    }
+  }, [apiUrl, getAuthHeaders, ipWindow, refreshAfterBulkBanChange, showToast, updateBulkBanRecords])
+
+  const handleBulkBanSharedIp = useCallback((item: SharedIPItem) => {
+    const targets = (item.users || []).filter((user) => user.status !== 2)
+    if (targets.length === 0) {
+      showToast('info', '该 IP 下没有可封禁的未封禁用户')
+      return
+    }
+
+    setConfirmDialog({
+      open: true,
+      title: '封禁该 IP 下所有未封禁用户',
+      description: `即将封禁 ${targets.length} 个用户，并禁用这些用户的令牌。IP: ${item.ip}`,
+      confirmText: '封禁全部',
+      variant: 'destructive',
+      onConfirm: async () => {
+        setConfirmDialog(prev => ({ ...prev, open: false }))
+        await performBulkBanSharedIp(item)
+      },
+    })
+  }, [performBulkBanSharedIp, showToast])
+
+  const performUndoBulkBan = useCallback(async (record: BulkBanRecord) => {
+    if (!record || record.undone || record.users.length === 0) return
+
+    let succeeded = 0
+    let failed = 0
+    setUndoBulkBanLoading(record.id)
+    try {
+      for (const user of record.users) {
+        try {
+          const response = await fetch(`${apiUrl}/api/users/${user.user_id}/unban`, {
+            method: 'POST',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({
+              reason: '撤销批量封禁',
+              enable_tokens: true,
+              context: {
+                source: 'ip_monitoring_bulk_undo',
+                undo_batch_id: record.id,
+                ip: record.ip,
+              },
+            }),
+          })
+          const res = await response.json()
+          if (res.success) succeeded += 1
+          else failed += 1
+        } catch (e) {
+          console.error('Failed to undo bulk ban user:', e)
+          failed += 1
+        }
+      }
+
+      updateBulkBanRecords((records) => records.map((item) => (
+        item.id === record.id
+          ? {
+            ...item,
+            undone: failed === 0,
+            undone_at: failed === 0 ? Math.floor(Date.now() / 1000) : item.undone_at,
+            undo_failed_count: failed,
+          }
+          : item
+      )))
+
+      if (succeeded > 0 && failed === 0) {
+        showToast('success', `已撤销 ${succeeded} 个封禁`)
+      } else if (succeeded > 0) {
+        showToast('info', `已撤销 ${succeeded} 个封禁，${failed} 个失败`)
+      } else {
+        showToast('error', '撤销失败')
+      }
+
+      refreshAfterBulkBanChange()
+    } finally {
+      setUndoBulkBanLoading(null)
+    }
+  }, [apiUrl, getAuthHeaders, refreshAfterBulkBanChange, showToast, updateBulkBanRecords])
+
+  const handleUndoBulkBan = useCallback((record: BulkBanRecord | null) => {
+    if (!record) {
+      showToast('info', '没有可撤销的批量封禁记录')
+      return
+    }
+
+    setConfirmDialog({
+      open: true,
+      title: '撤销上一次批量封禁',
+      description: `即将解封批次 ${record.ip} 中的 ${record.users.length} 个用户，并重新启用这些用户的令牌。`,
+      confirmText: '撤销封禁',
+      variant: 'destructive',
+      onConfirm: async () => {
+        setConfirmDialog(prev => ({ ...prev, open: false }))
+        await performUndoBulkBan(record)
+      },
+    })
+  }, [performUndoBulkBan, showToast])
 
   // AI 自动封禁相关函数
   const fetchAiConfig = useCallback(async () => {
@@ -2704,24 +2936,40 @@ export function RealtimeRanking() {
                         多用户共用 IP
                         <Badge variant="secondary" className="ml-2 bg-background font-mono">{sharedIps.length}</Badge>
                       </CardTitle>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="h-7 w-7"
-                        onClick={handleRefreshSharedIps}
-                        disabled={ipRefreshing.shared}
-                        title="刷新"
-                      >
-                        <RefreshCw className={cn("h-3.5 w-3.5", ipRefreshing.shared && "animate-spin")} />
-                      </Button>
+                      <div className="flex items-center gap-2">
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-7 px-2 text-xs"
+                          onClick={() => handleUndoBulkBan(latestUndoableBulkBanRecord)}
+                          disabled={!latestUndoableBulkBanRecord || !!undoBulkBanLoading}
+                          title="撤销最近一次批量封禁"
+                        >
+                          {undoBulkBanLoading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5 mr-1.5" />}
+                          撤销上一次
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="icon"
+                          className="h-7 w-7"
+                          onClick={handleRefreshSharedIps}
+                          disabled={ipRefreshing.shared}
+                          title="刷新"
+                        >
+                          <RefreshCw className={cn("h-3.5 w-3.5", ipRefreshing.shared && "animate-spin")} />
+                        </Button>
+                      </div>
                     </div>
                   </CardHeader>
                   <CardContent className="p-0">
                     {sharedIps.length > 0 ? (
                       <>
                         <div className="divide-y">
-                          {sharedIps.slice((ipPage.shared - 1) * ipPageSize, ipPage.shared * ipPageSize).map((item) => (
-                            <div key={item.ip} className="px-4 py-3 transition-colors hover:bg-muted/30">
+                          {sharedIps.slice((ipPage.shared - 1) * ipPageSize, ipPage.shared * ipPageSize).map((item) => {
+                            const unbannedCount = (item.users || []).filter((user) => user.status !== 2).length
+                            const isBulkBanning = bulkBanLoadingIp === item.ip
+                            return (
+                              <div key={item.ip} className="px-4 py-3 transition-colors hover:bg-muted/30">
                               <div
                                 className="flex items-center justify-between cursor-pointer"
                                 onClick={() => toggleSharedIpExpand(item.ip)}
@@ -2740,6 +2988,20 @@ export function RealtimeRanking() {
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-2">
+                                  <Button
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-8 px-2 text-xs text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700"
+                                    disabled={unbannedCount === 0 || !!bulkBanLoadingIp}
+                                    title={unbannedCount > 0 ? `封禁该 IP 下 ${unbannedCount} 个未封禁用户` : '该 IP 下用户均已封禁'}
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      handleBulkBanSharedIp(item)
+                                    }}
+                                  >
+                                    {isBulkBanning ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldBan className="h-3.5 w-3.5 mr-1.5" />}
+                                    封禁全部
+                                  </Button>
                                   <div className="flex flex-col items-end">
                                     <span className="text-sm font-bold tabular-nums font-mono text-foreground">
                                       {formatNumber(item.request_count)}
@@ -2818,8 +3080,9 @@ export function RealtimeRanking() {
                                   )}
                                 </div>
                               )}
-                            </div>
-                          ))}
+                              </div>
+                            )
+                          })}
                         </div>
                         {sharedIps.length > ipPageSize && (
                           <div className="flex items-center justify-between p-3 border-t bg-muted/5">
@@ -2837,6 +3100,57 @@ export function RealtimeRanking() {
                       <div className="h-40 flex flex-col items-center justify-center text-muted-foreground text-sm">
                         <ShieldCheck className="h-8 w-8 mb-2 opacity-20" />
                         暂无异常共用 IP
+                      </div>
+                    )}
+                    {bulkBanRecords.length > 0 && (
+                      <div className="border-t bg-muted/10 px-4 py-3">
+                        <div className="flex items-center justify-between mb-2">
+                          <div className="flex items-center gap-2">
+                            <ShieldBan className="h-4 w-4 text-red-500" />
+                            <span className="text-sm font-semibold">封禁记录</span>
+                            <Badge variant="outline" className="h-5 px-2 text-[10px]">{bulkBanRecords.length}</Badge>
+                          </div>
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            className="h-7 px-2 text-xs"
+                            disabled={!latestUndoableBulkBanRecord || !!undoBulkBanLoading}
+                            onClick={() => handleUndoBulkBan(latestUndoableBulkBanRecord)}
+                          >
+                            {undoBulkBanLoading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5 mr-1.5" />}
+                            撤销上一次封禁
+                          </Button>
+                        </div>
+                        <div className="space-y-1.5">
+                          {bulkBanRecords.slice(0, 5).map((record) => (
+                            <div key={record.id} className="flex items-center justify-between gap-3 rounded-lg border bg-background/80 px-3 py-2 text-xs">
+                              <div className="min-w-0">
+                                <div className="flex items-center gap-2 min-w-0">
+                                  <code className="font-mono text-foreground truncate">{record.ip}</code>
+                                  <Badge variant={record.undone ? "secondary" : "destructive"} className="h-5 px-2 text-[10px]">
+                                    {record.undone ? '已撤销' : '已封禁'}
+                                  </Badge>
+                                  {record.failed_count > 0 && (
+                                    <Badge variant="outline" className="h-5 px-2 text-[10px]">{record.failed_count} 失败</Badge>
+                                  )}
+                                </div>
+                                <div className="mt-1 text-muted-foreground">
+                                  {formatTime(record.created_at)} · 成功 {record.success_count}/{record.user_count} · {record.reason}
+                                </div>
+                              </div>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                className="h-7 px-2 text-xs shrink-0"
+                                disabled={record.undone || undoBulkBanLoading === record.id}
+                                onClick={() => handleUndoBulkBan(record)}
+                              >
+                                {undoBulkBanLoading === record.id ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5 mr-1.5" />}
+                                撤销
+                              </Button>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
                   </CardContent>

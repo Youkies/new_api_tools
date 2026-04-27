@@ -182,14 +182,15 @@ func BanUser(c *gin.Context) {
 	}
 
 	var req struct {
-		Reason        string `json:"reason"`
-		DisableTokens bool   `json:"disable_tokens"`
+		Reason        string                 `json:"reason"`
+		DisableTokens bool                   `json:"disable_tokens"`
+		Context       map[string]interface{} `json:"context"`
 	}
 	req.DisableTokens = true
 	c.ShouldBindJSON(&req)
 
 	svc := service.NewUserManagementService()
-	if err := svc.BanUser(userID, req.DisableTokens); err != nil {
+	if err := svc.BanUserWithAudit(userID, req.DisableTokens, req.Reason, "Admin", req.Context); err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("BAN_ERROR", err.Error(), ""))
 		return
 	}
@@ -209,13 +210,14 @@ func UnbanUser(c *gin.Context) {
 	}
 
 	var req struct {
-		Reason       string `json:"reason"`
-		EnableTokens bool   `json:"enable_tokens"`
+		Reason       string                 `json:"reason"`
+		EnableTokens bool                   `json:"enable_tokens"`
+		Context      map[string]interface{} `json:"context"`
 	}
 	c.ShouldBindJSON(&req)
 
 	svc := service.NewUserManagementService()
-	if err := svc.UnbanUser(userID, req.EnableTokens); err != nil {
+	if err := svc.UnbanUserWithAudit(userID, req.EnableTokens, req.Reason, "Admin", req.Context); err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("UNBAN_ERROR", err.Error(), ""))
 		return
 	}
