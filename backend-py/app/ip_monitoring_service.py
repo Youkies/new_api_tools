@@ -478,17 +478,16 @@ class IPMonitoringService:
                 for user_row in self.db.execute(user_sql, params) or []:
                     ip = user_row.get("ip") or ""
                     users_by_ip.setdefault(ip, [])
-                    if len(users_by_ip[ip]) < 20:
-                        users_by_ip[ip].append({
-                            "user_id": int(user_row.get("user_id") or 0),
-                            "username": user_row.get("username") or "",
-                            "display_name": user_row.get("display_name") or "",
-                            "status": int(user_row.get("status") or 0),
-                            "token_count": int(user_row.get("token_count") or 0),
-                            "request_count": int(user_row.get("request_count") or 0),
-                            "first_seen": int(user_row.get("first_seen") or 0),
-                            "last_seen": int(user_row.get("last_seen") or 0),
-                        })
+                    users_by_ip[ip].append({
+                        "user_id": int(user_row.get("user_id") or 0),
+                        "username": user_row.get("username") or "",
+                        "display_name": user_row.get("display_name") or "",
+                        "status": int(user_row.get("status") or 0),
+                        "token_count": int(user_row.get("token_count") or 0),
+                        "request_count": int(user_row.get("request_count") or 0),
+                        "first_seen": int(user_row.get("first_seen") or 0),
+                        "last_seen": int(user_row.get("last_seen") or 0),
+                    })
 
             items = []
             for row in rows:

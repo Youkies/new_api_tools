@@ -72,9 +72,10 @@ func GetSharedUserIPs(c *gin.Context) {
 	}
 	minUsers, _ := strconv.Atoi(c.DefaultQuery("min_users", "2"))
 	limit := parseLimit(c, 50, maxIPLimit)
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	svc := service.NewIPMonitoringService()
-	data, err := svc.GetSharedUserIPs(window, minUsers, limit)
+	data, err := svc.GetSharedUserIPs(window, minUsers, limit, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return

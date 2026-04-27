@@ -14,6 +14,7 @@
 - 用户管理前端新增余额、用量、请求数排序控件和可点击排序表头。
 - 风控中心多用户共用 IP 条目右侧新增“封禁全部”，按批次记录封禁结果并可撤销最近批次。
 - Go 后端用户封禁/解封新增审计记录，`/api/risk/ban-records` 可返回 Go 侧封禁流水。
+- 修复共享 IP 批量封禁实时同步：后端返回完整用户明细，前端封禁前强制刷新完整 IP 用户列表，并在封禁/撤销成功后立即同步本地状态。
 
 ## 验证结果
 
@@ -22,6 +23,7 @@
 - `npm run build` 已通过，仅有前端 chunk 体积 warning。
 - `git status --short` 显示本次风控相关文件和 `.ai_memory/` 新增目录。
 - 追加排序与批量封禁后，`go test ./...`、Python `py_compile`、`npm run build` 再次通过。
+- 修复实时同步后，`go test ./...`、Python `py_compile backend-py\app\ip_monitoring_service.py backend-py\app\ip_monitoring_routes.py`、`npm run build` 通过。
 
 ## 下一步
 

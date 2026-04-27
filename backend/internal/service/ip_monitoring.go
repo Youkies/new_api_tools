@@ -204,7 +204,7 @@ func (s *IPMonitoringService) GetSharedIPs(window string, minTokens, limit int) 
 }
 
 // GetSharedUserIPs returns IPs used by multiple users with per-user ban status.
-func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit int) (map[string]interface{}, error) {
+func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit int, useCache bool) (map[string]interface{}, error) {
 	seconds, ok := WindowSeconds[window]
 	if !ok {
 		seconds = 86400
@@ -217,9 +217,11 @@ func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit in
 	cacheKey := fmt.Sprintf("ip:shared_users:%s:%d:%d", window, minUsers, limit)
 	cm := cache.Get()
 	var cached map[string]interface{}
-	found, _ := cm.GetJSON(cacheKey, &cached)
-	if found {
-		return cached, nil
+	if useCache {
+		found, _ := cm.GetJSON(cacheKey, &cached)
+		if found {
+			return cached, nil
+		}
 	}
 
 	query := s.db.RebindQuery(`
@@ -284,9 +286,7 @@ func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit in
 				for _, ur := range userRows {
 					ip := toString(ur["ip"])
 					delete(ur, "ip")
-					if len(usersByIP[ip]) < 20 {
-						usersByIP[ip] = append(usersByIP[ip], ur)
-					}
+					usersByIP[ip] = append(usersByIP[ip], ur)
 				}
 				for _, row := range rows {
 					ip := toString(row["ip"])
@@ -311,7 +311,9 @@ func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit in
 		"min_users": minUsers,
 	}
 
-	cm.Set(cacheKey, result, 5*time.Minute)
+	if useCache {
+		cm.Set(cacheKey, result, 5*time.Minute)
+	}
 	return result, nil
 }
 

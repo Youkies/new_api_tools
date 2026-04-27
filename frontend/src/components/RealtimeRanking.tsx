@@ -850,19 +850,51 @@ export function RealtimeRanking() {
     fetchBanRecords(1)
   }, [fetchLeaderboards, fetchIPData, fetchBannedUsers, fetchBanRecords])
 
+  const syncSharedIpUserStatuses = useCallback((userIds: number[], status: number) => {
+    if (userIds.length === 0) return
+    const idSet = new Set(userIds)
+    setSharedIps((prev) => prev.map((item) => {
+      let changed = false
+      const users = (item.users || []).map((user) => {
+        if (!idSet.has(user.user_id) || user.status === status) return user
+        changed = true
+        return { ...user, status }
+      })
+      if (!changed) return item
+      return {
+        ...item,
+        users,
+        banned_count: users.filter((user) => user.status === 2).length,
+      }
+    }))
+  }, [])
+
   const performBulkBanSharedIp = useCallback(async (item: SharedIPItem) => {
-    const targets = (item.users || []).filter((user) => user.status !== 2)
+    let sourceItem = item
+    try {
+      const response = await fetch(`${apiUrl}/api/ip/shared-users?window=${ipWindow}&min_users=2&limit=500&no_cache=true`, { headers: getAuthHeaders() })
+      const res = await response.json()
+      const freshItem = (res.data?.items || []).find((candidate: SharedIPItem) => candidate.ip === item.ip)
+      if (res.success && freshItem) {
+        sourceItem = freshItem
+        setSharedIps((prev) => prev.map((existing) => existing.ip === item.ip ? freshItem : existing))
+      }
+    } catch (e) {
+      console.warn('Failed to refresh shared IP details before bulk ban:', e)
+    }
+
+    const targets = (sourceItem.users || []).filter((user) => user.status !== 2)
     if (targets.length === 0) {
       showToast('info', '该 IP 下没有可封禁的未封禁用户')
       return
     }
 
-    const batchId = `shared-ip-${item.ip}-${Date.now()}`
+    const batchId = `shared-ip-${sourceItem.ip}-${Date.now()}`
     const reason = '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)'
     const succeeded: BulkBanRecord['users'] = []
     let failed = 0
 
-    setBulkBanLoadingIp(item.ip)
+    setBulkBanLoadingIp(sourceItem.ip)
     try {
       for (const user of targets) {
         const displayName = user.display_name || user.username || `User#${user.user_id}`
@@ -876,11 +908,11 @@ export function RealtimeRanking() {
               context: {
                 source: 'ip_monitoring_bulk',
                 batch_id: batchId,
-                ip: item.ip,
+                ip: sourceItem.ip,
                 window: ipWindow,
-                user_count: item.user_count,
-                token_count: item.token_count,
-                request_count: item.request_count,
+                user_count: sourceItem.user_count,
+                token_count: sourceItem.token_count,
+                request_count: sourceItem.request_count,
               },
             }),
           })
@@ -901,10 +933,11 @@ export function RealtimeRanking() {
       }
 
       if (succeeded.length > 0) {
+        syncSharedIpUserStatuses(succeeded.map((user) => user.user_id), 2)
         updateBulkBanRecords((records) => [
           {
             id: batchId,
-            ip: item.ip,
+            ip: sourceItem.ip,
             reason,
             created_at: Math.floor(Date.now() / 1000),
             user_count: targets.length,
@@ -928,7 +961,7 @@ export function RealtimeRanking() {
     } finally {
       setBulkBanLoadingIp(null)
     }
-  }, [apiUrl, getAuthHeaders, ipWindow, refreshAfterBulkBanChange, showToast, updateBulkBanRecords])
+  }, [apiUrl, getAuthHeaders, ipWindow, refreshAfterBulkBanChange, showToast, syncSharedIpUserStatuses, updateBulkBanRecords])
 
   const handleBulkBanSharedIp = useCallback((item: SharedIPItem) => {
     const targets = (item.users || []).filter((user) => user.status !== 2)
@@ -955,6 +988,7 @@ export function RealtimeRanking() {
 
     let succeeded = 0
     let failed = 0
+    const succeededIds: number[] = []
     setUndoBulkBanLoading(record.id)
     try {
       for (const user of record.users) {
@@ -973,8 +1007,12 @@ export function RealtimeRanking() {
             }),
           })
           const res = await response.json()
-          if (res.success) succeeded += 1
-          else failed += 1
+          if (res.success) {
+            succeeded += 1
+            succeededIds.push(user.user_id)
+          } else {
+            failed += 1
+          }
         } catch (e) {
           console.error('Failed to undo bulk ban user:', e)
           failed += 1
@@ -991,6 +1029,7 @@ export function RealtimeRanking() {
           }
           : item
       )))
+      syncSharedIpUserStatuses(succeededIds, 1)
 
       if (succeeded > 0 && failed === 0) {
         showToast('success', `已撤销 ${succeeded} 个封禁`)
@@ -1004,7 +1043,7 @@ export function RealtimeRanking() {
     } finally {
       setUndoBulkBanLoading(null)
     }
-  }, [apiUrl, getAuthHeaders, refreshAfterBulkBanChange, showToast, updateBulkBanRecords])
+  }, [apiUrl, getAuthHeaders, refreshAfterBulkBanChange, showToast, syncSharedIpUserStatuses, updateBulkBanRecords])
 
   const handleUndoBulkBan = useCallback((record: BulkBanRecord | null) => {
     if (!record) {
@@ -4985,6 +5024,7 @@ export function RealtimeRanking() {
                     const res = await response.json()
                     if (res.success) {
                       showToast('success', res.message || '已封禁')
+                      syncSharedIpUserStatuses([banConfirmDialog.userId], 2)
                       if (pendingResolveAfterBan) {
                         await resolveAiPendingReview(pendingResolveAfterBan, 'approved_ban', '管理员确认封禁')
                         setPendingResolveAfterBan(null)
@@ -4992,7 +5032,7 @@ export function RealtimeRanking() {
                       setBanConfirmDialog(prev => ({ ...prev, open: false }))
                       setDialogOpen(false)
                       fetchLeaderboards()
-                      fetchIPData()
+                      fetchIPData(false, false, true)
                       fetchBannedUsers(1)
                       fetchBanRecords(1)
                       fetchAiPendingReviews()
@@ -5031,10 +5071,11 @@ export function RealtimeRanking() {
                     const res = await response.json()
                     if (res.success) {
                       showToast('success', res.message || '已解封')
+                      syncSharedIpUserStatuses([banConfirmDialog.userId], 1)
                       setBanConfirmDialog(prev => ({ ...prev, open: false }))
                       setDialogOpen(false)
                       fetchLeaderboards()
-                      fetchIPData()
+                      fetchIPData(false, false, true)
                       fetchBannedUsers(bannedPage)
                       fetchBanRecords(recordsPage)
                     } else {

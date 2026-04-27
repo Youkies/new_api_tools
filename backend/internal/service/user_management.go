@@ -477,6 +477,12 @@ func (s *UserManagementService) addSecurityAudit(action string, userID int64, us
 	cm.Set(securityAuditCacheKey, records, 0)
 }
 
+func invalidateRiskCaches() {
+	cm := cache.Get()
+	cm.DeleteByPrefix("ip:")
+	cm.DeleteByPrefix("risk:")
+}
+
 // BanUser sets user status to banned (2)
 func (s *UserManagementService) BanUser(userID int64, disableTokens bool) error {
 	return s.BanUserWithAudit(userID, disableTokens, "", "System", nil)
@@ -506,6 +512,7 @@ func (s *UserManagementService) BanUserWithAudit(userID int64, disableTokens boo
 	context["user_affected"] = userAffected
 	context["tokens_affected"] = tokensAffected
 	s.addSecurityAudit("ban", userID, username, operator, reason, context)
+	invalidateRiskCaches()
 	logger.L.Security(fmt.Sprintf("用户 %d 已封禁", userID))
 	return nil
 }
@@ -539,6 +546,7 @@ func (s *UserManagementService) UnbanUserWithAudit(userID int64, enableTokens bo
 	context["user_affected"] = userAffected
 	context["tokens_affected"] = tokensAffected
 	s.addSecurityAudit("unban", userID, username, operator, reason, context)
+	invalidateRiskCaches()
 	logger.L.Security(fmt.Sprintf("用户 %d 已解封", userID))
 	return nil
 }
