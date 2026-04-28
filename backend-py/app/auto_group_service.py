@@ -56,6 +56,7 @@ class AutoGroupConfig:
     auto_scan_enabled: bool = False
     whitelist_ids: List[int] = None
     usage_rules: List[Dict[str, Any]] = None
+    usage_require_topup: bool = True
 
     def __post_init__(self):
         if self.source_rules is None:
@@ -103,6 +104,7 @@ class AutoGroupService:
             auto_scan_enabled=stored.get("auto_scan_enabled", False),
             whitelist_ids=stored.get("whitelist_ids", []),
             usage_rules=stored.get("usage_rules", []),
+            usage_require_topup=stored.get("usage_require_topup", True),
         )
 
     def get_config(self) -> Dict[str, Any]:
@@ -116,6 +118,7 @@ class AutoGroupService:
             "auto_scan_enabled": self._config.auto_scan_enabled,
             "whitelist_ids": self._config.whitelist_ids,
             "usage_rules": self._config.usage_rules,
+            "usage_require_topup": self._config.usage_require_topup,
             "last_scan_time": self._last_scan_time,
         }
 
@@ -330,6 +333,19 @@ class AutoGroupService:
             return bool(rows)
         except Exception:
             return False
+
+    def _build_usage_topup_condition(self) -> str:
+        if not self._config.usage_require_topup:
+            return ""
+        if not self._table_exists("top_ups"):
+            return "AND 1 = 0"
+        return """
+            AND EXISTS (
+                SELECT 1 FROM top_ups tu
+                WHERE tu.user_id = users.id
+                AND (LOWER(tu.status) IN ('success', 'completed') OR tu.status = '1')
+            )
+        """
 
     def detect_registration_source(self, user: Dict[str, Any]) -> RegistrationSource:
         """
@@ -550,6 +566,8 @@ class AutoGroupService:
             is_pg = db.config.engine == DatabaseEngine.POSTGRESQL
             group_col = '"group"' if is_pg else '`group`'
             min_threshold = int(rules[0]["threshold_quota"])
+            topup_condition = self._build_usage_topup_condition()
+            has_topup = bool(self._config.usage_require_topup)
 
             whitelist_condition = ""
             params: Dict[str, Any] = {"min_threshold": min_threshold}
@@ -570,6 +588,7 @@ class AutoGroupService:
                 AND status = 1
                 AND COALESCE(used_quota, 0) >= :min_threshold
                 {whitelist_condition}
+                {topup_condition}
                 ORDER BY COALESCE(used_quota, 0) DESC, id DESC
             """
 
@@ -596,6 +615,7 @@ class AutoGroupService:
                     "status": int(row.get("status") or 0),
                     "used_quota": used_quota,
                     "used_amount": round(used_quota / QUOTA_PER_USD, 2),
+                    "has_topup": has_topup,
                     "target_group": target_rule["group"],
                     "threshold_amount": target_rule["threshold_amount"],
                     "threshold_quota": target_rule["threshold_quota"],

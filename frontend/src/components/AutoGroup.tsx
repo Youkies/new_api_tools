@@ -53,6 +53,7 @@ interface UserInfo {
   created_time: number
   used_quota?: number
   used_amount?: number
+  has_topup?: boolean
   target_group?: string
 }
 
@@ -81,6 +82,7 @@ interface Config {
   scan_interval_minutes: number
   auto_scan_enabled: boolean
   whitelist_ids: number[]
+  usage_require_topup: boolean
   last_scan_time: number
 }
 
@@ -642,11 +644,25 @@ export function AutoGroup() {
                           使用累计已消费金额判断，命中最高门槛后自动升级到对应分组
                         </p>
                       </div>
-                      <Button variant="outline" size="sm" onClick={applyDefaultUsageRules} disabled={saving}>
-                        <ArrowUpCircle className="h-4 w-4 mr-2" />
-                        默认档位
-                      </Button>
+                      <div className="flex gap-2">
+                        <Button
+                          variant={(config.usage_require_topup ?? true) ? 'default' : 'outline'}
+                          size="sm"
+                          onClick={() => saveConfig({ usage_require_topup: !(config.usage_require_topup ?? true) })}
+                          disabled={saving}
+                        >
+                          <DollarSign className="h-4 w-4 mr-2" />
+                          {(config.usage_require_topup ?? true) ? '要求已充值' : '不要求充值'}
+                        </Button>
+                        <Button variant="outline" size="sm" onClick={applyDefaultUsageRules} disabled={saving}>
+                          <ArrowUpCircle className="h-4 w-4 mr-2" />
+                          默认档位
+                        </Button>
+                      </div>
                     </div>
+                    <p className="text-sm text-muted-foreground">
+                      开启充值判定后，只有存在成功充值记录的用户才会按消费自动升级。
+                    </p>
                     <div className="grid gap-3">
                       {getUsageRules().map((rule, index) => (
                         <div key={index} className="grid gap-3 md:grid-cols-[160px_1fr_auto] items-end">
@@ -821,6 +837,7 @@ export function AutoGroup() {
                       {config.mode === 'by_usage' && (
                         <>
                           <TableHead className="text-right">已消费</TableHead>
+                          <TableHead>充值</TableHead>
                           <TableHead>目标分组</TableHead>
                         </>
                       )}
@@ -830,13 +847,13 @@ export function AutoGroup() {
                   <TableBody>
                     {previewLoading ? (
                       <TableRow>
-                        <TableCell colSpan={config.mode === 'by_usage' ? 7 : 5} className="text-center py-8">
+                        <TableCell colSpan={config.mode === 'by_usage' ? 8 : 5} className="text-center py-8">
                           <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                         </TableCell>
                       </TableRow>
                     ) : previewUsers.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={config.mode === 'by_usage' ? 7 : 5} className="text-center py-8 text-muted-foreground">
+                        <TableCell colSpan={config.mode === 'by_usage' ? 8 : 5} className="text-center py-8 text-muted-foreground">
                           没有待分配的用户
                         </TableCell>
                       </TableRow>
@@ -852,6 +869,11 @@ export function AutoGroup() {
                           {config.mode === 'by_usage' && (
                             <>
                               <TableCell className="text-right font-mono">{formatQuota(user.used_quota)}</TableCell>
+                              <TableCell>
+                                <Badge variant={(config.usage_require_topup ?? true) ? 'success' : 'outline'}>
+                                  {(config.usage_require_topup ?? true) ? '已充值' : '未要求'}
+                                </Badge>
+                              </TableCell>
                               <TableCell>
                                 <Badge variant="default">{user.target_group || '-'}</Badge>
                               </TableCell>

@@ -22,6 +22,7 @@ class SaveConfigRequest(BaseModel):
     scan_interval_minutes: Optional[int] = None
     auto_scan_enabled: Optional[bool] = None
     whitelist_ids: Optional[List[int]] = None
+    usage_require_topup: Optional[bool] = None
 
 
 class BatchMoveRequest(BaseModel):
@@ -80,6 +81,8 @@ async def save_config(
         config["auto_scan_enabled"] = request.auto_scan_enabled
     if request.whitelist_ids is not None:
         config["whitelist_ids"] = request.whitelist_ids
+    if request.usage_require_topup is not None:
+        config["usage_require_topup"] = request.usage_require_topup
 
     if not config:
         raise HTTPException(status_code=400, detail="没有要保存的配置")

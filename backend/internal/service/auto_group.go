@@ -126,6 +126,7 @@ var defaultAutoGroupConfig = map[string]interface{}{
 	"auto_scan_enabled":     false,
 	"whitelist_ids":         []interface{}{},
 	"usage_rules":           []interface{}{},
+	"usage_require_topup":   true,
 	"last_scan_time":        0,
 }
 
@@ -339,6 +340,33 @@ func shouldMoveByUsage(currentGroup string, targetRule usageGroupRule, rules []u
 		return false
 	}
 	return targetRule.ThresholdQuota > currentThreshold
+}
+
+func (s *AutoGroupService) requireTopUpForUsage() bool {
+	config := s.getConfigCached()
+	value, ok := config["usage_require_topup"]
+	if !ok {
+		return true
+	}
+	if enabled, ok := value.(bool); ok {
+		return enabled
+	}
+	return true
+}
+
+func (s *AutoGroupService) buildUsageTopUpCondition() string {
+	if !s.requireTopUpForUsage() {
+		return ""
+	}
+	exists, err := s.db.TableExists("top_ups")
+	if err != nil || !exists {
+		return "AND 1 = 0"
+	}
+	return `AND EXISTS (
+		SELECT 1 FROM top_ups tu
+		WHERE tu.user_id = users.id
+		AND (LOWER(tu.status) IN ('success', 'completed') OR tu.status = '1')
+	)`
 }
 
 // buildWhitelistCondition builds the SQL condition and args for whitelist exclusion
@@ -755,6 +783,8 @@ func (s *AutoGroupService) GetUsageUpgradeUsers(page, pageSize int) map[string]i
 	oauthCols := s.buildOAuthSelectCols()
 	whitelistIDs := s.getWhitelistIDs()
 	minThreshold := rules[0].ThresholdQuota
+	topUpCond := s.buildUsageTopUpCondition()
+	hasTopUp := s.requireTopUpForUsage()
 
 	args := []interface{}{minThreshold}
 	wlCond, wlArgs, _ := s.buildWhitelistCondition(whitelistIDs, 2)
@@ -770,7 +800,8 @@ func (s *AutoGroupService) GetUsageUpgradeUsers(page, pageSize int) map[string]i
 			AND status = 1
 			AND COALESCE(used_quota, 0) >= $1
 			%s
-			ORDER BY COALESCE(used_quota, 0) DESC, id DESC`, groupCol, oauthCols, wlCond)
+			%s
+			ORDER BY COALESCE(used_quota, 0) DESC, id DESC`, groupCol, oauthCols, wlCond, topUpCond)
 	} else {
 		query = fmt.Sprintf(`
 			SELECT id, username, display_name, email, %s as user_group, status,
@@ -780,7 +811,8 @@ func (s *AutoGroupService) GetUsageUpgradeUsers(page, pageSize int) map[string]i
 			AND status = 1
 			AND COALESCE(used_quota, 0) >= ?
 			%s
-			ORDER BY COALESCE(used_quota, 0) DESC, id DESC`, groupCol, oauthCols, wlCond)
+			%s
+			ORDER BY COALESCE(used_quota, 0) DESC, id DESC`, groupCol, oauthCols, wlCond, topUpCond)
 		query = s.db.RebindQuery(query)
 	}
 
@@ -816,6 +848,7 @@ func (s *AutoGroupService) GetUsageUpgradeUsers(page, pageSize int) map[string]i
 			"status":           toInt64(row["status"]),
 			"used_quota":       usedQuota,
 			"used_amount":      math.Round((float64(usedQuota)/autoGroupQuotaPerUSD)*100) / 100,
+			"has_topup":        hasTopUp,
 			"target_group":     targetRule.Group,
 			"threshold_amount": targetRule.ThresholdAmount,
 			"threshold_quota":  targetRule.ThresholdQuota,
