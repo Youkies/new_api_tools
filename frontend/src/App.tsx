@@ -1,10 +1,36 @@
-import { useState, useEffect } from 'react'
-import { Login, Layout, TabType, Generator, History, TopUps, Dashboard, Redemptions, Analytics, UserManagement, RealtimeRanking, IPAnalysis, ModelStatusMonitor, AutoGroup, Tokens, CostAccounting } from './components'
+import { lazy, Suspense, useEffect, useState } from 'react'
+import { Login } from './components/Login'
+import { Layout, type TabType } from './components/Layout'
 import { useAuth } from './contexts/AuthContext'
 import { WarmupScreen } from './components/WarmupScreen'
 
+const Dashboard = lazy(() => import('./components/Dashboard').then((module) => ({ default: module.Dashboard })))
+const Generator = lazy(() => import('./components/Generator').then((module) => ({ default: module.Generator })))
+const Redemptions = lazy(() => import('./components/Redemptions').then((module) => ({ default: module.Redemptions })))
+const History = lazy(() => import('./components/History').then((module) => ({ default: module.History })))
+const TopUps = lazy(() => import('./components/TopUps').then((module) => ({ default: module.TopUps })))
+const RealtimeRanking = lazy(() => import('./components/RealtimeRanking').then((module) => ({ default: module.RealtimeRanking })))
+const IPAnalysis = lazy(() => import('./components/IPAnalysis').then((module) => ({ default: module.IPAnalysis })))
+const Analytics = lazy(() => import('./components/Analytics').then((module) => ({ default: module.Analytics })))
+const CostAccounting = lazy(() => import('./components/CostAccounting').then((module) => ({ default: module.CostAccounting })))
+const ModelStatusMonitor = lazy(() => import('./components/ModelStatusMonitor').then((module) => ({ default: module.ModelStatusMonitor })))
+const UserManagement = lazy(() => import('./components/UserManagement').then((module) => ({ default: module.UserManagement })))
+const Tokens = lazy(() => import('./components/Tokens').then((module) => ({ default: module.Tokens })))
+const AutoGroup = lazy(() => import('./components/AutoGroup').then((module) => ({ default: module.AutoGroup })))
+
 // Valid tabs
 const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'ip-analysis', 'analytics', 'costs', 'model-status', 'users', 'tokens', 'auto-group', 'generator', 'redemptions', 'history']
+
+function PageFallback() {
+  return (
+    <div className="min-h-[360px] flex items-center justify-center">
+      <div className="flex flex-col items-center gap-3 text-muted-foreground">
+        <div className="w-8 h-8 rounded-full border-4 border-primary/20 border-t-primary animate-spin" />
+        <p className="text-sm">正在加载页面...</p>
+      </div>
+    </div>
+  )
+}
 
 // Get initial tab from URL pathname (supports sub-routes like /risk/ip)
 const getInitialTab = (): TabType => {
@@ -160,7 +186,9 @@ function App() {
 
   return (
     <Layout activeTab={activeTab} onTabChange={setActiveTab} onLogout={logout}>
-      {renderContent()}
+      <Suspense fallback={<PageFallback />}>
+        {renderContent()}
+      </Suspense>
     </Layout>
   )
 }

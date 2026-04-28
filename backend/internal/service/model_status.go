@@ -14,7 +14,7 @@ import (
 var (
 	AvailableTimeWindows = []string{"1h", "6h", "12h", "24h"}
 	DefaultTimeWindow    = "24h"
-	AvailableThemes = []string{
+	AvailableThemes      = []string{
 		"daylight", "obsidian", "minimal", "neon", "forest", "ocean", "terminal",
 		"cupertino", "material", "openai", "anthropic", "vercel", "linear",
 		"stripe", "github", "discord", "tesla",
@@ -91,7 +91,7 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 		GROUP BY model_name
 		ORDER BY request_count_24h DESC`)
 
-	rows, err := s.db.Query(query, startTime)
+	rows, err := s.db.QueryWithTimeout(20*time.Second, query, startTime)
 	if err != nil {
 		return nil, err
 	}
@@ -102,54 +102,21 @@ func (s *ModelStatusService) GetAvailableModels() ([]map[string]interface{}, err
 
 // GetModelStatus returns status for a specific model
 // Uses a single GROUP BY FLOOR query (matches Python backend optimization)
-func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[string]interface{}, error) {
-	cacheKey := fmt.Sprintf("model_status:%s:%s", modelName, window)
-	cm := cache.Get()
-	var cached map[string]interface{}
-	found, _ := cm.GetJSON(cacheKey, &cached)
-	if found {
-		return cached, nil
-	}
-
-	// Get window configuration (dynamic slot count per window)
-	twConfig, ok := timeWindowConfigs[window]
-	if !ok {
-		twConfig = timeWindowConfigs["24h"]
-	}
-
-	now := time.Now().Unix()
-	startTime := now - twConfig.totalSeconds
-	numSlots := twConfig.numSlots
-	slotSeconds := twConfig.slotSeconds
-
-	// Single optimized query — aggregate by time slot using FLOOR division
-	// This reduces N queries to 1 query per model (matches Python backend)
-	//
-	// Success counting strategy:
-	//   - type=2 with completion_tokens > 0 → definite success
-	//   - type=2 with completion_tokens = 0 → empty response (likely failure)
-	//   - type=5 → explicit failure (if NewAPI version supports it)
-	// This ensures correct success rate even when NewAPI doesn't log type=5 failures.
-	slotQuery := s.db.RebindQuery(fmt.Sprintf(`
-		SELECT FLOOR((created_at - %d) / %d) as slot_idx,
-			COUNT(*) as total,
-			SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
-			SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
-			SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
-		FROM logs
-		WHERE model_name = ?
-			AND created_at >= ? AND created_at < ?
-			AND type IN (2, 5)
-		GROUP BY FLOOR((created_at - %d) / %d)`,
-		startTime, slotSeconds,
-		startTime, slotSeconds))
-
-	rows, err := s.db.Query(slotQuery, modelName, startTime, now)
+func (s *ModelStatusService) GetModelStatus(modelName, window string, useCache bool) (map[string]interface{}, error) {
+	results, err := s.GetMultipleModelsStatus([]string{modelName}, window, useCache)
 	if err != nil {
 		return nil, err
 	}
+	if len(results) == 0 {
+		return nil, fmt.Errorf("model status not found: %s", modelName)
+	}
+	return results[0], nil
+}
 
-	// Initialize all slots with zeros
+func buildModelStatusResult(modelName, window string, rows []map[string]interface{}, twConfig timeWindowConfig, startTime int64) map[string]interface{} {
+	numSlots := twConfig.numSlots
+	slotSeconds := twConfig.slotSeconds
+
 	type slotInfo struct {
 		total   int64
 		success int64
@@ -158,17 +125,14 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 	}
 	slotMap := make(map[int64]*slotInfo, numSlots)
 
-	// Fill in actual data from query results
-	if rows != nil {
-		for _, row := range rows {
-			idx := toInt64(row["slot_idx"])
-			if idx >= 0 && idx < int64(numSlots) {
-				slotMap[idx] = &slotInfo{
-					total:   toInt64(row["total"]),
-					success: toInt64(row["success"]),
-					failure: toInt64(row["failure"]),
-					empty:   toInt64(row["empty_count"]),
-				}
+	for _, row := range rows {
+		idx := toInt64(row["slot_idx"])
+		if idx >= 0 && idx < int64(numSlots) {
+			slotMap[idx] = &slotInfo{
+				total:   toInt64(row["total"]),
+				success: toInt64(row["success"]),
+				failure: toInt64(row["failure"]),
+				empty:   toInt64(row["empty_count"]),
 			}
 		}
 	}
@@ -224,7 +188,7 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		overallRate = float64(totalSuccess) / float64(totalReqs) * 100
 	}
 
-	result := map[string]interface{}{
+	return map[string]interface{}{
 		"model_name":     modelName,
 		"display_name":   modelName,
 		"time_window":    window,
@@ -236,31 +200,112 @@ func (s *ModelStatusService) GetModelStatus(modelName, window string) (map[strin
 		"current_status": getStatusColor(overallRate, totalReqs),
 		"slot_data":      slotData,
 	}
-
-	cm.Set(cacheKey, result, 30*time.Second)
-	return result, nil
 }
 
 // GetMultipleModelsStatus returns status for multiple models
-func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window string) ([]map[string]interface{}, error) {
-	results := make([]map[string]interface{}, 0, len(modelNames))
-	failedModels := make([]string, 0)
+func (s *ModelStatusService) GetMultipleModelsStatus(modelNames []string, window string, useCache bool) ([]map[string]interface{}, error) {
+	twConfig, ok := timeWindowConfigs[window]
+	if !ok {
+		window = DefaultTimeWindow
+		twConfig = timeWindowConfigs[DefaultTimeWindow]
+	}
+
+	orderedNames := make([]string, 0, len(modelNames))
+	seen := map[string]bool{}
 	for _, name := range modelNames {
-		status, err := s.GetModelStatus(name, window)
-		if err != nil {
-			failedModels = append(failedModels, fmt.Sprintf("%s: %v", name, err))
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
 			continue
 		}
-		results = append(results, status)
+		seen[name] = true
+		orderedNames = append(orderedNames, name)
 	}
-	if len(modelNames) > 0 && len(results) == 0 && len(failedModels) > 0 {
-		return nil, fmt.Errorf("all model status queries failed: %s", strings.Join(failedModels, "; "))
+
+	resultsByModel := map[string]map[string]interface{}{}
+	uncached := make([]string, 0, len(orderedNames))
+	cm := cache.Get()
+	if useCache {
+		for _, name := range orderedNames {
+			cacheKey := fmt.Sprintf("model_status:%s:%s", name, window)
+			var cached map[string]interface{}
+			if found, _ := cm.GetJSON(cacheKey, &cached); found {
+				resultsByModel[name] = cached
+			} else {
+				uncached = append(uncached, name)
+			}
+		}
+	} else {
+		uncached = append(uncached, orderedNames...)
 	}
+
+	if len(uncached) > 0 {
+		now := time.Now().Unix()
+		startTime := now - twConfig.totalSeconds
+		rowsByModel := map[string][]map[string]interface{}{}
+		const batchSize = 100
+
+		for start := 0; start < len(uncached); start += batchSize {
+			end := start + batchSize
+			if end > len(uncached) {
+				end = len(uncached)
+			}
+			batch := uncached[start:end]
+			modelPlaceholders := strings.TrimSuffix(strings.Repeat("?,", len(batch)), ",")
+
+			// Batch aggregate by model + time slot. This replaces N per-model SQL queries with
+			// one query per chunk and keeps the response shape unchanged.
+			query := s.db.RebindQuery(fmt.Sprintf(`
+				SELECT model_name,
+					FLOOR((created_at - %d) / %d) as slot_idx,
+					COUNT(*) as total,
+					SUM(CASE WHEN type = 2 AND completion_tokens > 0 THEN 1 ELSE 0 END) as success,
+					SUM(CASE WHEN type = 5 THEN 1 ELSE 0 END) as failure,
+					SUM(CASE WHEN type = 2 AND completion_tokens = 0 THEN 1 ELSE 0 END) as empty_count
+				FROM logs
+				WHERE model_name IN (%s)
+					AND created_at >= ? AND created_at < ?
+					AND type IN (2, 5)
+				GROUP BY model_name, FLOOR((created_at - %d) / %d)`,
+				startTime, twConfig.slotSeconds, modelPlaceholders, startTime, twConfig.slotSeconds))
+
+			args := make([]interface{}, 0, len(batch)+2)
+			for _, name := range batch {
+				args = append(args, name)
+			}
+			args = append(args, startTime, now)
+
+			rows, err := s.db.QueryWithTimeout(30*time.Second, query, args...)
+			if err != nil {
+				return nil, err
+			}
+			for _, row := range rows {
+				name := toString(row["model_name"])
+				if name == "" {
+					continue
+				}
+				rowsByModel[name] = append(rowsByModel[name], row)
+			}
+		}
+
+		for _, name := range uncached {
+			result := buildModelStatusResult(name, window, rowsByModel[name], twConfig, startTime)
+			resultsByModel[name] = result
+			cm.Set(fmt.Sprintf("model_status:%s:%s", name, window), result, 30*time.Second)
+		}
+	}
+
+	results := make([]map[string]interface{}, 0, len(orderedNames))
+	for _, name := range orderedNames {
+		if result, ok := resultsByModel[name]; ok {
+			results = append(results, result)
+		}
+	}
+
 	return results, nil
 }
 
 // GetAllModelsStatus returns status for all models that have requests
-func (s *ModelStatusService) GetAllModelsStatus(window string) ([]map[string]interface{}, error) {
+func (s *ModelStatusService) GetAllModelsStatus(window string, useCache bool) ([]map[string]interface{}, error) {
 	models, err := s.GetAvailableModels()
 	if err != nil {
 		return nil, err
@@ -273,7 +318,7 @@ func (s *ModelStatusService) GetAllModelsStatus(window string) ([]map[string]int
 		}
 	}
 
-	return s.GetMultipleModelsStatus(names, window)
+	return s.GetMultipleModelsStatus(names, window, useCache)
 }
 
 // GetTokenGroups 返回令牌分组列表及其关联的模型（基于 abilities 表）

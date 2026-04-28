@@ -105,9 +105,10 @@ func GetAvailableModels(c *gin.Context) {
 func GetSingleModelStatus(c *gin.Context) {
 	modelName := c.Param("model_name")
 	window := c.DefaultQuery("window", service.DefaultTimeWindow)
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	svc := service.NewModelStatusService()
-	data, err := svc.GetModelStatus(modelName, window)
+	data, err := svc.GetModelStatus(modelName, window, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
@@ -123,9 +124,10 @@ func GetMultipleModelsStatusHandler(c *gin.Context) {
 		return
 	}
 	window := c.DefaultQuery("window", service.DefaultTimeWindow)
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	svc := service.NewModelStatusService()
-	data, err := svc.GetMultipleModelsStatus(modelNames, window)
+	data, err := svc.GetMultipleModelsStatus(modelNames, window, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
@@ -141,9 +143,10 @@ func GetMultipleModelsStatusHandler(c *gin.Context) {
 // GET /status/all
 func GetAllModelsStatusHandler(c *gin.Context) {
 	window := c.DefaultQuery("window", service.DefaultTimeWindow)
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	svc := service.NewModelStatusService()
-	data, err := svc.GetAllModelsStatus(window)
+	data, err := svc.GetAllModelsStatus(window, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return

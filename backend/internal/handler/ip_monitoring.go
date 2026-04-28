@@ -92,9 +92,10 @@ func GetMultiIPTokens(c *gin.Context) {
 	}
 	minIPs, _ := strconv.Atoi(c.DefaultQuery("min_ips", "2"))
 	limit := parseLimit(c, 50, maxIPLimit)
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	svc := service.NewIPMonitoringService()
-	data, err := svc.GetMultiIPTokens(window, minIPs, limit)
+	data, err := svc.GetMultiIPTokens(window, minIPs, limit, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return
@@ -111,9 +112,10 @@ func GetMultiIPUsers(c *gin.Context) {
 	}
 	minIPs, _ := strconv.Atoi(c.DefaultQuery("min_ips", "3"))
 	limit := parseLimit(c, 50, maxIPLimit)
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	svc := service.NewIPMonitoringService()
-	data, err := svc.GetMultiIPUsers(window, minIPs, limit)
+	data, err := svc.GetMultiIPUsers(window, minIPs, limit, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return

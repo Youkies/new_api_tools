@@ -28,6 +28,8 @@ var RecommendedIndexes = []IndexDef{
 
 	// === 中优先级：Dashboard 模型统计 ===
 	{"idx_logs_type_created_model", "logs", []string{"type", "created_at", "model_name"}},
+	{"idx_logs_model_created_type", "logs", []string{"model_name", "created_at", "type"}},
+	{"idx_logs_type_created_channel_model", "logs", []string{"type", "created_at", "channel_id", "model_name"}},
 
 	// === 高优先级：用户活跃度查询 ===
 	{"idx_logs_user_type_created", "logs", []string{"user_id", "type", "created_at"}},
@@ -36,10 +38,13 @@ var RecommendedIndexes = []IndexDef{
 	{"idx_logs_user_created_ip", "logs", []string{"user_id", "created_at", "ip"}},
 	{"idx_logs_created_token_ip", "logs", []string{"created_at", "token_id", "ip"}},
 	{"idx_logs_created_ip_token", "logs", []string{"created_at", "ip", "token_id"}},
+	{"idx_logs_created_ip_user", "logs", []string{"created_at", "ip", "user_id"}},
 
 	// === 其他表索引 ===
 	{"idx_users_deleted_status", "users", []string{"deleted_at", "status"}},
+	{"idx_users_status_used_quota", "users", []string{"status", "used_quota"}},
 	{"idx_tokens_user_deleted", "tokens", []string{"user_id", "deleted_at"}},
+	{"idx_top_ups_user_status", "top_ups", []string{"user_id", "status"}},
 
 	// === 自动分组查询优化 ===
 	{"idx_users_group", "users", []string{"group"}},
@@ -149,6 +154,11 @@ func (m *Manager) indexExists(indexName, tableName string) (bool, error) {
 		WHERE table_schema = DATABASE() AND table_name = ? AND index_name = ? LIMIT 1`
 	row, err := m.QueryOne(query, tableName, indexName)
 	return row != nil, err
+}
+
+// IndexExists checks if an index exists.
+func (m *Manager) IndexExists(indexName, tableName string) (bool, error) {
+	return m.indexExists(indexName, tableName)
 }
 
 // CleanupRedundantIndexes removes indexes that are covered by other indexes

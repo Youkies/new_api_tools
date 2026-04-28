@@ -29,6 +29,7 @@ func GetLeaderboards(c *gin.Context) {
 	windows := strings.Split(windowsStr, ",")
 	limit := parseLimit(c, 10, 100)
 	sortBy := c.DefaultQuery("sort_by", "requests")
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
 	if sortBy != "requests" && sortBy != "quota" && sortBy != "failure_rate" {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid sort_by: "+sortBy, ""))
@@ -36,7 +37,7 @@ func GetLeaderboards(c *gin.Context) {
 	}
 
 	svc := service.NewRiskMonitoringService()
-	data, err := svc.GetLeaderboards(windows, limit, sortBy)
+	data, err := svc.GetLeaderboards(windows, limit, sortBy, useCache)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return

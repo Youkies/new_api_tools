@@ -25,6 +25,7 @@ type AutoGroupService struct {
 var (
 	agOAuthColumnsOnce   sync.Once
 	agAvailableOAuthCols []string
+	autoGroupScanOnce    sync.Once
 )
 
 // allAutoGroupOAuthColumns lists all possible OAuth ID columns
@@ -33,6 +34,64 @@ var allAutoGroupOAuthColumns = []string{"github_id", "wechat_id", "telegram_id",
 // NewAutoGroupService creates a new AutoGroupService
 func NewAutoGroupService() *AutoGroupService {
 	return &AutoGroupService{db: database.Get()}
+}
+
+// StartBackgroundAutoGroupScan runs the configured auto-group scan loop.
+func StartBackgroundAutoGroupScan(stop <-chan struct{}) {
+	autoGroupScanOnce.Do(func() {
+		go func() {
+			defer func() {
+				if r := recover(); r != nil {
+					logger.L.Error(fmt.Sprintf("自动分组后台任务 panic: %v", r))
+				}
+			}()
+
+			select {
+			case <-time.After(2 * time.Minute):
+			case <-stop:
+				return
+			}
+
+			logger.L.System("自动分组后台任务已启动")
+			for {
+				svc := NewAutoGroupService()
+				config := svc.GetConfig()
+				enabled, _ := config["enabled"].(bool)
+				autoScanEnabled, _ := config["auto_scan_enabled"].(bool)
+				intervalMinutes := toInt64(config["scan_interval_minutes"])
+				if !enabled || !autoScanEnabled || intervalMinutes <= 0 {
+					select {
+					case <-time.After(1 * time.Minute):
+					case <-stop:
+						logger.L.System("自动分组后台任务已停止")
+						return
+					}
+					continue
+				}
+
+				select {
+				case <-time.After(time.Duration(intervalMinutes) * time.Minute):
+				case <-stop:
+					logger.L.System("自动分组后台任务已停止")
+					return
+				}
+
+				svc = NewAutoGroupService()
+				config = svc.GetConfig()
+				enabled, _ = config["enabled"].(bool)
+				autoScanEnabled, _ = config["auto_scan_enabled"].(bool)
+				if !enabled || !autoScanEnabled || toInt64(config["scan_interval_minutes"]) <= 0 {
+					continue
+				}
+
+				logger.L.System(fmt.Sprintf("自动分组: 开始定时扫描 (间隔: %d分钟)", intervalMinutes))
+				result := svc.RunScan(false)
+				if success, _ := result["success"].(bool); !success {
+					logger.L.Warn(fmt.Sprintf("自动分组定时扫描失败: %v", result["message"]))
+				}
+			}
+		}()
+	})
 }
 
 // getGroupCol returns the properly quoted column name for "group"

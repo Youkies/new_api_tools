@@ -113,6 +113,14 @@ func main() {
 
 	// ========== 7. Background tasks ==========
 
+	// System scale detection and hot-cache warmup.
+	stopSystemTasks := make(chan struct{})
+	service.StartBackgroundSystemTasks(stopSystemTasks)
+
+	// Auto group scheduled scans.
+	stopAutoGroup := make(chan struct{})
+	service.StartBackgroundAutoGroupScan(stopAutoGroup)
+
 	// IP recording enforcement: check every 10 minutes, enable if any user disabled it
 	stopIPEnforce := make(chan struct{})
 	go backgroundEnforceIPRecording(stopIPEnforce)
@@ -142,6 +150,8 @@ func main() {
 	logger.L.System("正在优雅关闭服务...")
 
 	// Stop background tasks
+	close(stopSystemTasks)
+	close(stopAutoGroup)
 	close(stopIPEnforce)
 
 	// Give the server 10 seconds to finish processing requests

@@ -24,13 +24,15 @@ func NewRiskMonitoringService() *RiskMonitoringService {
 }
 
 // GetLeaderboards returns usage leaderboards across multiple time windows
-func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sortBy string) (map[string]interface{}, error) {
+func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sortBy string, useCache bool) (map[string]interface{}, error) {
 	cm := cache.Get()
 	cacheKey := fmt.Sprintf("risk:leaderboards:%s:%d:%s", strings.Join(windows, ","), limit, sortBy)
-	var cached map[string]interface{}
-	found, _ := cm.GetJSON(cacheKey, &cached)
-	if found {
-		return cached, nil
+	if useCache {
+		var cached map[string]interface{}
+		found, _ := cm.GetJSON(cacheKey, &cached)
+		if found {
+			return cached, nil
+		}
 	}
 
 	windowsData := map[string]interface{}{}
@@ -75,7 +77,7 @@ func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sor
 			ORDER BY %s
 			LIMIT ?`, orderBy))
 
-		rows, err := s.db.Query(query, startTime, now, limit)
+		rows, err := s.db.QueryWithTimeout(20*time.Second, query, startTime, now, limit)
 		if err != nil {
 			windowsData[window] = []map[string]interface{}{}
 			continue

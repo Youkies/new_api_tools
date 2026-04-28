@@ -339,6 +339,7 @@ const TIME_WINDOW_KEY = 'model_status_time_window'
 const THEME_KEY = 'model_status_theme'
 const SORT_MODE_KEY = 'model_status_sort_mode'
 const CUSTOM_ORDER_KEY = 'model_status_custom_order'
+const DEFAULT_SELECTED_MODEL_LIMIT = 20
 // Note: MODEL_GROUP_KEY is defined alongside MODEL_GROUPS above
 
 // Sort mode type
@@ -621,7 +622,7 @@ export function ModelStatusMonitor({ isEmbed = false }: ModelStatusMonitorProps)
             .map((m: ModelWithStats) => m.model_name)
           // If no active models, fall back to first 5
           const defaultModels = activeModels.length > 0
-            ? activeModels
+            ? activeModels.slice(0, DEFAULT_SELECTED_MODEL_LIMIT)
             : data.data.slice(0, 5).map((m: ModelWithStats) => m.model_name)
           setSelectedModels(defaultModels)
           saveSelectedModelsToBackend(defaultModels)

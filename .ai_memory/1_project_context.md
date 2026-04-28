@@ -10,5 +10,7 @@
 - `by_usage` 默认开启充值判定 `usage_require_topup=true`：候选用户必须在 `top_ups` 表存在成功充值记录，成功状态按 `success`、`completed` 或 `1` 判断；如果要求充值但 `top_ups` 表不存在，应返回无候选用户。
 - 自动分组目标分组列表不能只看 `users.group`；需要合并 NewAPI 的 `options.GroupRatio`、`UserUsableGroups`、`GroupGroupRatio`、`group_ratio_setting.group_special_usable_group`、`AutoGroups`，以及 `abilities.group`、`channels.group`，这样没有用户但已在倍率/特殊倍率中配置的分组也能被选择。
 - 手动分组迁移支持先测试再执行：`/api/auto-group/batch-move` 使用 `dry_run=true` 只返回预览，不修改用户；正式迁移写入 `batch_id`，撤销整批迁移使用 `/api/auto-group/revert-batch`。自动分组日志需保留 `batch_id`、`reverted_at`、`revert_log_id`、`revert_of` 元数据，避免重复或错误撤销。
+- Go 正式后端已补齐性能基础设施：前端使用路由级懒加载；Go `/api/system/scale` 基于用户数、日志估算和 24h 请求量返回刷新建议；`/api/system/warmup-status` 反映后台热缓存预热状态；模型状态使用批量 SQL 按 `model_name + slot` 聚合；风控排行榜、模型状态和 IP 列表支持 `no_cache=true` 真刷新。
+- Go 正式后端已支持自动分组后台定时扫描：启动后按 `enabled`、`auto_scan_enabled`、`scan_interval_minutes` 静默执行 `RunScan(false)`，与前端“自动扫描”开关语义一致。
 - 用户确认偏好：功能完成并验证通过后，默认自动提交并 push 当前分支；提交前仍需检查 `git status` 和 diff 范围，避免带入无关改动。
 - 常用验证命令：`go test ./...`（在 `backend/`）、`python -m py_compile ...`、`npm run build`（在 `frontend/`）。

@@ -360,9 +360,11 @@ func (s *DashboardService) GetChannelStatus() ([]map[string]interface{}, error) 
 			COALESCE(used_quota, 0) as used_quota,
 			COALESCE(balance, 0) as balance,
 			priority
-		FROM channels
-		WHERE deleted_at IS NULL
-		ORDER BY priority DESC, id ASC`
+		FROM channels`
+	if s.db.ColumnExists("channels", "deleted_at") {
+		query += " WHERE deleted_at IS NULL"
+	}
+	query += " ORDER BY priority DESC, id ASC"
 
 	return s.db.Query(query)
 }

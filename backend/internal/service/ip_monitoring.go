@@ -318,7 +318,7 @@ func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit in
 }
 
 // GetMultiIPTokens returns tokens used from multiple IPs with IP details
-func (s *IPMonitoringService) GetMultiIPTokens(window string, minIPs, limit int) (map[string]interface{}, error) {
+func (s *IPMonitoringService) GetMultiIPTokens(window string, minIPs, limit int, useCache bool) (map[string]interface{}, error) {
 	seconds, ok := WindowSeconds[window]
 	if !ok {
 		seconds = 86400
@@ -328,9 +328,11 @@ func (s *IPMonitoringService) GetMultiIPTokens(window string, minIPs, limit int)
 	cacheKey := fmt.Sprintf("ip:multi_token:%s:%d:%d", window, minIPs, limit)
 	cm := cache.Get()
 	var cached map[string]interface{}
-	found, _ := cm.GetJSON(cacheKey, &cached)
-	if found {
-		return cached, nil
+	if useCache {
+		found, _ := cm.GetJSON(cacheKey, &cached)
+		if found {
+			return cached, nil
+		}
 	}
 
 	query := s.db.RebindQuery(`
@@ -412,7 +414,7 @@ func (s *IPMonitoringService) GetMultiIPTokens(window string, minIPs, limit int)
 }
 
 // GetMultiIPUsers returns users accessing from multiple IPs with top IP details
-func (s *IPMonitoringService) GetMultiIPUsers(window string, minIPs, limit int) (map[string]interface{}, error) {
+func (s *IPMonitoringService) GetMultiIPUsers(window string, minIPs, limit int, useCache bool) (map[string]interface{}, error) {
 	seconds, ok := WindowSeconds[window]
 	if !ok {
 		seconds = 86400
@@ -422,9 +424,11 @@ func (s *IPMonitoringService) GetMultiIPUsers(window string, minIPs, limit int) 
 	cacheKey := fmt.Sprintf("ip:multi_user:%s:%d:%d", window, minIPs, limit)
 	cm := cache.Get()
 	var cached map[string]interface{}
-	found, _ := cm.GetJSON(cacheKey, &cached)
-	if found {
-		return cached, nil
+	if useCache {
+		found, _ := cm.GetJSON(cacheKey, &cached)
+		if found {
+			return cached, nil
+		}
 	}
 
 	query := s.db.RebindQuery(`
