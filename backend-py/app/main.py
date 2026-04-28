@@ -2024,6 +2024,7 @@ def include_routes(app: FastAPI):
     from .system_routes import router as system_router
     from .model_status_routes import router as model_status_router
     from .auto_group_routes import router as auto_group_router
+    from .cost_accounting_routes import router as cost_accounting_router
     app.include_router(router)
     app.include_router(auth_router)
     app.include_router(top_up_router)
@@ -2037,6 +2038,7 @@ def include_routes(app: FastAPI):
     app.include_router(system_router)
     app.include_router(model_status_router)
     app.include_router(auto_group_router)
+    app.include_router(cost_accounting_router)
 
 
 # Create FastAPI application

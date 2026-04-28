@@ -2,29 +2,23 @@
 
 ## 目标
 
-优化风控系统：多用户共用 IP 检测、用户封禁状态展示、一键封禁、AI 风控加强、待处理复核区、管理员反馈学习统计，并初始化项目记忆库。后续追加：用户管理按余额/用量/请求数排序，风控中心共享 IP 条目支持封禁全部用户、记录批量封禁并撤销上一次封禁。
+新增成本核算功能：查询每个渠道在自定义时间段内的站内计费、上游成本、毛利估算和模型明细；默认时间范围为本地今天 00:00 到页面打开时刻；支持设置渠道模型基础成本和渠道倍率，并可把多个站内模型名映射到同一个上游模型。
 
 ## 已完成
 
-- Go 后端增加多用户共用 IP 相关风险分析和 AI 待处理复核队列。
-- 前端将“多令牌共用 IP”调整为“多用户共用 IP”，展开项显示用户封禁状态并提供一键封禁。
-- 前端 AI 风控页增加待处理复核区、待处理数量、管理员处理操作和封禁后自动回写处理结果。
-- Python 后端补齐 AI 待处理复核、处理结果记录和学习统计接口。
-- `.ai_memory` 已初始化。
-- 用户管理前端新增余额、用量、请求数排序控件和可点击排序表头。
-- 风控中心多用户共用 IP 条目右侧新增“封禁全部”，按批次记录封禁结果并可撤销最近批次。
-- Go 后端用户封禁/解封新增审计记录，`/api/risk/ban-records` 可返回 Go 侧封禁流水。
-- 修复共享 IP 批量封禁实时同步：后端返回完整用户明细，前端封禁前强制刷新完整 IP 用户列表，并在封禁/撤销成功后立即同步本地状态。
+- Go 后端新增 `/api/cost/summary`、`/api/cost/rules`，使用工具自建表 `api_tools_channel_costs` 保存成本规则。
+- 成本规则支持按量（输入/输出 `$ / 1M tokens`）和按次（`$ / request`），支持渠道默认规则 `*`、具体模型规则和 `cost_multiplier` 倍率；实际成本按基础价格乘倍率计算。
+- 成本查询按 `logs.channel_id + logs.model_name` 聚合请求数、额度消耗、输入/输出 tokens，并计算站内计费、上游成本、毛利和未配置模型数量。
+- Python 后端补齐相同 `/api/cost/*` 兼容接口。
+- 前端新增 `成本核算` 导航页，可按时间段和渠道查询，可从未配置模型行快速生成成本规则并保存。
+- 前端成本规则表新增“倍率”列，基础价格列用于填写官方/正常价格，例如输入 `5`、倍率 `0.35` 会按 `1.75 $/1M` 计入成本。
 
 ## 验证结果
 
-- `go test ./...` 已通过。
-- `python -m py_compile backend-py\app\ai_auto_ban_service.py backend-py\app\ai_auto_ban_routes.py backend-py\app\ip_monitoring_service.py backend-py\app\ip_monitoring_routes.py backend-py\app\risk_monitoring_service.py` 已通过。
-- `npm run build` 已通过，仅有前端 chunk 体积 warning。
-- `git status --short` 显示本次风控相关文件和 `.ai_memory/` 新增目录。
-- 追加排序与批量封禁后，`go test ./...`、Python `py_compile`、`npm run build` 再次通过。
-- 修复实时同步后，`go test ./...`、Python `py_compile backend-py\app\ip_monitoring_service.py backend-py\app\ip_monitoring_routes.py`、`npm run build` 通过。
+- `go test ./...`（`backend/`）通过。
+- `python -m py_compile backend-py\app\cost_accounting_service.py backend-py\app\cost_accounting_routes.py backend-py\app\main.py` 通过。
+- `npm run build`（`frontend/`）通过，仅保留既有 chunk 体积 warning。
 
 ## 下一步
 
-等待用户审查改动或决定是否提交/推送。
+等待用户试用成本规则配置和时间段查询结果；如需要，可继续增加导出 CSV、规则批量复制或按上游模型汇总视图。

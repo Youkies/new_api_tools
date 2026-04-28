@@ -92,6 +92,7 @@ func main() {
 		handler.RegisterDashboardRoutes(api)
 		handler.RegisterUserManagementRoutes(api)
 		handler.RegisterLogAnalyticsRoutes(api)
+		handler.RegisterCostAccountingRoutes(api)
 
 		// Phase 2.3: IP Monitoring, Risk Monitoring, Model Status
 		handler.RegisterIPMonitoringRoutes(api)
