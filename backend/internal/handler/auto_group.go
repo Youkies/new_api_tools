@@ -41,7 +41,7 @@ func SaveAutoGroupConfig(c *gin.Context) {
 	}
 
 	// Validate mode if provided
-	if mode, ok := req["mode"].(string); ok && mode != "simple" && mode != "by_source" {
+	if mode, ok := req["mode"].(string); ok && mode != "simple" && mode != "by_source" && mode != "by_usage" {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "无效的分组模式", ""))
 		return
 	}

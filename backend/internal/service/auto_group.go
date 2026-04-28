@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -124,7 +125,16 @@ var defaultAutoGroupConfig = map[string]interface{}{
 	"scan_interval_minutes": 60,
 	"auto_scan_enabled":     false,
 	"whitelist_ids":         []interface{}{},
+	"usage_rules":           []interface{}{},
 	"last_scan_time":        0,
+}
+
+const autoGroupQuotaPerUSD = 500000.0
+
+type usageGroupRule struct {
+	Group           string  `json:"group"`
+	ThresholdAmount float64 `json:"threshold_amount"`
+	ThresholdQuota  int64   `json:"threshold_quota"`
 }
 
 // 优化3: getConfigCached 请求级缓存，避免重复 Redis GET + JSON Unmarshal
@@ -231,6 +241,106 @@ func (s *AutoGroupService) getTargetGroupBySource(source string) string {
 	return tg
 }
 
+func (s *AutoGroupService) getUsageRules() []usageGroupRule {
+	config := s.getConfigCached()
+	rawRules, ok := config["usage_rules"]
+	if !ok || rawRules == nil {
+		return nil
+	}
+
+	items := make([]interface{}, 0)
+	switch rules := rawRules.(type) {
+	case []interface{}:
+		items = rules
+	case []map[string]interface{}:
+		for _, rule := range rules {
+			items = append(items, rule)
+		}
+	}
+
+	result := make([]usageGroupRule, 0, len(items))
+	seen := map[string]bool{}
+	for _, item := range items {
+		ruleMap, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		group := strings.TrimSpace(toString(ruleMap["group"]))
+		if group == "" || group == "default" || seen[group] {
+			continue
+		}
+
+		thresholdQuota := toInt64(ruleMap["threshold_quota"])
+		thresholdAmount := toFloat64(ruleMap["threshold_amount"])
+		if thresholdAmount <= 0 && thresholdQuota > 0 {
+			thresholdAmount = float64(thresholdQuota) / autoGroupQuotaPerUSD
+		}
+		if thresholdQuota <= 0 && thresholdAmount > 0 {
+			thresholdQuota = int64(math.Ceil(thresholdAmount * autoGroupQuotaPerUSD))
+		}
+		if thresholdAmount <= 0 || thresholdQuota <= 0 {
+			continue
+		}
+
+		seen[group] = true
+		result = append(result, usageGroupRule{
+			Group:           group,
+			ThresholdAmount: thresholdAmount,
+			ThresholdQuota:  thresholdQuota,
+		})
+	}
+
+	sortUsageRules(result)
+	return result
+}
+
+func sortUsageRules(rules []usageGroupRule) {
+	for i := 0; i < len(rules); i++ {
+		for j := i + 1; j < len(rules); j++ {
+			if rules[j].ThresholdQuota < rules[i].ThresholdQuota {
+				rules[i], rules[j] = rules[j], rules[i]
+			}
+		}
+	}
+}
+
+func targetGroupByUsage(usedQuota int64, rules []usageGroupRule) (usageGroupRule, bool) {
+	var matched usageGroupRule
+	found := false
+	for _, rule := range rules {
+		if usedQuota >= rule.ThresholdQuota {
+			matched = rule
+			found = true
+		}
+	}
+	return matched, found
+}
+
+func shouldMoveByUsage(currentGroup string, targetRule usageGroupRule, rules []usageGroupRule) bool {
+	currentGroup = strings.TrimSpace(currentGroup)
+	if currentGroup == "" {
+		currentGroup = "default"
+	}
+	if currentGroup == targetRule.Group {
+		return false
+	}
+	if currentGroup == "default" {
+		return true
+	}
+
+	currentThreshold := int64(0)
+	for _, rule := range rules {
+		if rule.Group == currentGroup {
+			currentThreshold = rule.ThresholdQuota
+			break
+		}
+	}
+	if currentThreshold <= 0 {
+		return false
+	}
+	return targetRule.ThresholdQuota > currentThreshold
+}
+
 // buildWhitelistCondition builds the SQL condition and args for whitelist exclusion
 func (s *AutoGroupService) buildWhitelistCondition(whitelistIDs []int64, argIdx int) (string, []interface{}, int) {
 	if len(whitelistIDs) == 0 {
@@ -281,26 +391,31 @@ func (s *AutoGroupService) GetStats() map[string]interface{} {
 	groupCol := s.getGroupCol()
 	whitelistIDs := s.getWhitelistIDs()
 
-	// Build whitelist condition
-	wlCond, wlArgs, _ := s.buildWhitelistCondition(whitelistIDs, 1)
-
-	// Count pending users (default group, active, not whitelisted)
-	pendingSQL := fmt.Sprintf(`
-		SELECT COUNT(*) as cnt
-		FROM users
-		WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
-		AND deleted_at IS NULL
-		AND status = 1
-		%s`, groupCol, groupCol, wlCond)
-
-	if !s.db.IsPG {
-		pendingSQL = s.db.RebindQuery(pendingSQL)
-	}
-
 	pendingCount := int64(0)
-	row, err := s.db.QueryOne(pendingSQL, wlArgs...)
-	if err == nil && row != nil {
-		pendingCount = toInt64(row["cnt"])
+	if mode, _ := config["mode"].(string); mode == "by_usage" {
+		pending := s.GetUsageUpgradeUsers(1, 1)
+		pendingCount = toInt64(pending["total"])
+	} else {
+		// Build whitelist condition
+		wlCond, wlArgs, _ := s.buildWhitelistCondition(whitelistIDs, 1)
+
+		// Count pending users (default group, active, not whitelisted)
+		pendingSQL := fmt.Sprintf(`
+			SELECT COUNT(*) as cnt
+			FROM users
+			WHERE (COALESCE(%s, 'default') = 'default' OR %s = '')
+			AND deleted_at IS NULL
+			AND status = 1
+			%s`, groupCol, groupCol, wlCond)
+
+		if !s.db.IsPG {
+			pendingSQL = s.db.RebindQuery(pendingSQL)
+		}
+
+		row, err := s.db.QueryOne(pendingSQL, wlArgs...)
+		if err == nil && row != nil {
+			pendingCount = toInt64(row["cnt"])
+		}
 	}
 
 	// 优化4: 使用 Redis LLEN 获取总日志计数
@@ -373,6 +488,11 @@ func (s *AutoGroupService) GetAvailableGroups() []map[string]interface{} {
 
 // GetPendingUsers returns users not yet assigned to a group
 func (s *AutoGroupService) GetPendingUsers(page, pageSize int) map[string]interface{} {
+	config := s.getConfigCached()
+	if mode, _ := config["mode"].(string); mode == "by_usage" {
+		return s.GetUsageUpgradeUsers(page, pageSize)
+	}
+
 	groupCol := s.getGroupCol()
 	whitelistIDs := s.getWhitelistIDs()
 	oauthCols := s.buildOAuthSelectCols()
@@ -463,6 +583,114 @@ func (s *AutoGroupService) GetPendingUsers(page, pageSize int) map[string]interf
 
 	return map[string]interface{}{
 		"items":       items,
+		"total":       total,
+		"page":        page,
+		"page_size":   pageSize,
+		"total_pages": totalPages,
+	}
+}
+
+// GetUsageUpgradeUsers returns active users eligible for usage-based group upgrades.
+func (s *AutoGroupService) GetUsageUpgradeUsers(page, pageSize int) map[string]interface{} {
+	rules := s.getUsageRules()
+	if len(rules) == 0 {
+		return map[string]interface{}{
+			"items": []map[string]interface{}{}, "total": int64(0),
+			"page": page, "page_size": pageSize, "total_pages": int64(0),
+		}
+	}
+
+	groupCol := s.getGroupCol()
+	oauthCols := s.buildOAuthSelectCols()
+	whitelistIDs := s.getWhitelistIDs()
+	minThreshold := rules[0].ThresholdQuota
+
+	args := []interface{}{minThreshold}
+	wlCond, wlArgs, _ := s.buildWhitelistCondition(whitelistIDs, 2)
+	args = append(args, wlArgs...)
+
+	var query string
+	if s.db.IsPG {
+		query = fmt.Sprintf(`
+			SELECT id, username, display_name, email, %s as user_group, status,
+				COALESCE(used_quota, 0) as used_quota%s
+			FROM users
+			WHERE deleted_at IS NULL
+			AND status = 1
+			AND COALESCE(used_quota, 0) >= $1
+			%s
+			ORDER BY COALESCE(used_quota, 0) DESC, id DESC`, groupCol, oauthCols, wlCond)
+	} else {
+		query = fmt.Sprintf(`
+			SELECT id, username, display_name, email, %s as user_group, status,
+				COALESCE(used_quota, 0) as used_quota%s
+			FROM users
+			WHERE deleted_at IS NULL
+			AND status = 1
+			AND COALESCE(used_quota, 0) >= ?
+			%s
+			ORDER BY COALESCE(used_quota, 0) DESC, id DESC`, groupCol, oauthCols, wlCond)
+		query = s.db.RebindQuery(query)
+	}
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		logger.L.Error(fmt.Sprintf("获取按消费升级用户失败: %v", err))
+		rows = nil
+	}
+
+	eligible := make([]map[string]interface{}, 0)
+	for _, row := range rows {
+		usedQuota := toInt64(row["used_quota"])
+		targetRule, ok := targetGroupByUsage(usedQuota, rules)
+		if !ok {
+			continue
+		}
+		currentGroup := toString(row["user_group"])
+		if currentGroup == "" {
+			currentGroup = "default"
+		}
+		if !shouldMoveByUsage(currentGroup, targetRule, rules) {
+			continue
+		}
+
+		source := s.detectSource(row)
+		eligible = append(eligible, map[string]interface{}{
+			"id":               toInt64(row["id"]),
+			"username":         toString(row["username"]),
+			"display_name":     toString(row["display_name"]),
+			"email":            toString(row["email"]),
+			"group":            currentGroup,
+			"source":           source,
+			"status":           toInt64(row["status"]),
+			"used_quota":       usedQuota,
+			"used_amount":      math.Round((float64(usedQuota)/autoGroupQuotaPerUSD)*100) / 100,
+			"target_group":     targetRule.Group,
+			"threshold_amount": targetRule.ThresholdAmount,
+			"threshold_quota":  targetRule.ThresholdQuota,
+		})
+	}
+
+	total := int64(len(eligible))
+	start := (page - 1) * pageSize
+	if start < 0 {
+		start = 0
+	}
+	end := start + pageSize
+	if start > len(eligible) {
+		start = len(eligible)
+	}
+	if end > len(eligible) {
+		end = len(eligible)
+	}
+
+	totalPages := int64(0)
+	if total > 0 {
+		totalPages = (total + int64(pageSize) - 1) / int64(pageSize)
+	}
+
+	return map[string]interface{}{
+		"items":       eligible[start:end],
 		"total":       total,
 		"page":        page,
 		"page_size":   pageSize,
@@ -692,6 +920,13 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 				"message": "未配置任何来源分组规则",
 			}
 		}
+	} else if mode == "by_usage" {
+		if len(s.getUsageRules()) == 0 {
+			return map[string]interface{}{
+				"success": false,
+				"message": "未配置任何消费升级规则",
+			}
+		}
 	}
 
 	startTime := time.Now()
@@ -786,38 +1021,53 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 			logger.L.Business(fmt.Sprintf("自动分组: 批量分配 %d 个用户到 %s", assignedCount, targetGroup))
 		}
 	} else {
-		// by_source 模式 or dry_run: 逐用户处理
+		// by_source/by_usage 模式 or dry_run: 逐用户处理
 		for _, user := range users {
 			userID := toInt64(user["id"])
 			username := toString(user["username"])
 			userSource := toString(user["source"])
 
 			targetGroup := s.getTargetGroupBySource(userSource)
+			if mode == "by_usage" {
+				targetGroup = toString(user["target_group"])
+			}
 
 			if targetGroup == "" {
 				skippedCount++
+				message := fmt.Sprintf("来源 %s 未配置目标分组", userSource)
+				if mode == "by_usage" {
+					message = "未命中消费升级规则"
+				}
 				results = append(results, map[string]interface{}{
 					"user_id": userID, "username": username, "source": userSource,
-					"action": "skipped", "message": fmt.Sprintf("来源 %s 未配置目标分组", userSource),
+					"action": "skipped", "message": message,
 				})
 				continue
 			}
 
 			if dryRun {
 				assignedCount++
+				message := fmt.Sprintf("[试运行] 将分配到 %s", targetGroup)
+				if mode == "by_usage" {
+					message = fmt.Sprintf("[试运行] 已消费 $%.2f，将升级到 %s", toFloat64(user["used_amount"]), targetGroup)
+				}
 				results = append(results, map[string]interface{}{
 					"user_id": userID, "username": username, "source": userSource,
 					"target_group": targetGroup, "action": "would_assign",
-					"message": fmt.Sprintf("[试运行] 将分配到 %s", targetGroup),
+					"message": message,
 				})
 			} else {
 				result := s.assignUser(userID, targetGroup, "system")
 				if success, _ := result["success"].(bool); success {
 					assignedCount++
+					message := toString(result["message"])
+					if mode == "by_usage" {
+						message = fmt.Sprintf("已消费 $%.2f，已升级到 %s", toFloat64(user["used_amount"]), targetGroup)
+					}
 					results = append(results, map[string]interface{}{
 						"user_id": userID, "username": username, "source": userSource,
 						"target_group": targetGroup, "action": "assigned",
-						"message": toString(result["message"]),
+						"message": message,
 					})
 				} else {
 					errorCount++

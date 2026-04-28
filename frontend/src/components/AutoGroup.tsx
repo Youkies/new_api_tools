@@ -17,6 +17,8 @@ import {
   Send,
   Key,
   Shield,
+  DollarSign,
+  ArrowUpCircle,
 } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
@@ -49,6 +51,9 @@ interface UserInfo {
   source: string
   status: number
   created_time: number
+  used_quota?: number
+  used_amount?: number
+  target_group?: string
 }
 
 interface LogEntry {
@@ -68,10 +73,16 @@ interface Config {
   mode: string
   target_group: string
   source_rules: Record<string, string>
+  usage_rules: UsageRule[]
   scan_interval_minutes: number
   auto_scan_enabled: boolean
   whitelist_ids: number[]
   last_scan_time: number
+}
+
+interface UsageRule {
+  group: string
+  threshold_amount: number
 }
 
 interface Stats {
@@ -103,6 +114,16 @@ function formatTime(ts: number) {
     minute: '2-digit',
   })
 }
+
+function formatQuota(quota?: number) {
+  return `$${((quota || 0) / 500000).toFixed(2)}`
+}
+
+const DEFAULT_USAGE_RULES: UsageRule[] = [
+  { group: 'Pro', threshold_amount: 10 },
+  { group: 'Super', threshold_amount: 50 },
+  { group: 'Ultra', threshold_amount: 100 },
+]
 
 export function AutoGroup() {
   const { token } = useAuth()
@@ -270,6 +291,30 @@ export function AutoGroup() {
     } finally {
       setSaving(false)
     }
+  }
+
+  const getUsageRules = () => config?.usage_rules?.length ? config.usage_rules : DEFAULT_USAGE_RULES
+
+  const saveUsageRule = (index: number, patch: Partial<UsageRule>) => {
+    if (!config) return
+    const nextRules = [...getUsageRules()].map((rule, idx) => (
+      idx === index ? { ...rule, ...patch } : rule
+    ))
+    saveConfig({ usage_rules: nextRules })
+  }
+
+  const addUsageRule = () => {
+    const nextRules = [...getUsageRules(), { group: '', threshold_amount: 0 }]
+    saveConfig({ usage_rules: nextRules })
+  }
+
+  const removeUsageRule = (index: number) => {
+    const nextRules = getUsageRules().filter((_, idx) => idx !== index)
+    saveConfig({ usage_rules: nextRules })
+  }
+
+  const applyDefaultUsageRules = () => {
+    saveConfig({ usage_rules: DEFAULT_USAGE_RULES })
   }
 
   // Run scan
@@ -469,11 +514,20 @@ export function AutoGroup() {
                   <h4 className="font-medium">分组模式</h4>
                   <Select
                     value={config.mode}
-                    onChange={(e) => saveConfig({ mode: e.target.value })}
+                    onChange={(e) => {
+                      const mode = e.target.value
+                      saveConfig({
+                        mode,
+                        ...(mode === 'by_usage' && (!config.usage_rules || config.usage_rules.length === 0)
+                          ? { usage_rules: DEFAULT_USAGE_RULES }
+                          : {}),
+                      })
+                    }}
                     disabled={saving}
                   >
                     <option value="simple">简单模式 - 所有用户分配到同一分组</option>
                     <option value="by_source">按来源分组 - 根据注册来源分配到不同分组</option>
+                    <option value="by_usage">按消费升级 - 根据累计消费自动升级分组</option>
                   </Select>
                 </div>
 
@@ -540,6 +594,72 @@ export function AutoGroup() {
                         </div>
                       ))}
                     </div>
+                  </div>
+                )}
+
+                {config.mode === 'by_usage' && (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between gap-3">
+                      <div>
+                        <h4 className="font-medium">按消费升级规则</h4>
+                        <p className="text-sm text-muted-foreground">
+                          使用累计已消费金额判断，命中最高门槛后自动升级到对应分组
+                        </p>
+                      </div>
+                      <Button variant="outline" size="sm" onClick={applyDefaultUsageRules} disabled={saving}>
+                        <ArrowUpCircle className="h-4 w-4 mr-2" />
+                        默认档位
+                      </Button>
+                    </div>
+                    <div className="grid gap-3">
+                      {getUsageRules().map((rule, index) => (
+                        <div key={index} className="grid gap-3 md:grid-cols-[160px_1fr_auto] items-end">
+                          <div className="space-y-1">
+                            <label className="text-xs text-muted-foreground">消费达到 USD</label>
+                            <Input
+                              type="number"
+                              min={0}
+                              step="0.01"
+                              value={rule.threshold_amount}
+                              onChange={(e) => saveUsageRule(index, { threshold_amount: Number(e.target.value) || 0 })}
+                              disabled={saving}
+                            />
+                          </div>
+                          <div className="space-y-1">
+                            <label className="text-xs text-muted-foreground">升级到分组</label>
+                            <Select
+                              value={rule.group}
+                              onChange={(e) => saveUsageRule(index, { group: e.target.value })}
+                              disabled={saving}
+                            >
+                              <option value="">-- 请选择目标分组 --</option>
+                              {groups
+                                .filter((g) => g.group_name !== 'default')
+                                .map((g) => (
+                                  <option key={g.group_name} value={g.group_name}>
+                                    {g.group_name}
+                                  </option>
+                                ))}
+                              {!groups.some((g) => g.group_name === rule.group) && rule.group && (
+                                <option value={rule.group}>{rule.group}</option>
+                              )}
+                            </Select>
+                          </div>
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => removeUsageRule(index)}
+                            disabled={saving || getUsageRules().length <= 1}
+                          >
+                            删除
+                          </Button>
+                        </div>
+                      ))}
+                    </div>
+                    <Button variant="outline" size="sm" onClick={addUsageRule} disabled={saving}>
+                      <DollarSign className="h-4 w-4 mr-2" />
+                      添加档位
+                    </Button>
                   </div>
                 )}
 
@@ -662,19 +782,25 @@ export function AutoGroup() {
                       <TableHead>用户名</TableHead>
                       <TableHead>当前分组</TableHead>
                       <TableHead>注册来源</TableHead>
+                      {config.mode === 'by_usage' && (
+                        <>
+                          <TableHead className="text-right">已消费</TableHead>
+                          <TableHead>目标分组</TableHead>
+                        </>
+                      )}
                       <TableHead>注册时间</TableHead>
                     </TableRow>
                   </TableHeader>
                   <TableBody>
                     {previewLoading ? (
                       <TableRow>
-                        <TableCell colSpan={5} className="text-center py-8">
+                        <TableCell colSpan={config.mode === 'by_usage' ? 7 : 5} className="text-center py-8">
                           <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                         </TableCell>
                       </TableRow>
                     ) : previewUsers.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={5} className="text-center py-8 text-muted-foreground">
+                        <TableCell colSpan={config.mode === 'by_usage' ? 7 : 5} className="text-center py-8 text-muted-foreground">
                           没有待分配的用户
                         </TableCell>
                       </TableRow>
@@ -687,6 +813,14 @@ export function AutoGroup() {
                             <Badge variant="outline">{user.group || 'default'}</Badge>
                           </TableCell>
                           <TableCell>{renderSourceBadge(user.source)}</TableCell>
+                          {config.mode === 'by_usage' && (
+                            <>
+                              <TableCell className="text-right font-mono">{formatQuota(user.used_quota)}</TableCell>
+                              <TableCell>
+                                <Badge variant="default">{user.target_group || '-'}</Badge>
+                              </TableCell>
+                            </>
+                          )}
                           <TableCell>{formatTime(user.created_time)}</TableCell>
                         </TableRow>
                       ))

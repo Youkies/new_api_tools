@@ -18,6 +18,7 @@ class SaveConfigRequest(BaseModel):
     mode: Optional[str] = None  # "simple" 或 "by_source"
     target_group: Optional[str] = None
     source_rules: Optional[dict] = None
+    usage_rules: Optional[List[dict]] = None
     scan_interval_minutes: Optional[int] = None
     auto_scan_enabled: Optional[bool] = None
     whitelist_ids: Optional[List[int]] = None
@@ -56,13 +57,15 @@ async def save_config(
     if request.enabled is not None:
         config["enabled"] = request.enabled
     if request.mode is not None:
-        if request.mode not in ["simple", "by_source"]:
+        if request.mode not in ["simple", "by_source", "by_usage"]:
             raise HTTPException(status_code=400, detail="无效的分组模式")
         config["mode"] = request.mode
     if request.target_group is not None:
         config["target_group"] = request.target_group
     if request.source_rules is not None:
         config["source_rules"] = request.source_rules
+    if request.usage_rules is not None:
+        config["usage_rules"] = request.usage_rules
     if request.scan_interval_minutes is not None:
         if request.scan_interval_minutes < 1 or request.scan_interval_minutes > 1440:
             raise HTTPException(status_code=400, detail="扫描间隔必须在 1-1440 分钟之间")

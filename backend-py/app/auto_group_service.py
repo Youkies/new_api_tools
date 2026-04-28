@@ -17,6 +17,7 @@
 - 不预设任何危险分组
 """
 import time
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set
 from enum import Enum
@@ -40,6 +41,7 @@ class RegistrationSource(Enum):
 # 配置常量
 AUTO_GROUP_CONFIG_KEY = "auto_group_config"
 DEFAULT_SCAN_INTERVAL = 60  # 默认扫描间隔（分钟）
+QUOTA_PER_USD = 500000.0
 
 
 @dataclass
@@ -52,6 +54,7 @@ class AutoGroupConfig:
     scan_interval_minutes: int = DEFAULT_SCAN_INTERVAL
     auto_scan_enabled: bool = False
     whitelist_ids: List[int] = None
+    usage_rules: List[Dict[str, Any]] = None
 
     def __post_init__(self):
         if self.source_rules is None:
@@ -66,6 +69,8 @@ class AutoGroupConfig:
             }
         if self.whitelist_ids is None:
             self.whitelist_ids = []
+        if self.usage_rules is None:
+            self.usage_rules = []
 
 
 class AutoGroupService:
@@ -96,6 +101,7 @@ class AutoGroupService:
             scan_interval_minutes=stored.get("scan_interval_minutes", DEFAULT_SCAN_INTERVAL),
             auto_scan_enabled=stored.get("auto_scan_enabled", False),
             whitelist_ids=stored.get("whitelist_ids", []),
+            usage_rules=stored.get("usage_rules", []),
         )
 
     def get_config(self) -> Dict[str, Any]:
@@ -108,6 +114,7 @@ class AutoGroupService:
             "scan_interval_minutes": self._config.scan_interval_minutes,
             "auto_scan_enabled": self._config.auto_scan_enabled,
             "whitelist_ids": self._config.whitelist_ids,
+            "usage_rules": self._config.usage_rules,
             "last_scan_time": self._last_scan_time,
         }
 
@@ -202,6 +209,69 @@ class AutoGroupService:
             return self._config.target_group
         return self._config.source_rules.get(source.value, "")
 
+    def _get_usage_rules(self) -> List[Dict[str, Any]]:
+        rules = []
+        seen = set()
+        for raw in self._config.usage_rules or []:
+            if not isinstance(raw, dict):
+                continue
+            group = str(raw.get("group") or "").strip()
+            if not group or group == "default" or group in seen:
+                continue
+            threshold_quota = self._to_int(raw.get("threshold_quota"))
+            threshold_amount = self._to_float(raw.get("threshold_amount"))
+            if threshold_amount <= 0 and threshold_quota > 0:
+                threshold_amount = threshold_quota / QUOTA_PER_USD
+            if threshold_quota <= 0 and threshold_amount > 0:
+                threshold_quota = int(math.ceil(threshold_amount * QUOTA_PER_USD))
+            if threshold_amount <= 0 or threshold_quota <= 0:
+                continue
+            seen.add(group)
+            rules.append({
+                "group": group,
+                "threshold_amount": threshold_amount,
+                "threshold_quota": threshold_quota,
+            })
+        rules.sort(key=lambda item: item["threshold_quota"])
+        return rules
+
+    def _target_group_by_usage(self, used_quota: int, rules: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        matched = None
+        for rule in rules:
+            if used_quota >= int(rule["threshold_quota"]):
+                matched = rule
+        return matched
+
+    def _should_move_by_usage(self, current_group: str, target_rule: Dict[str, Any], rules: List[Dict[str, Any]]) -> bool:
+        current_group = (current_group or "default").strip() or "default"
+        if current_group == target_rule["group"]:
+            return False
+        if current_group == "default":
+            return True
+        current_threshold = 0
+        for rule in rules:
+            if rule["group"] == current_group:
+                current_threshold = int(rule["threshold_quota"])
+                break
+        if current_threshold <= 0:
+            return False
+        return int(target_rule["threshold_quota"]) > current_threshold
+
+    def _to_int(self, value: Any) -> int:
+        try:
+            return int(float(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _to_float(self, value: Any) -> float:
+        try:
+            parsed = float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        if parsed <= 0 or math.isnan(parsed) or math.isinf(parsed):
+            return 0.0
+        return parsed
+
     def _is_whitelisted(self, user_id: int) -> bool:
         """检查用户是否在白名单中"""
         return user_id in self._config.whitelist_ids
@@ -220,6 +290,9 @@ class AutoGroupService:
         - 用户状态正常（status = 1）
         - 用户不在白名单中
         """
+        if self._config.mode == "by_usage":
+            return self.get_usage_upgrade_users(page=page, page_size=page_size)
+
         try:
             db = get_db_manager()
             db.connect()
@@ -294,6 +367,96 @@ class AutoGroupService:
             }
         except Exception as e:
             logger.error(f"获取待分配用户列表失败: {e}")
+            return {
+                "items": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": 0,
+            }
+
+    def get_usage_upgrade_users(self, page: int = 1, page_size: int = 50) -> Dict[str, Any]:
+        """获取满足累计消费升级规则的用户。"""
+        rules = self._get_usage_rules()
+        if not rules:
+            return {
+                "items": [],
+                "total": 0,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": 0,
+            }
+
+        try:
+            db = get_db_manager()
+            db.connect()
+
+            is_pg = db.config.engine == DatabaseEngine.POSTGRESQL
+            group_col = '"group"' if is_pg else '`group`'
+            min_threshold = int(rules[0]["threshold_quota"])
+
+            whitelist_condition = ""
+            params: Dict[str, Any] = {"min_threshold": min_threshold}
+            whitelist_ids = self._config.whitelist_ids or []
+            if whitelist_ids:
+                placeholders = ", ".join([":wl_" + str(i) for i in range(len(whitelist_ids))])
+                whitelist_condition = f"AND id NOT IN ({placeholders})"
+                for i, wl_id in enumerate(whitelist_ids):
+                    params[f"wl_{i}"] = wl_id
+
+            sql = f"""
+                SELECT id, username, display_name, email, {group_col} as user_group,
+                       COALESCE(used_quota, 0) as used_quota,
+                       github_id, wechat_id, telegram_id, discord_id, oidc_id, linux_do_id,
+                       status
+                FROM users
+                WHERE deleted_at IS NULL
+                AND status = 1
+                AND COALESCE(used_quota, 0) >= :min_threshold
+                {whitelist_condition}
+                ORDER BY COALESCE(used_quota, 0) DESC, id DESC
+            """
+
+            rows = db.execute(sql, params)
+            eligible = []
+            for row in rows or []:
+                used_quota = int(row.get("used_quota") or 0)
+                target_rule = self._target_group_by_usage(used_quota, rules)
+                if not target_rule:
+                    continue
+                current_group = row.get("user_group") or "default"
+                if not self._should_move_by_usage(current_group, target_rule, rules):
+                    continue
+
+                user_dict = dict(row)
+                source = self.detect_registration_source(user_dict)
+                eligible.append({
+                    "id": int(row.get("id")),
+                    "username": row.get("username") or "",
+                    "display_name": row.get("display_name") or "",
+                    "email": row.get("email") or "",
+                    "group": current_group,
+                    "source": source.value,
+                    "status": int(row.get("status") or 0),
+                    "used_quota": used_quota,
+                    "used_amount": round(used_quota / QUOTA_PER_USD, 2),
+                    "target_group": target_rule["group"],
+                    "threshold_amount": target_rule["threshold_amount"],
+                    "threshold_quota": target_rule["threshold_quota"],
+                })
+
+            total = len(eligible)
+            start = max(0, (page - 1) * page_size)
+            end = min(total, start + page_size)
+            return {
+                "items": eligible[start:end],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+                "total_pages": (total + page_size - 1) // page_size if total > 0 else 0,
+            }
+        except Exception as e:
+            logger.error(f"获取按消费升级用户失败: {e}")
             return {
                 "items": [],
                 "total": 0,
@@ -667,6 +830,11 @@ class AutoGroupService:
                     "success": False,
                     "message": "未配置任何来源分组规则",
                 }
+        if self._config.mode == "by_usage" and not self._get_usage_rules():
+            return {
+                "success": False,
+                "message": "未配置任何消费升级规则",
+            }
 
         start_time = time.time()
         results = []
@@ -687,39 +855,50 @@ class AutoGroupService:
 
             # 获取目标分组
             target_group = self.get_target_group_by_source(source)
+            if self._config.mode == "by_usage":
+                target_group = user.get("target_group") or ""
 
             if not target_group:
                 skipped_count += 1
+                message = f"来源 {source.value} 未配置目标分组"
+                if self._config.mode == "by_usage":
+                    message = "未命中消费升级规则"
                 results.append({
                     "user_id": user_id,
                     "username": username,
                     "source": source.value,
                     "action": "skipped",
-                    "message": f"来源 {source.value} 未配置目标分组",
+                    "message": message,
                 })
                 continue
 
             if dry_run:
                 assigned_count += 1
+                message = f"[试运行] 将分配到 {target_group}"
+                if self._config.mode == "by_usage":
+                    message = f"[试运行] 已消费 ${float(user.get('used_amount') or 0):.2f}，将升级到 {target_group}"
                 results.append({
                     "user_id": user_id,
                     "username": username,
                     "source": source.value,
                     "target_group": target_group,
                     "action": "would_assign",
-                    "message": f"[试运行] 将分配到 {target_group}",
+                    "message": message,
                 })
             else:
                 result = self.assign_user(user_id, target_group, operator)
                 if result.get("success"):
                     assigned_count += 1
+                    message = result.get("message")
+                    if self._config.mode == "by_usage":
+                        message = f"已消费 ${float(user.get('used_amount') or 0):.2f}，已升级到 {target_group}"
                     results.append({
                         "user_id": user_id,
                         "username": username,
                         "source": source.value,
                         "target_group": target_group,
                         "action": "assigned",
-                        "message": result.get("message"),
+                        "message": message,
                     })
                 else:
                     error_count += 1
@@ -791,17 +970,20 @@ class AutoGroupService:
                 for i, wl_id in enumerate(whitelist_ids):
                     params[f"wl_{i}"] = wl_id
 
-            # 获取待分配用户数
-            pending_sql = f"""
-                SELECT COUNT(*) as cnt
-                FROM users
-                WHERE (COALESCE({group_col}, 'default') = 'default' OR {group_col} = '')
-                AND deleted_at IS NULL
-                AND status = 1
-                {whitelist_condition}
-            """
-            pending_result = db.execute(pending_sql, params)
-            pending_count = int(pending_result[0].get("cnt", 0)) if pending_result else 0
+            if self._config.mode == "by_usage":
+                pending_count = int(self.get_usage_upgrade_users(page=1, page_size=1).get("total") or 0)
+            else:
+                # 获取待分配用户数
+                pending_sql = f"""
+                    SELECT COUNT(*) as cnt
+                    FROM users
+                    WHERE (COALESCE({group_col}, 'default') = 'default' OR {group_col} = '')
+                    AND deleted_at IS NULL
+                    AND status = 1
+                    {whitelist_condition}
+                """
+                pending_result = db.execute(pending_sql, params)
+                pending_count = int(pending_result[0].get("cnt", 0)) if pending_result else 0
 
             # 获取累计处理数（从日志表）
             logs = self._storage.get_auto_group_logs(page=1, page_size=1, action="assign")
