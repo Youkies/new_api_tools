@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -248,6 +249,10 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 	}
 
 	ruleMap := buildCostRuleMap(rules)
+	channelModelMappings, err := s.loadChannelModelMappings(channelID)
+	if err != nil {
+		return nil, err
+	}
 	query := `
 		SELECT COALESCE(l.channel_id, 0) as channel_id,
 			COALESCE(MAX(c.name), '') as channel_name,
@@ -300,15 +305,15 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		completionTokens := toInt64(row["completion_tokens"])
 		billedAmount := float64(quotaUsed) / costQuotaPerUSD
 
-		rule, configured := findCostRule(ruleMap, cid, modelName)
+		upstreamModel := resolveUpstreamModel(channelModelMappings, cid, modelName)
+		rule, configured := findCostRule(ruleMap, cid, modelName, upstreamModel)
 		estimatedCost := 0.0
-		upstreamModel := modelName
 		billingMode := "token"
 		ruleID := int64(0)
 		if configured {
-			upstreamModel = rule.UpstreamModel
-			if upstreamModel == "" || upstreamModel == "*" {
-				upstreamModel = modelName
+			ruleUpstreamModel := strings.TrimSpace(rule.UpstreamModel)
+			if ruleUpstreamModel != "" && ruleUpstreamModel != "*" && ruleUpstreamModel != rule.ModelName {
+				upstreamModel = ruleUpstreamModel
 			}
 			billingMode = rule.BillingMode
 			ruleID = rule.ID
@@ -429,6 +434,89 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 	}, nil
 }
 
+func (s *CostAccountingService) loadChannelModelMappings(channelID *int64) (map[int64]map[string]string, error) {
+	mappings := map[int64]map[string]string{}
+	if !s.db.ColumnExists("channels", "model_mapping") {
+		return mappings, nil
+	}
+
+	query := `SELECT id, model_mapping FROM channels WHERE deleted_at IS NULL`
+	args := []interface{}{}
+	if channelID != nil && *channelID > 0 {
+		query += " AND id = ?"
+		args = append(args, *channelID)
+	}
+
+	rows, err := s.db.QueryWithTimeout(15*time.Second, s.db.RebindQuery(query), args...)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, row := range rows {
+		channelID := toInt64(row["id"])
+		parsed := parseModelMapping(toString(row["model_mapping"]))
+		if channelID > 0 && len(parsed) > 0 {
+			mappings[channelID] = parsed
+		}
+	}
+	return mappings, nil
+}
+
+func parseModelMapping(raw string) map[string]string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || raw == "{}" || raw == "[]" {
+		return map[string]string{}
+	}
+
+	var decoded map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		return map[string]string{}
+	}
+
+	mapping := make(map[string]string, len(decoded))
+	for key, value := range decoded {
+		source := strings.TrimSpace(key)
+		target := mappingValueToString(value)
+		if source != "" && target != "" {
+			mapping[source] = target
+		}
+	}
+	return mapping
+}
+
+func mappingValueToString(value interface{}) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(v)
+	case []interface{}:
+		for _, item := range v {
+			if resolved := mappingValueToString(item); resolved != "" {
+				return resolved
+			}
+		}
+	case map[string]interface{}:
+		for _, key := range []string{"model", "target", "upstream_model", "upstream", "value"} {
+			if resolved := mappingValueToString(v[key]); resolved != "" {
+				return resolved
+			}
+		}
+	default:
+		return strings.TrimSpace(fmt.Sprint(v))
+	}
+	return ""
+}
+
+func resolveUpstreamModel(mappings map[int64]map[string]string, channelID int64, modelName string) string {
+	if channelMapping, ok := mappings[channelID]; ok {
+		if upstreamModel := strings.TrimSpace(channelMapping[modelName]); upstreamModel != "" {
+			return upstreamModel
+		}
+	}
+	return modelName
+}
+
 type costRuleMap struct {
 	exact    map[string]ChannelCostRule
 	wildcard map[int64]ChannelCostRule
@@ -453,9 +541,14 @@ func buildCostRuleMap(rules []ChannelCostRule) costRuleMap {
 	return result
 }
 
-func findCostRule(rules costRuleMap, channelID int64, modelName string) (ChannelCostRule, bool) {
+func findCostRule(rules costRuleMap, channelID int64, modelName, upstreamModel string) (ChannelCostRule, bool) {
 	if rule, ok := rules.exact[ruleKey(channelID, modelName)]; ok {
 		return rule, true
+	}
+	if upstreamModel != "" && upstreamModel != modelName {
+		if rule, ok := rules.exact[ruleKey(channelID, upstreamModel)]; ok {
+			return rule, true
+		}
 	}
 	if rule, ok := rules.wildcard[channelID]; ok {
 		return rule, true

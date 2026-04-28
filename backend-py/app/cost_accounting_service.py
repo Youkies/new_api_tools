@@ -1,6 +1,7 @@
 """
 Channel cost accounting service.
 """
+import json
 import math
 import time
 from dataclasses import dataclass
@@ -191,6 +192,7 @@ class CostAccountingService:
 
         rules = self.list_rules()
         rule_map = self._build_rule_map(rules)
+        channel_model_mappings = self._load_channel_model_mappings(channel_id)
 
         params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
         channel_clause = ""
@@ -239,16 +241,16 @@ class CostAccountingService:
             completion_tokens = int(row.get("completion_tokens") or 0)
             billed_amount = quota_used / QUOTA_PER_USD
 
-            rule = self._find_rule(rule_map, cid, model_name)
+            upstream_model = self._resolve_upstream_model(channel_model_mappings, cid, model_name)
+            rule = self._find_rule(rule_map, cid, model_name, upstream_model)
             configured = rule is not None
             estimated_cost = 0.0
-            upstream_model = model_name
             billing_mode = "token"
             rule_id = 0
             if rule:
-                upstream_model = rule.get("upstream_model") or model_name
-                if upstream_model == "*":
-                    upstream_model = model_name
+                rule_upstream_model = str(rule.get("upstream_model") or "").strip()
+                if rule_upstream_model and rule_upstream_model != "*" and rule_upstream_model != rule.get("model_name"):
+                    upstream_model = rule_upstream_model
                 billing_mode = rule.get("billing_mode") or "token"
                 rule_id = int(rule.get("id") or 0)
                 estimated_cost = self._calculate_cost(rule, requests, prompt_tokens, completion_tokens)
@@ -330,6 +332,71 @@ class CostAccountingService:
             "rules": rules,
         }
 
+    def _load_channel_model_mappings(self, channel_id: Optional[int] = None) -> Dict[int, Dict[str, str]]:
+        mappings: Dict[int, Dict[str, str]] = {}
+        if not self._column_exists("channels", "model_mapping"):
+            return mappings
+
+        sql = "SELECT id, model_mapping FROM channels WHERE deleted_at IS NULL"
+        params: Dict[str, Any] = {}
+        if channel_id and channel_id > 0:
+            sql += " AND id = :channel_id"
+            params["channel_id"] = channel_id
+
+        rows = self.db.execute(sql, params)
+        for row in rows:
+            cid = int(row.get("id") or 0)
+            parsed = self._parse_model_mapping(row.get("model_mapping"))
+            if cid > 0 and parsed:
+                mappings[cid] = parsed
+        return mappings
+
+    def _parse_model_mapping(self, raw: Any) -> Dict[str, str]:
+        if raw is None:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+        raw_text = str(raw).strip()
+        if raw_text in ("", "null", "{}", "[]"):
+            return {}
+
+        try:
+            decoded = json.loads(raw_text)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(decoded, dict):
+            return {}
+
+        result: Dict[str, str] = {}
+        for source, target in decoded.items():
+            source_model = str(source or "").strip()
+            target_model = self._mapping_value_to_str(target)
+            if source_model and target_model:
+                result[source_model] = target_model
+        return result
+
+    def _mapping_value_to_str(self, value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, list):
+            for item in value:
+                resolved = self._mapping_value_to_str(item)
+                if resolved:
+                    return resolved
+            return ""
+        if isinstance(value, dict):
+            for key in ("model", "target", "upstream_model", "upstream", "value"):
+                resolved = self._mapping_value_to_str(value.get(key))
+                if resolved:
+                    return resolved
+            return ""
+        return str(value).strip()
+
+    def _resolve_upstream_model(self, mappings: Dict[int, Dict[str, str]], channel_id: int, model_name: str) -> str:
+        return mappings.get(channel_id, {}).get(model_name, "").strip() or model_name
+
     def _rule_to_dict(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "id": int(row.get("id") or 0),
@@ -374,8 +441,21 @@ class CostAccountingService:
                 exact[(cid, rule.get("model_name"))] = rule
         return {"exact": exact, "wildcard": wildcard}
 
-    def _find_rule(self, rule_map: Dict[str, Any], channel_id: int, model_name: str) -> Optional[Dict[str, Any]]:
-        return rule_map["exact"].get((channel_id, model_name)) or rule_map["wildcard"].get(channel_id)
+    def _find_rule(
+        self,
+        rule_map: Dict[str, Any],
+        channel_id: int,
+        model_name: str,
+        upstream_model: str,
+    ) -> Optional[Dict[str, Any]]:
+        exact = rule_map["exact"].get((channel_id, model_name))
+        if exact:
+            return exact
+        if upstream_model and upstream_model != model_name:
+            exact = rule_map["exact"].get((channel_id, upstream_model))
+            if exact:
+                return exact
+        return rule_map["wildcard"].get(channel_id)
 
     def _calculate_cost(self, rule: Dict[str, Any], requests: int, prompt_tokens: int, completion_tokens: int) -> float:
         multiplier = self._cost_multiplier(rule)
