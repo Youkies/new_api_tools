@@ -9,7 +9,7 @@
 - Go 后端新增 `/api/cost/summary`、`/api/cost/rules`，使用工具自建表 `api_tools_channel_costs` 保存成本规则。
 - 成本规则支持按量（输入/输出 `$ / 1M tokens`）和按次（`$ / request`），支持渠道默认规则 `*`、具体模型规则和 `cost_multiplier` 倍率；实际成本按基础价格乘倍率计算。
 - 成本查询按 `logs.channel_id + logs.model_name` 聚合请求数、额度消耗、输入/输出 tokens，并计算站内计费、上游成本、毛利和未配置模型数量。
-- 修正上游模型来源：成本汇总会读取 `channels.model_mapping`，把 NewAPI 渠道里的模型重定向作为默认上游模型；成本规则仍可显式覆盖，且规则可按站内别名或上游模型匹配。
+- 修正上游模型来源：成本汇总会读取 `channels.model_mapping`，把 NewAPI 渠道里的模型重定向作为默认上游模型；已对照 `d:\Project\newapi` 源码，`channels` 表没有 `deleted_at`，查询改为字段存在时才追加软删除过滤；模型重定向按 NewAPI 支持链式解析；成本规则仍可显式覆盖，且规则可按站内别名或上游模型匹配。
 - Python 后端补齐相同 `/api/cost/*` 兼容接口。
 - 前端新增 `成本核算` 导航页，可按时间段和渠道查询，可从未配置模型行快速生成成本规则并保存。
 - 前端成本规则表新增“倍率”列，基础价格列用于填写官方/正常价格，例如输入 `5`、倍率 `0.35` 会按 `1.75 $/1M` 计入成本。
@@ -18,8 +18,9 @@
 
 - `go test ./...`（`backend/`）通过。
 - `python -m py_compile backend-py\app\cost_accounting_service.py backend-py\app\cost_accounting_routes.py backend-py\app\main.py` 通过。
+- `git diff --check` 通过，仅有 CRLF 提示。
 - `npm run build`（`frontend/`）通过，仅保留既有 chunk 体积 warning。
 
 ## 下一步
 
-等待用户确认成本核算页里的“上游模型”是否已与渠道管理中的模型重定向一致；如需要，可继续增加导出 CSV、规则批量复制或按上游模型汇总视图。
+等待用户确认成本核算页不再出现 `Unknown column 'deleted_at'`，且“上游模型”与渠道管理中的链式模型重定向一致；如需要，可继续增加导出 CSV、规则批量复制或按上游模型汇总视图。

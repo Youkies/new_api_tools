@@ -199,14 +199,19 @@ func (s *CostAccountingService) SaveRules(rules []ChannelCostRule) ([]ChannelCos
 
 // ListChannels returns channel options for the cost UI.
 func (s *CostAccountingService) ListChannels() ([]map[string]interface{}, error) {
-	rows, err := s.db.Query(`
+	query := `
 		SELECT id, name, type, status,
 			COALESCE(used_quota, 0) as used_quota,
 			COALESCE(balance, 0) as balance,
 			priority
 		FROM channels
-		WHERE deleted_at IS NULL
-		ORDER BY priority DESC, id ASC`)
+	`
+	if s.db.ColumnExists("channels", "deleted_at") {
+		query += " WHERE deleted_at IS NULL"
+	}
+	query += " ORDER BY priority DESC, id ASC"
+
+	rows, err := s.db.Query(query)
 	if err != nil {
 		return nil, err
 	}
@@ -440,11 +445,18 @@ func (s *CostAccountingService) loadChannelModelMappings(channelID *int64) (map[
 		return mappings, nil
 	}
 
-	query := `SELECT id, model_mapping FROM channels WHERE deleted_at IS NULL`
+	query := `SELECT id, model_mapping FROM channels`
 	args := []interface{}{}
+	conditions := []string{}
+	if s.db.ColumnExists("channels", "deleted_at") {
+		conditions = append(conditions, "deleted_at IS NULL")
+	}
 	if channelID != nil && *channelID > 0 {
-		query += " AND id = ?"
+		conditions = append(conditions, "id = ?")
 		args = append(args, *channelID)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 
 	rows, err := s.db.QueryWithTimeout(15*time.Second, s.db.RebindQuery(query), args...)
@@ -510,8 +522,18 @@ func mappingValueToString(value interface{}) string {
 
 func resolveUpstreamModel(mappings map[int64]map[string]string, channelID int64, modelName string) string {
 	if channelMapping, ok := mappings[channelID]; ok {
-		if upstreamModel := strings.TrimSpace(channelMapping[modelName]); upstreamModel != "" {
-			return upstreamModel
+		currentModel := modelName
+		visited := map[string]bool{currentModel: true}
+		for {
+			nextModel := strings.TrimSpace(channelMapping[currentModel])
+			if nextModel == "" {
+				return currentModel
+			}
+			if visited[nextModel] {
+				return currentModel
+			}
+			visited[nextModel] = true
+			currentModel = nextModel
 		}
 	}
 	return modelName

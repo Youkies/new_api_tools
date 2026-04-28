@@ -164,15 +164,18 @@ class CostAccountingService:
         return self.list_rules()
 
     def list_channels(self) -> List[Dict[str, Any]]:
-        rows = self.db.execute("""
+        sql = """
             SELECT id, name, type, status,
                 COALESCE(used_quota, 0) as used_quota,
                 COALESCE(balance, 0) as balance,
                 priority
             FROM channels
-            WHERE deleted_at IS NULL
-            ORDER BY priority DESC, id ASC
-        """)
+        """
+        if self._column_exists("channels", "deleted_at"):
+            sql += " WHERE deleted_at IS NULL"
+        sql += " ORDER BY priority DESC, id ASC"
+
+        rows = self.db.execute(sql)
         for row in rows:
             if not row.get("name"):
                 row["name"] = f"Channel#{row.get('id')}"
@@ -337,11 +340,16 @@ class CostAccountingService:
         if not self._column_exists("channels", "model_mapping"):
             return mappings
 
-        sql = "SELECT id, model_mapping FROM channels WHERE deleted_at IS NULL"
+        sql = "SELECT id, model_mapping FROM channels"
         params: Dict[str, Any] = {}
+        conditions = []
+        if self._column_exists("channels", "deleted_at"):
+            conditions.append("deleted_at IS NULL")
         if channel_id and channel_id > 0:
-            sql += " AND id = :channel_id"
+            conditions.append("id = :channel_id")
             params["channel_id"] = channel_id
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
 
         rows = self.db.execute(sql, params)
         for row in rows:
@@ -395,7 +403,17 @@ class CostAccountingService:
         return str(value).strip()
 
     def _resolve_upstream_model(self, mappings: Dict[int, Dict[str, str]], channel_id: int, model_name: str) -> str:
-        return mappings.get(channel_id, {}).get(model_name, "").strip() or model_name
+        channel_mapping = mappings.get(channel_id, {})
+        current_model = model_name
+        visited = {current_model}
+        while True:
+            next_model = channel_mapping.get(current_model, "").strip()
+            if not next_model:
+                return current_model
+            if next_model in visited:
+                return current_model
+            visited.add(next_model)
+            current_model = next_model
 
     def _rule_to_dict(self, row: Dict[str, Any]) -> Dict[str, Any]:
         return {
