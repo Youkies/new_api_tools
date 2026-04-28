@@ -978,8 +978,7 @@ func (s *AutoGroupService) GetUsers(page, pageSize int, group, source, keyword s
 	}
 }
 
-// assignUser assigns a single user to a target group — matches Python's assign_user()
-func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string) map[string]interface{} {
+func (s *AutoGroupService) getAssignableUser(userID int64) (map[string]interface{}, map[string]interface{}) {
 	groupCol := s.getGroupCol()
 	oauthCols := s.buildOAuthSelectCols()
 
@@ -996,7 +995,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 
 	userRow, err := s.db.QueryOne(userSQL, userID)
 	if err != nil || userRow == nil {
-		return map[string]interface{}{
+		return nil, map[string]interface{}{
 			"success": false,
 			"message": "用户不存在",
 		}
@@ -1009,6 +1008,30 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 	username := toString(userRow["username"])
 	source := s.detectSource(userRow)
 
+	return map[string]interface{}{
+		"id":        userID,
+		"username":  username,
+		"old_group": oldGroup,
+		"source":    source,
+	}, nil
+}
+
+// assignUser assigns a single user to a target group — matches Python's assign_user()
+func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string) map[string]interface{} {
+	return s.assignUserWithBatch(userID, targetGroup, operator, "")
+}
+
+func (s *AutoGroupService) assignUserWithBatch(userID int64, targetGroup, operator, batchID string) map[string]interface{} {
+	userInfo, errorResult := s.getAssignableUser(userID)
+	if errorResult != nil {
+		return errorResult
+	}
+
+	groupCol := s.getGroupCol()
+	oldGroup := toString(userInfo["old_group"])
+	username := toString(userInfo["username"])
+	source := toString(userInfo["source"])
+
 	var updateSQL string
 	if s.db.IsPG {
 		updateSQL = fmt.Sprintf("UPDATE users SET %s = $1 WHERE id = $2", groupCol)
@@ -1016,7 +1039,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		updateSQL = fmt.Sprintf("UPDATE users SET %s = ? WHERE id = ?", groupCol)
 	}
 
-	_, err = s.db.Execute(updateSQL, targetGroup, userID)
+	_, err := s.db.Execute(updateSQL, targetGroup, userID)
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -1024,7 +1047,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		}
 	}
 
-	s.addUserLog("assign", userID, username, oldGroup, targetGroup, source, operator)
+	s.addUserLogWithMeta("assign", userID, username, oldGroup, targetGroup, source, operator, batchID, 0)
 
 	logger.L.Business(fmt.Sprintf("自动分组: 用户分配 user_id=%d username=%s %s -> %s source=%s operator=%s",
 		userID, username, oldGroup, targetGroup, source, operator))
@@ -1037,6 +1060,7 @@ func (s *AutoGroupService) assignUser(userID int64, targetGroup, operator string
 		"old_group": oldGroup,
 		"new_group": targetGroup,
 		"source":    source,
+		"batch_id":  batchID,
 	}
 }
 
@@ -1255,8 +1279,8 @@ func (s *AutoGroupService) RunScan(dryRun bool) map[string]interface{} {
 	}
 }
 
-// BatchMoveUsers moves users to a target group
-func (s *AutoGroupService) BatchMoveUsers(userIDs []int64, targetGroup string) map[string]interface{} {
+// BatchMoveUsers moves users to a target group, or previews the move when dryRun is true.
+func (s *AutoGroupService) BatchMoveUsers(userIDs []int64, targetGroup string, dryRun bool) map[string]interface{} {
 	if len(userIDs) == 0 {
 		return map[string]interface{}{
 			"success": false,
@@ -1270,24 +1294,82 @@ func (s *AutoGroupService) BatchMoveUsers(userIDs []int64, targetGroup string) m
 		}
 	}
 
+	batchID := ""
+	if !dryRun {
+		batchID = generateAutoGroupBatchID("manual")
+	}
 	successCount := 0
 	failedCount := 0
+	skippedCount := 0
 	results := make([]map[string]interface{}, 0)
 
 	for _, userID := range userIDs {
-		result := s.assignUser(userID, targetGroup, "admin")
-		if success, _ := result["success"].(bool); success {
-			successCount++
-		} else {
+		userInfo, errorResult := s.getAssignableUser(userID)
+		if errorResult != nil {
 			failedCount++
+			results = append(results, errorResult)
+			continue
 		}
-		results = append(results, result)
+
+		oldGroup := toString(userInfo["old_group"])
+		username := toString(userInfo["username"])
+		source := toString(userInfo["source"])
+		if oldGroup == targetGroup {
+			skippedCount++
+			results = append(results, map[string]interface{}{
+				"success":      true,
+				"user_id":      userID,
+				"username":     username,
+				"old_group":    oldGroup,
+				"new_group":    targetGroup,
+				"source":       source,
+				"target_group": targetGroup,
+				"action":       "skipped",
+				"message":      fmt.Sprintf("用户 %s 已经在 %s", username, targetGroup),
+			})
+			continue
+		}
+
+		if dryRun {
+			successCount++
+			results = append(results, map[string]interface{}{
+				"success":      true,
+				"user_id":      userID,
+				"username":     username,
+				"old_group":    oldGroup,
+				"new_group":    targetGroup,
+				"source":       source,
+				"target_group": targetGroup,
+				"action":       "would_move",
+				"message":      fmt.Sprintf("[试运行] 用户 %s 将从 %s 移动到 %s", username, oldGroup, targetGroup),
+			})
+		} else {
+			result := s.assignUserWithBatch(userID, targetGroup, "admin", batchID)
+			if success, _ := result["success"].(bool); success {
+				successCount++
+				result["action"] = "moved"
+				result["target_group"] = targetGroup
+				result["batch_id"] = batchID
+			} else {
+				failedCount++
+				result["action"] = "error"
+			}
+			results = append(results, result)
+		}
+	}
+
+	message := fmt.Sprintf("成功移动 %d 个用户，跳过 %d 个，失败 %d 个", successCount, skippedCount, failedCount)
+	if dryRun {
+		message = fmt.Sprintf("试运行完成：%d 个用户可移动，%d 个跳过，%d 个失败", successCount, skippedCount, failedCount)
 	}
 
 	return map[string]interface{}{
 		"success":       failedCount == 0,
-		"message":       fmt.Sprintf("成功移动 %d 个用户，失败 %d 个", successCount, failedCount),
+		"message":       message,
+		"dry_run":       dryRun,
+		"batch_id":      batchID,
 		"success_count": successCount,
+		"skipped_count": skippedCount,
 		"failed_count":  failedCount,
 		"results":       results,
 	}
@@ -1354,12 +1436,40 @@ func (s *AutoGroupService) GetLogs(page, pageSize int, action string, userID *in
 
 // RevertUser reverts a user's group assignment
 func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
-	cm := cache.Get()
-	rdb := cm.RedisClient()
-	ctx := context.Background()
+	var targetLog map[string]interface{}
+	entries, err := s.getAutoGroupLogEntries()
+	if err != nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": fmt.Sprintf("读取日志失败: %v", err),
+		}
+	}
+	for _, entry := range entries {
+		if toInt64(entry["id"]) == int64(logID) {
+			targetLog = entry
+			break
+		}
+	}
+	if targetLog == nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": "日志记录不存在",
+		}
+	}
+	return s.revertLogEntry(targetLog, "admin")
+}
 
-	// Read all logs from Redis list
-	logStrings, err := rdb.LRange(ctx, "auto_group:logs", 0, -1).Result()
+// RevertBatch reverts all non-reverted assignment logs in the same batch.
+func (s *AutoGroupService) RevertBatch(batchID string) map[string]interface{} {
+	batchID = strings.TrimSpace(batchID)
+	if batchID == "" {
+		return map[string]interface{}{
+			"success": false,
+			"message": "缺少批次 ID",
+		}
+	}
+
+	entries, err := s.getAutoGroupLogEntries()
 	if err != nil {
 		return map[string]interface{}{
 			"success": false,
@@ -1367,30 +1477,66 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	// Find the log entry by ID
-	var targetLog map[string]interface{}
-	for _, logStr := range logStrings {
-		var entry map[string]interface{}
-		if json.Unmarshal([]byte(logStr), &entry) == nil {
-			if toInt64(entry["id"]) == int64(logID) {
-				targetLog = entry
-				break
-			}
+	results := make([]map[string]interface{}, 0)
+	successCount := 0
+	failedCount := 0
+	skippedCount := 0
+	for _, entry := range entries {
+		if toString(entry["batch_id"]) != batchID || toString(entry["action"]) != "assign" {
+			continue
+		}
+		if toInt64(entry["reverted_at"]) > 0 {
+			skippedCount++
+			continue
+		}
+		result := s.revertLogEntry(entry, "admin")
+		if success, _ := result["success"].(bool); success {
+			successCount++
+		} else {
+			failedCount++
+		}
+		results = append(results, result)
+	}
+
+	if successCount == 0 && failedCount == 0 && skippedCount == 0 {
+		return map[string]interface{}{
+			"success":  false,
+			"message":  "没有找到可撤销的批次记录",
+			"batch_id": batchID,
 		}
 	}
 
-	if targetLog == nil {
+	return map[string]interface{}{
+		"success":       failedCount == 0,
+		"message":       fmt.Sprintf("批次撤销完成：成功 %d 个，跳过 %d 个，失败 %d 个", successCount, skippedCount, failedCount),
+		"batch_id":      batchID,
+		"success_count": successCount,
+		"skipped_count": skippedCount,
+		"failed_count":  failedCount,
+		"results":       results,
+	}
+}
+
+func (s *AutoGroupService) revertLogEntry(targetLog map[string]interface{}, operator string) map[string]interface{} {
+	logID := toInt64(targetLog["id"])
+	if toString(targetLog["action"]) != "assign" {
 		return map[string]interface{}{
 			"success": false,
-			"message": "日志记录不存在",
+			"message": "只有分配记录可以撤销",
 		}
 	}
-
+	if toInt64(targetLog["reverted_at"]) > 0 {
+		return map[string]interface{}{
+			"success": false,
+			"message": "该记录已撤销",
+		}
+	}
 	userIDVal := toInt64(targetLog["user_id"])
 	oldGroup := toString(targetLog["old_group"])
 	newGroup := toString(targetLog["new_group"])
 	username := toString(targetLog["username"])
 	source := toString(targetLog["source"])
+	batchID := toString(targetLog["batch_id"])
 
 	if userIDVal == 0 {
 		return map[string]interface{}{
@@ -1445,7 +1591,8 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		}
 	}
 
-	s.addUserLog("revert", userIDVal, username, newGroup, oldGroup, source, "admin")
+	revertLogID := s.addUserLogWithMeta("revert", userIDVal, username, newGroup, oldGroup, source, operator, batchID, logID)
+	s.markAutoGroupLogReverted(logID, revertLogID)
 
 	logger.L.Business(fmt.Sprintf("自动分组: 用户恢复 user_id=%d username=%s %s -> %s", userIDVal, username, newGroup, oldGroup))
 
@@ -1456,20 +1603,87 @@ func (s *AutoGroupService) RevertUser(logID int) map[string]interface{} {
 		"username":  username,
 		"old_group": newGroup,
 		"new_group": oldGroup,
+		"batch_id":  batchID,
 	}
 }
 
-// 优化4: addUserLog 使用 Redis LPUSH + LTRIM 原子操作
-func (s *AutoGroupService) addUserLog(action string, userID int64, username, oldGroup, newGroup, source, operator string) {
+func generateAutoGroupBatchID(prefix string) string {
+	return fmt.Sprintf("%s:%d", prefix, time.Now().UnixNano())
+}
+
+func (s *AutoGroupService) getAutoGroupLogEntries() ([]map[string]interface{}, error) {
 	cm := cache.Get()
 	rdb := cm.RedisClient()
 	ctx := context.Background()
 
-	// Get current log count for ID generation
-	logLen, _ := rdb.LLen(ctx, "auto_group:logs").Result()
+	logStrings, err := rdb.LRange(ctx, "auto_group:logs", 0, -1).Result()
+	if err != nil {
+		return nil, err
+	}
 
+	entries := make([]map[string]interface{}, 0, len(logStrings))
+	for _, logStr := range logStrings {
+		var entry map[string]interface{}
+		if json.Unmarshal([]byte(logStr), &entry) == nil {
+			entries = append(entries, entry)
+		}
+	}
+	return entries, nil
+}
+
+func (s *AutoGroupService) markAutoGroupLogReverted(logID, revertLogID int64) {
+	if logID == 0 {
+		return
+	}
+	cm := cache.Get()
+	rdb := cm.RedisClient()
+	ctx := context.Background()
+
+	logStrings, err := rdb.LRange(ctx, "auto_group:logs", 0, -1).Result()
+	if err != nil {
+		logger.L.Error(fmt.Sprintf("读取自动分组日志失败: %v", err))
+		return
+	}
+
+	now := time.Now().Unix()
+	updated := make([]interface{}, 0, len(logStrings))
+	for _, logStr := range logStrings {
+		var entry map[string]interface{}
+		if json.Unmarshal([]byte(logStr), &entry) == nil && toInt64(entry["id"]) == logID {
+			entry["reverted_at"] = now
+			entry["revert_log_id"] = revertLogID
+			if data, err := json.Marshal(entry); err == nil {
+				updated = append(updated, string(data))
+				continue
+			}
+		}
+		updated = append(updated, logStr)
+	}
+
+	pipe := rdb.Pipeline()
+	pipe.Del(ctx, "auto_group:logs")
+	if len(updated) > 0 {
+		pipe.RPush(ctx, "auto_group:logs", updated...)
+		pipe.LTrim(ctx, "auto_group:logs", 0, 999)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		logger.L.Error(fmt.Sprintf("标记自动分组日志撤销状态失败: %v", err))
+	}
+}
+
+// 优化4: addUserLog 使用 Redis LPUSH + LTRIM 原子操作
+func (s *AutoGroupService) addUserLog(action string, userID int64, username, oldGroup, newGroup, source, operator string) int64 {
+	return s.addUserLogWithMeta(action, userID, username, oldGroup, newGroup, source, operator, "", 0)
+}
+
+func (s *AutoGroupService) addUserLogWithMeta(action string, userID int64, username, oldGroup, newGroup, source, operator, batchID string, revertOf int64) int64 {
+	cm := cache.Get()
+	rdb := cm.RedisClient()
+	ctx := context.Background()
+
+	logID := time.Now().UnixNano()
 	entry := map[string]interface{}{
-		"id":         logLen + 1,
+		"id":         logID,
 		"action":     action,
 		"user_id":    userID,
 		"username":   username,
@@ -1480,16 +1694,26 @@ func (s *AutoGroupService) addUserLog(action string, userID int64, username, old
 		"affected":   1,
 		"created_at": time.Now().Unix(),
 	}
+	if batchID != "" {
+		entry["batch_id"] = batchID
+	}
+	if action == "assign" {
+		entry["reverted_at"] = 0
+	}
+	if revertOf > 0 {
+		entry["revert_of"] = revertOf
+	}
 
 	data, err := json.Marshal(entry)
 	if err != nil {
 		logger.L.Error(fmt.Sprintf("序列化自动分组日志失败: %v", err))
-		return
+		return 0
 	}
 
 	// Atomic LPUSH + LTRIM
 	rdb.LPush(ctx, "auto_group:logs", string(data))
 	rdb.LTrim(ctx, "auto_group:logs", 0, 999) // Keep latest 1000
+	return logID
 }
 
 // 优化1: addBatchLogs 批量写入日志
@@ -1498,12 +1722,12 @@ func (s *AutoGroupService) addBatchLogs(action string, users []map[string]interf
 	rdb := cm.RedisClient()
 	ctx := context.Background()
 
-	logLen, _ := rdb.LLen(ctx, "auto_group:logs").Result()
-
 	pipe := rdb.Pipeline()
+	baseID := time.Now().UnixNano()
+	now := time.Now().Unix()
 	for i, user := range users {
 		entry := map[string]interface{}{
-			"id":         logLen + int64(i) + 1,
+			"id":         baseID + int64(i),
 			"action":     action,
 			"user_id":    user["id"],
 			"username":   user["username"],
@@ -1512,7 +1736,10 @@ func (s *AutoGroupService) addBatchLogs(action string, users []map[string]interf
 			"source":     user["source"],
 			"operator":   operator,
 			"affected":   1,
-			"created_at": time.Now().Unix(),
+			"created_at": now,
+		}
+		if action == "assign" {
+			entry["reverted_at"] = 0
 		}
 		data, err := json.Marshal(entry)
 		if err != nil {

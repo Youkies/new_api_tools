@@ -173,9 +173,23 @@ class LocalStorage:
                     action TEXT NOT NULL,
                     source TEXT DEFAULT '',
                     operator TEXT DEFAULT 'system',
+                    batch_id TEXT DEFAULT '',
+                    reverted_at INTEGER DEFAULT 0,
+                    revert_log_id INTEGER DEFAULT 0,
+                    revert_of INTEGER DEFAULT 0,
                     created_at INTEGER NOT NULL
                 )
             """)
+            cursor.execute("PRAGMA table_info(auto_group_logs)")
+            existing_columns = {row["name"] for row in cursor.fetchall()}
+            for column_name, ddl in [
+                ("batch_id", "batch_id TEXT DEFAULT ''"),
+                ("reverted_at", "reverted_at INTEGER DEFAULT 0"),
+                ("revert_log_id", "revert_log_id INTEGER DEFAULT 0"),
+                ("revert_of", "revert_of INTEGER DEFAULT 0"),
+            ]:
+                if column_name not in existing_columns:
+                    cursor.execute(f"ALTER TABLE auto_group_logs ADD COLUMN {ddl}")
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_auto_group_logs_time
                 ON auto_group_logs(created_at)
@@ -183,6 +197,10 @@ class LocalStorage:
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_auto_group_logs_user
                 ON auto_group_logs(user_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_group_logs_batch
+                ON auto_group_logs(batch_id)
             """)
 
             conn.commit()
@@ -678,6 +696,8 @@ class LocalStorage:
         action: str,
         source: str = "",
         operator: str = "system",
+        batch_id: str = "",
+        revert_of: int = 0,
     ) -> int:
         """添加自动分组日志记录"""
         with self._get_connection() as conn:
@@ -685,8 +705,8 @@ class LocalStorage:
             cursor.execute(
                 """
                 INSERT INTO auto_group_logs
-                (user_id, username, old_group, new_group, action, source, operator, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (user_id, username, old_group, new_group, action, source, operator, batch_id, reverted_at, revert_log_id, revert_of, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     int(user_id),
@@ -696,6 +716,10 @@ class LocalStorage:
                     action,
                     source or "",
                     operator or "system",
+                    batch_id or "",
+                    0,
+                    0,
+                    int(revert_of or 0),
                     int(time.time()),
                 )
             )
@@ -731,7 +755,8 @@ class LocalStorage:
 
             cursor.execute(
                 f"""
-                SELECT id, user_id, username, old_group, new_group, action, source, operator, created_at
+                SELECT id, user_id, username, old_group, new_group, action, source, operator,
+                       batch_id, reverted_at, revert_log_id, revert_of, created_at
                 FROM auto_group_logs
                 {where_sql}
                 ORDER BY created_at DESC
@@ -752,6 +777,10 @@ class LocalStorage:
                 "action": r["action"],
                 "source": r["source"] or "",
                 "operator": r["operator"] or "system",
+                "batch_id": r["batch_id"] or "",
+                "reverted_at": int(r["reverted_at"] or 0),
+                "revert_log_id": int(r["revert_log_id"] or 0),
+                "revert_of": int(r["revert_of"] or 0),
                 "created_at": int(r["created_at"]),
             })
 
@@ -769,7 +798,8 @@ class LocalStorage:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT id, user_id, username, old_group, new_group, action, source, operator, created_at
+                SELECT id, user_id, username, old_group, new_group, action, source, operator,
+                       batch_id, reverted_at, revert_log_id, revert_of, created_at
                 FROM auto_group_logs
                 WHERE id = ?
                 """,
@@ -789,8 +819,60 @@ class LocalStorage:
                 "action": row["action"],
                 "source": row["source"] or "",
                 "operator": row["operator"] or "system",
+                "batch_id": row["batch_id"] or "",
+                "reverted_at": int(row["reverted_at"] or 0),
+                "revert_log_id": int(row["revert_log_id"] or 0),
+                "revert_of": int(row["revert_of"] or 0),
                 "created_at": int(row["created_at"]),
             }
+
+    def get_auto_group_logs_by_batch_id(self, batch_id: str) -> List[Dict[str, Any]]:
+        """获取同一批次的自动分组日志。"""
+        if not batch_id:
+            return []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, user_id, username, old_group, new_group, action, source, operator,
+                       batch_id, reverted_at, revert_log_id, revert_of, created_at
+                FROM auto_group_logs
+                WHERE batch_id = ?
+                ORDER BY id ASC
+                """,
+                [batch_id],
+            )
+            rows = cursor.fetchall()
+
+        return [{
+            "id": int(row["id"]),
+            "user_id": int(row["user_id"]),
+            "username": row["username"] or "",
+            "old_group": row["old_group"] or "default",
+            "new_group": row["new_group"] or "",
+            "action": row["action"],
+            "source": row["source"] or "",
+            "operator": row["operator"] or "system",
+            "batch_id": row["batch_id"] or "",
+            "reverted_at": int(row["reverted_at"] or 0),
+            "revert_log_id": int(row["revert_log_id"] or 0),
+            "revert_of": int(row["revert_of"] or 0),
+            "created_at": int(row["created_at"]),
+        } for row in rows]
+
+    def mark_auto_group_log_reverted(self, log_id: int, revert_log_id: int = 0) -> None:
+        """标记一条自动分组分配日志已撤销。"""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                UPDATE auto_group_logs
+                SET reverted_at = ?, revert_log_id = ?
+                WHERE id = ?
+                """,
+                (int(time.time()), int(revert_log_id or 0), int(log_id)),
+            )
+            conn.commit()
 
     def cleanup_old_auto_group_logs(self, max_age_days: int = 90) -> int:
         """清理旧的自动分组日志"""

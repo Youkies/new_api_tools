@@ -15,6 +15,7 @@ import {
   RefreshCw,
   Eye,
   ShieldCheck,
+  RotateCcw,
   Github,
   MessageCircle,
   Send,
@@ -89,6 +90,25 @@ interface UserInfo {
   activity_level: string
   linux_do_id: string | null
   source?: string
+}
+
+interface BatchMoveUserResult {
+  user_id: number
+  username: string
+  old_group: string
+  new_group: string
+  action: string
+  message?: string
+}
+
+interface BatchMoveResult {
+  dry_run: boolean
+  batch_id?: string
+  message?: string
+  success_count: number
+  skipped_count: number
+  failed_count: number
+  results: BatchMoveUserResult[]
 }
 
 type UserSortField = 'quota' | 'used_quota' | 'request_count'
@@ -168,6 +188,10 @@ export function UserManagement() {
   const [selectedUserIds, setSelectedUserIds] = useState<Set<number>>(new Set())
   const [batchTargetGroup, setBatchTargetGroup] = useState('')
   const [batchMoving, setBatchMoving] = useState(false)
+  const [batchTesting, setBatchTesting] = useState(false)
+  const [batchMovePreview, setBatchMovePreview] = useState<BatchMoveResult | null>(null)
+  const [lastManualBatchId, setLastManualBatchId] = useState('')
+  const [batchReverting, setBatchReverting] = useState(false)
 
   // Linux.do 用户名查询状态
   const [linuxDoLookupLoading, setLinuxDoLookupLoading] = useState<string | null>(null)
@@ -175,6 +199,7 @@ export function UserManagement() {
   const allSelectedOnPage = users.length > 0 && users.every((u) => selectedUserIds.has(u.id))
 
   const toggleSelectAllOnPage = () => {
+    setBatchMovePreview(null)
     setSelectedUserIds((prev) => {
       const next = new Set(prev)
       const allSelected = users.length > 0 && users.every((u) => next.has(u.id))
@@ -188,6 +213,7 @@ export function UserManagement() {
   }
 
   const toggleSelectUser = (userId: number) => {
+    setBatchMovePreview(null)
     setSelectedUserIds((prev) => {
       const next = new Set(prev)
       if (next.has(userId)) next.delete(userId)
@@ -248,7 +274,7 @@ export function UserManagement() {
   }, [apiUrl, getAuthHeaders])
 
   // 批量移动用户到指定分组
-  const batchMoveUsers = async () => {
+  const batchMoveUsers = async (dryRun = false) => {
     if (selectedUserIds.size === 0) {
       showToast('error', '请选择用户')
       return
@@ -257,7 +283,8 @@ export function UserManagement() {
       showToast('error', '请选择目标分组')
       return
     }
-    setBatchMoving(true)
+    if (dryRun) setBatchTesting(true)
+    else setBatchMoving(true)
     try {
       const response = await fetch(`${apiUrl}/api/auto-group/batch-move`, {
         method: 'POST',
@@ -265,22 +292,56 @@ export function UserManagement() {
         body: JSON.stringify({
           user_ids: Array.from(selectedUserIds),
           target_group: batchTargetGroup,
+          dry_run: dryRun,
         }),
       })
       const data = await response.json()
       if (data.success || data.data?.success_count > 0) {
+        if (dryRun) {
+          setBatchMovePreview(data.data)
+          showToast('success', data.data?.message || '测试迁移完成')
+          return
+        }
+        setLastManualBatchId(data.data?.batch_id || '')
+        setBatchMovePreview(null)
         showToast('success', data.data?.message || `成功移动 ${data.data?.success_count || 0} 个用户`)
         setSelectedUserIds(new Set())
         setBatchTargetGroup('')
         fetchUsers()
       } else {
-        showToast('error', data.message || '移动失败')
+        showToast('error', data.data?.message || data.message || '移动失败')
       }
     } catch (error) {
       console.error('Failed to batch move users:', error)
       showToast('error', '网络错误')
     } finally {
-      setBatchMoving(false)
+      if (dryRun) setBatchTesting(false)
+      else setBatchMoving(false)
+    }
+  }
+
+  const revertManualBatch = async (batchId: string) => {
+    if (!batchId) return
+    setBatchReverting(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/auto-group/revert-batch`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ batch_id: batchId }),
+      })
+      const data = await response.json()
+      if (data.success) {
+        showToast('success', data.data?.message || data.message || '批次已撤销')
+        setLastManualBatchId('')
+        fetchUsers()
+      } else {
+        showToast('error', data.data?.message || data.message || '撤销失败')
+      }
+    } catch (error) {
+      console.error('Failed to revert batch move:', error)
+      showToast('error', '网络错误')
+    } finally {
+      setBatchReverting(false)
     }
   }
 
@@ -946,56 +1007,117 @@ export function UserManagement() {
 
           {/* Batch Move */}
           {users.length > 0 && (
-            <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-4 p-3 rounded-lg border bg-muted/20">
-              <div className="flex flex-wrap items-center gap-2 text-sm">
-                <span className="text-muted-foreground">
-                  已选择 <span className="font-medium text-foreground">{selectedUserIds.size}</span> 个
-                </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-8"
-                  onClick={toggleSelectAllOnPage}
-                >
-                  {allSelectedOnPage ? '取消全选本页' : '全选本页'}
-                </Button>
-                {selectedUserIds.size > 0 && (
+            <>
+              <div className="flex flex-col sm:flex-row sm:items-center gap-3 mb-4 p-3 rounded-lg border bg-muted/20">
+                <div className="flex flex-wrap items-center gap-2 text-sm">
+                  <span className="text-muted-foreground">
+                    已选择 <span className="font-medium text-foreground">{selectedUserIds.size}</span> 个
+                  </span>
                   <Button
-                    variant="ghost"
+                    variant="outline"
                     size="sm"
                     className="h-8"
-                    onClick={() => setSelectedUserIds(new Set())}
+                    onClick={toggleSelectAllOnPage}
                   >
-                    清空
+                    {allSelectedOnPage ? '取消全选本页' : '全选本页'}
                   </Button>
-                )}
-              </div>
-
-              <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto sm:ml-auto">
-                <div className="w-full sm:w-48">
-                  <Select
-                    value={batchTargetGroup}
-                    onChange={(e) => setBatchTargetGroup(e.target.value)}
-                    disabled={batchMoving || selectedUserIds.size === 0}
-                  >
-                    <option value="">选择目标分组</option>
-                    {groups.map((g) => (
-                      <option key={g.group_name} value={g.group_name}>
-                        {g.group_name}
-                      </option>
-                    ))}
-                  </Select>
+                  {selectedUserIds.size > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8"
+                      onClick={() => {
+                        setSelectedUserIds(new Set())
+                        setBatchMovePreview(null)
+                      }}
+                    >
+                      清空
+                    </Button>
+                  )}
+                  {lastManualBatchId && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="h-8"
+                      onClick={() => revertManualBatch(lastManualBatchId)}
+                      disabled={batchReverting}
+                    >
+                      {batchReverting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RotateCcw className="h-4 w-4 mr-2" />}
+                      撤销上次迁移
+                    </Button>
+                  )}
                 </div>
-                <Button
-                  size="sm"
-                  onClick={batchMoveUsers}
-                  disabled={batchMoving || selectedUserIds.size === 0 || !batchTargetGroup}
-                >
-                  {batchMoving ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : null}
-                  批量移动
-                </Button>
+
+                <div className="flex flex-col sm:flex-row gap-2 w-full sm:w-auto sm:ml-auto">
+                  <div className="w-full sm:w-48">
+                    <Select
+                      value={batchTargetGroup}
+                      onChange={(e) => {
+                        setBatchTargetGroup(e.target.value)
+                        setBatchMovePreview(null)
+                      }}
+                      disabled={batchMoving || batchTesting || selectedUserIds.size === 0}
+                    >
+                      <option value="">选择目标分组</option>
+                      {groups.map((g) => (
+                        <option key={g.group_name} value={g.group_name}>
+                          {g.group_name}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => batchMoveUsers(true)}
+                    disabled={batchMoving || batchTesting || selectedUserIds.size === 0 || !batchTargetGroup}
+                  >
+                    {batchTesting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Eye className="h-4 w-4 mr-2" />}
+                    测试迁移
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => batchMoveUsers(false)}
+                    disabled={batchMoving || batchTesting || selectedUserIds.size === 0 || !batchTargetGroup}
+                  >
+                    {batchMoving ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ArrowDownUp className="h-4 w-4 mr-2" />}
+                    批量移动
+                  </Button>
+                </div>
               </div>
-            </div>
+              {batchMovePreview && (
+                <div className="mb-4 rounded-lg border bg-blue-50 p-3 text-sm dark:bg-blue-950/20">
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <div className="font-medium text-blue-900 dark:text-blue-100">{batchMovePreview.message || '测试迁移完成'}</div>
+                      <div className="mt-1 text-blue-700 dark:text-blue-300">
+                        可移动 {batchMovePreview.success_count} 个，跳过 {batchMovePreview.skipped_count} 个，失败 {batchMovePreview.failed_count} 个
+                      </div>
+                    </div>
+                    <div className="flex gap-2">
+                      <Button variant="outline" size="sm" onClick={() => setBatchMovePreview(null)}>清除测试</Button>
+                      <Button size="sm" onClick={() => batchMoveUsers(false)} disabled={batchMoving || batchTesting || batchMovePreview.success_count === 0}>
+                        {batchMoving ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <ArrowDownUp className="h-4 w-4 mr-2" />}
+                        确认迁移
+                      </Button>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid gap-1 sm:grid-cols-2 lg:grid-cols-3">
+                    {batchMovePreview.results.slice(0, 12).map((item) => (
+                      <div key={`${item.user_id}-${item.action}`} className="rounded border bg-background px-2 py-1">
+                        <span className="font-medium">{item.username || `#${item.user_id}`}</span>
+                        <span className="text-muted-foreground">：{item.old_group || 'default'} → {item.new_group}</span>
+                      </div>
+                    ))}
+                    {batchMovePreview.results.length > 12 && (
+                      <div className="rounded border bg-background px-2 py-1 text-muted-foreground">
+                        +{batchMovePreview.results.length - 12} 更多
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+            </>
           )}
 
           {/* Users Table */}

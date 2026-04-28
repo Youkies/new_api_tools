@@ -65,6 +65,10 @@ interface LogEntry {
   action: string
   source: string
   operator: string
+  batch_id?: string
+  reverted_at?: number
+  revert_log_id?: number
+  revert_of?: number
   created_at: number
 }
 
@@ -119,6 +123,12 @@ function formatQuota(quota?: number) {
   return `$${((quota || 0) / 500000).toFixed(2)}`
 }
 
+function formatBatchId(batchId?: string) {
+  if (!batchId) return '-'
+  const [prefix, value] = batchId.split(':')
+  return value ? `${prefix}:${value.slice(-6)}` : batchId
+}
+
 const DEFAULT_USAGE_RULES: UsageRule[] = [
   { group: 'Pro', threshold_amount: 10 },
   { group: 'Super', threshold_amount: 50 },
@@ -160,6 +170,7 @@ export function AutoGroup() {
   // Scan state
   const [scanning, setScanning] = useState(false)
   const [reverting, setReverting] = useState<number | null>(null)
+  const [revertingBatch, setRevertingBatch] = useState<string | null>(null)
 
   // Local input state (for delayed save on Enter/blur)
   const [localScanInterval, setLocalScanInterval] = useState<string>('')
@@ -367,6 +378,31 @@ export function AutoGroup() {
       showToast('error', '网络错误')
     } finally {
       setReverting(null)
+    }
+  }
+
+  const revertBatch = async (batchId: string) => {
+    if (!batchId) return
+    setRevertingBatch(batchId)
+    try {
+      const response = await fetch(`${apiUrl}/api/auto-group/revert-batch`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ batch_id: batchId }),
+      })
+      const data = await response.json()
+      if (data.success) {
+        showToast('success', data.data?.message || data.message || '批次已撤销')
+        fetchLogs()
+        fetchStats()
+        fetchPreviewUsers()
+      } else {
+        showToast('error', data.data?.message || data.message || '批次撤销失败')
+      }
+    } catch (error) {
+      showToast('error', '网络错误')
+    } finally {
+      setRevertingBatch(null)
     }
   }
 
@@ -879,6 +915,7 @@ export function AutoGroup() {
                   <TableHead>新分组</TableHead>
                   <TableHead>来源</TableHead>
                   <TableHead>操作</TableHead>
+                  <TableHead>批次</TableHead>
                   <TableHead>操作者</TableHead>
                   <TableHead></TableHead>
                 </TableRow>
@@ -886,13 +923,13 @@ export function AutoGroup() {
               <TableBody>
                 {logsLoading ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="text-center py-8">
+                    <TableCell colSpan={9} className="text-center py-8">
                       <Loader2 className="h-6 w-6 animate-spin mx-auto" />
                     </TableCell>
                   </TableRow>
                 ) : logs.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={8} className="text-center py-8 text-muted-foreground">
+                    <TableCell colSpan={9} className="text-center py-8 text-muted-foreground">
                       暂无日志记录
                     </TableCell>
                   </TableRow>
@@ -913,22 +950,43 @@ export function AutoGroup() {
                       <TableCell>{renderSourceBadge(log.source)}</TableCell>
                       <TableCell>
                         <Badge variant={log.action === 'assign' ? 'default' : 'secondary'}>
-                          {log.action === 'assign' ? '分配' : '恢复'}
+                          {log.action === 'assign' ? (log.reverted_at ? '已撤销' : '分配') : '恢复'}
                         </Badge>
                       </TableCell>
-                      <TableCell>{log.operator}</TableCell>
                       <TableCell>
+                        {log.batch_id ? (
+                          <Badge variant="outline" className="max-w-[140px] truncate" title={log.batch_id}>
+                            {formatBatchId(log.batch_id)}
+                          </Badge>
+                        ) : '-'}
+                      </TableCell>
+                      <TableCell>{log.operator}</TableCell>
+                      <TableCell className="space-x-1 whitespace-nowrap">
                         {log.action === 'assign' && (
                           <Button
                             variant="ghost"
                             size="sm"
                             onClick={() => revertUser(log.id)}
-                            disabled={reverting === log.id}
+                            disabled={Boolean(log.reverted_at) || reverting === log.id}
                           >
                             {reverting === log.id ? (
                               <Loader2 className="h-4 w-4 animate-spin" />
                             ) : (
                               <RotateCcw className="h-4 w-4" />
+                            )}
+                          </Button>
+                        )}
+                        {log.action === 'assign' && log.batch_id && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => revertBatch(log.batch_id || '')}
+                            disabled={Boolean(log.reverted_at) || revertingBatch === log.batch_id}
+                          >
+                            {revertingBatch === log.batch_id ? (
+                              <Loader2 className="h-4 w-4 animate-spin" />
+                            ) : (
+                              <span className="text-xs">批次</span>
                             )}
                           </Button>
                         )}

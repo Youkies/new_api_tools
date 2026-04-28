@@ -23,6 +23,7 @@ func RegisterAutoGroupRoutes(r *gin.RouterGroup) {
 		g.POST("/batch-move", BatchMoveAutoGroupUsers)
 		g.GET("/logs", GetAutoGroupLogs)
 		g.POST("/revert", RevertAutoGroupUser)
+		g.POST("/revert-batch", RevertAutoGroupBatch)
 	}
 }
 
@@ -155,6 +156,7 @@ func BatchMoveAutoGroupUsers(c *gin.Context) {
 	var req struct {
 		UserIDs     []int64 `json:"user_ids"`
 		TargetGroup string  `json:"target_group"`
+		DryRun      bool    `json:"dry_run"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
@@ -170,7 +172,7 @@ func BatchMoveAutoGroupUsers(c *gin.Context) {
 	}
 
 	svc := service.NewAutoGroupService()
-	data := svc.BatchMoveUsers(req.UserIDs, req.TargetGroup)
+	data := svc.BatchMoveUsers(req.UserIDs, req.TargetGroup, req.DryRun)
 	success, _ := data["success"].(bool)
 	c.JSON(http.StatusOK, gin.H{"success": success, "data": data})
 }
@@ -203,6 +205,21 @@ func RevertAutoGroupUser(c *gin.Context) {
 	}
 	svc := service.NewAutoGroupService()
 	data := svc.RevertUser(req.LogID)
+	success, _ := data["success"].(bool)
+	c.JSON(http.StatusOK, gin.H{"success": success, "data": data})
+}
+
+// POST /api/auto-group/revert-batch
+func RevertAutoGroupBatch(c *gin.Context) {
+	var req struct {
+		BatchID string `json:"batch_id"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		return
+	}
+	svc := service.NewAutoGroupService()
+	data := svc.RevertBatch(req.BatchID)
 	success, _ := data["success"].(bool)
 	c.JSON(http.StatusOK, gin.H{"success": success, "data": data})
 }

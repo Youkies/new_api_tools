@@ -28,11 +28,17 @@ class BatchMoveRequest(BaseModel):
     """批量移动请求"""
     user_ids: List[int]
     target_group: str
+    dry_run: bool = False
 
 
 class RevertRequest(BaseModel):
     """恢复请求"""
     log_id: int
+
+
+class RevertBatchRequest(BaseModel):
+    """批量恢复请求"""
+    batch_id: str
 
 
 @router.get("/config")
@@ -194,6 +200,7 @@ async def batch_move_users(
     result = service.batch_move_users(
         user_ids=request.user_ids,
         target_group=request.target_group,
+        dry_run=request.dry_run,
         operator="admin",
     )
     return {
@@ -232,6 +239,21 @@ async def revert_user(
     """恢复用户到原分组"""
     service = get_auto_group_service()
     result = service.revert_user(log_id=request.log_id, operator="admin")
+    return {
+        "success": result.get("success", False),
+        "message": result.get("message", ""),
+        "data": result,
+    }
+
+
+@router.post("/revert-batch")
+async def revert_batch(
+    request: RevertBatchRequest,
+    _: str = Depends(verify_auth),
+):
+    """恢复整个手动迁移批次"""
+    service = get_auto_group_service()
+    result = service.revert_batch(batch_id=request.batch_id, operator="admin")
     return {
         "success": result.get("success", False),
         "message": result.get("message", ""),

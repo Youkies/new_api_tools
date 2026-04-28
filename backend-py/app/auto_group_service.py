@@ -20,7 +20,7 @@ import json
 import time
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 from enum import Enum
 
 from .logger import logger
@@ -748,6 +748,7 @@ class AutoGroupService:
         user_id: int,
         target_group: str,
         operator: str = "system",
+        batch_id: str = "",
     ) -> Dict[str, Any]:
         """
         分配单个用户到目标分组
@@ -801,6 +802,7 @@ class AutoGroupService:
                 action="assign",
                 source=source.value,
                 operator=operator,
+                batch_id=batch_id,
             )
 
             logger.business(
@@ -821,15 +823,44 @@ class AutoGroupService:
                 "old_group": old_group,
                 "new_group": target_group,
                 "source": source.value,
+                "batch_id": batch_id,
             }
         except Exception as e:
             logger.error(f"分配用户失败: {e}")
             return {"success": False, "message": str(e)}
 
+    def _get_assignable_user(self, user_id: int) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        try:
+            db = get_db_manager()
+            db.connect()
+            is_pg = db.config.engine == DatabaseEngine.POSTGRESQL
+            group_col = '"group"' if is_pg else '`group`'
+            user_sql = f"""
+                SELECT id, username, {group_col} as user_group,
+                       github_id, wechat_id, telegram_id, discord_id, oidc_id, linux_do_id
+                FROM users
+                WHERE id = :user_id AND deleted_at IS NULL
+            """
+            rows = db.execute(user_sql, {"user_id": user_id})
+            if not rows:
+                return None, {"success": False, "message": "用户不存在", "user_id": user_id}
+            user = dict(rows[0])
+            old_group = user.get("user_group") or "default"
+            source = self.detect_registration_source(user)
+            return {
+                "id": int(user_id),
+                "username": user.get("username") or "",
+                "old_group": old_group,
+                "source": source.value,
+            }, None
+        except Exception as e:
+            return None, {"success": False, "message": str(e), "user_id": user_id}
+
     def batch_move_users(
         self,
         user_ids: List[int],
         target_group: str,
+        dry_run: bool = False,
         operator: str = "admin",
     ) -> Dict[str, Any]:
         """
@@ -849,22 +880,73 @@ class AutoGroupService:
         if not target_group:
             return {"success": False, "message": "未指定目标分组"}
 
+        batch_id = "" if dry_run else f"manual:{time.time_ns()}"
         success_count = 0
         failed_count = 0
+        skipped_count = 0
         results = []
 
         for user_id in user_ids:
-            result = self.assign_user(user_id, target_group, operator)
-            if result.get("success"):
-                success_count += 1
-            else:
+            user, error_result = self._get_assignable_user(user_id)
+            if error_result:
                 failed_count += 1
-            results.append(result)
+                results.append(error_result)
+                continue
+
+            old_group = str(user.get("old_group") or "default")
+            username = str(user.get("username") or "")
+            source = str(user.get("source") or "")
+            if old_group == target_group:
+                skipped_count += 1
+                results.append({
+                    "success": True,
+                    "user_id": user_id,
+                    "username": username,
+                    "old_group": old_group,
+                    "new_group": target_group,
+                    "source": source,
+                    "target_group": target_group,
+                    "action": "skipped",
+                    "message": f"用户 {username} 已经在 {target_group}",
+                })
+                continue
+
+            if dry_run:
+                success_count += 1
+                results.append({
+                    "success": True,
+                    "user_id": user_id,
+                    "username": username,
+                    "old_group": old_group,
+                    "new_group": target_group,
+                    "source": source,
+                    "target_group": target_group,
+                    "action": "would_move",
+                    "message": f"[试运行] 用户 {username} 将从 {old_group} 移动到 {target_group}",
+                })
+            else:
+                result = self.assign_user(user_id, target_group, operator, batch_id=batch_id)
+                if result.get("success"):
+                    success_count += 1
+                    result["action"] = "moved"
+                    result["target_group"] = target_group
+                    result["batch_id"] = batch_id
+                else:
+                    failed_count += 1
+                    result["action"] = "error"
+                results.append(result)
+
+        message = f"成功移动 {success_count} 个用户，跳过 {skipped_count} 个，失败 {failed_count} 个"
+        if dry_run:
+            message = f"试运行完成：{success_count} 个用户可移动，{skipped_count} 个跳过，{failed_count} 个失败"
 
         return {
             "success": failed_count == 0,
-            "message": f"成功移动 {success_count} 个用户，失败 {failed_count} 个",
+            "message": message,
+            "dry_run": dry_run,
+            "batch_id": batch_id,
             "success_count": success_count,
+            "skipped_count": skipped_count,
             "failed_count": failed_count,
             "results": results,
         }
@@ -885,11 +967,64 @@ class AutoGroupService:
             log = self._storage.get_auto_group_log_by_id(log_id)
             if not log:
                 return {"success": False, "message": "日志记录不存在"}
+            return self._revert_log_entry(log, operator)
+        except Exception as e:
+            logger.error(f"恢复用户失败: {e}")
+            return {"success": False, "message": str(e)}
 
-            user_id = log["user_id"]
-            old_group = log["old_group"]
-            new_group = log["new_group"]
-            username = log["username"]
+    def revert_batch(self, batch_id: str, operator: str = "admin") -> Dict[str, Any]:
+        """恢复整个手动迁移批次。"""
+        batch_id = (batch_id or "").strip()
+        if not batch_id:
+            return {"success": False, "message": "缺少批次 ID"}
+        try:
+            logs = self._storage.get_auto_group_logs_by_batch_id(batch_id)
+            success_count = 0
+            failed_count = 0
+            skipped_count = 0
+            results = []
+            for log in logs:
+                if log.get("action") != "assign":
+                    continue
+                if int(log.get("reverted_at") or 0) > 0:
+                    skipped_count += 1
+                    continue
+                result = self._revert_log_entry(log, operator)
+                if result.get("success"):
+                    success_count += 1
+                else:
+                    failed_count += 1
+                results.append(result)
+
+            if success_count == 0 and failed_count == 0 and skipped_count == 0:
+                return {"success": False, "message": "没有找到可撤销的批次记录", "batch_id": batch_id}
+
+            return {
+                "success": failed_count == 0,
+                "message": f"批次撤销完成：成功 {success_count} 个，跳过 {skipped_count} 个，失败 {failed_count} 个",
+                "batch_id": batch_id,
+                "success_count": success_count,
+                "skipped_count": skipped_count,
+                "failed_count": failed_count,
+                "results": results,
+            }
+        except Exception as e:
+            logger.error(f"批次恢复失败: {e}")
+            return {"success": False, "message": str(e), "batch_id": batch_id}
+
+    def _revert_log_entry(self, log: Dict[str, Any], operator: str = "admin") -> Dict[str, Any]:
+        if log.get("action") != "assign":
+            return {"success": False, "message": "只有分配记录可以撤销"}
+        if int(log.get("reverted_at") or 0) > 0:
+            return {"success": False, "message": "该记录已撤销"}
+
+        user_id = log["user_id"]
+        old_group = log["old_group"]
+        new_group = log["new_group"]
+        username = log["username"]
+        batch_id = log.get("batch_id", "")
+
+        try:
 
             db = get_db_manager()
             db.connect()
@@ -924,7 +1059,7 @@ class AutoGroupService:
             db.execute(update_sql, {"old_group": old_group, "user_id": user_id})
 
             # 记录恢复日志
-            self._storage.add_auto_group_log(
+            revert_log_id = self._storage.add_auto_group_log(
                 user_id=user_id,
                 username=username,
                 old_group=new_group,
@@ -932,7 +1067,10 @@ class AutoGroupService:
                 action="revert",
                 source=log.get("source", ""),
                 operator=operator,
+                batch_id=batch_id,
+                revert_of=int(log.get("id") or 0),
             )
+            self._storage.mark_auto_group_log_reverted(int(log.get("id") or 0), revert_log_id)
 
             logger.business(
                 "自动分组: 用户恢复",
@@ -950,6 +1088,7 @@ class AutoGroupService:
                 "username": username,
                 "old_group": new_group,
                 "new_group": old_group,
+                "batch_id": batch_id,
             }
         except Exception as e:
             logger.error(f"恢复用户失败: {e}")
