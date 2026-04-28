@@ -2,23 +2,21 @@
 
 ## 目标
 
-新增自动分组“按消费升级”模式：管理员可配置累计消费达到多少美元后自动升级到 Pro / Super / Ultra 等分组，并可试运行预览。
+修复自动分组“按消费升级”规则里的目标分组下拉识别不全问题：需要识别 NewAPI 中已配置但当前没有用户的分组，例如 `Pro优`、`Ultra优`。
 
 ## 已完成
 
-- Go 后端自动分组新增 `by_usage` 模式，配置项 `usage_rules` 保存消费门槛和目标分组。
-- 扫描时按 `users.used_quota / 500000` 换算消费金额，命中最高门槛后升级到对应分组。
-- 为避免误移动用户，仅从 `default` 或已配置档位中的低档分组升级；不会降级，也不会移动不在档位里的自定义分组。
-- Python 后端补齐相同配置、预览和扫描逻辑，保持兼容。
-- 前端自动分组页面新增“按消费升级”模式、默认 Pro/Super/Ultra 档位、档位增删改，以及预览表中的“已消费/目标分组”列。
+- 对照 `d:\Project\newapi` 源码确认 NewAPI 分组列表主要来自 `options.GroupRatio`，特殊分组还可能出现在 `UserUsableGroups`、`GroupGroupRatio`、`group_ratio_setting.group_special_usable_group`、`AutoGroups`、`abilities.group` 和 `channels.group`。
+- Go 后端 `/api/auto-group/groups` 改为合并用户表、能力表、渠道表和 NewAPI options 配置里的分组，并保留用户数排序。
+- Python 兼容后端同步相同分组来源解析，并对可选来源查询失败做跳过处理，避免整页分组列表被打空。
+- 新增 Go 单元测试覆盖 `GroupRatio`、`UserUsableGroups`、`GroupGroupRatio`、特殊可用分组和 `AutoGroups` 的解析。
 
 ## 验证结果
 
 - `go test ./...`（`backend/`）通过。
 - `python -m py_compile backend-py\app\auto_group_service.py backend-py\app\auto_group_routes.py backend-py\app\main.py` 通过。
-- `npm run build`（`frontend/`）通过，仅保留既有 chunk 体积 warning。
 - `git diff --check` 通过，仅有 CRLF 提示。
 
 ## 下一步
 
-等待用户试用“按消费升级”模式；如需要，可继续增加每个档位当前人数统计、升级历史筛选或按月消费而非累计消费的规则。
+等待用户在页面刷新后试用目标分组下拉；如仍有漏项，再用临时只读数据库连接核对实际 `options` 值，不在聊天或记忆里保存密码。

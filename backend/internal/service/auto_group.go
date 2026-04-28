@@ -457,9 +457,11 @@ func (s *AutoGroupService) GetStats() map[string]interface{} {
 	}
 }
 
-// GetAvailableGroups returns all distinct groups from users table
+// GetAvailableGroups returns all groups known by NewAPI users, channels, abilities and options.
 func (s *AutoGroupService) GetAvailableGroups() []map[string]interface{} {
+	groupCounts := map[string]int64{}
 	groupCol := s.getGroupCol()
+
 	query := fmt.Sprintf(`
 		SELECT COALESCE(%s, 'default') as group_name, COUNT(*) as user_count
 		FROM users
@@ -470,20 +472,169 @@ func (s *AutoGroupService) GetAvailableGroups() []map[string]interface{} {
 	rows, err := s.db.Query(query)
 	if err != nil {
 		logger.L.Error(fmt.Sprintf("获取可用分组列表失败: %v", err))
-		return []map[string]interface{}{}
 	}
-	if rows == nil {
-		return []map[string]interface{}{}
+	for _, row := range rows {
+		addGroupNames(groupCounts, toString(row["group_name"]), toInt64(row["user_count"]))
 	}
 
-	result := make([]map[string]interface{}, 0, len(rows))
-	for _, row := range rows {
+	s.addGroupsFromAbilities(groupCounts)
+	s.addGroupsFromChannels(groupCounts)
+	s.addGroupsFromOptions(groupCounts)
+
+	delete(groupCounts, "")
+	result := make([]map[string]interface{}, 0, len(groupCounts))
+	for groupName, userCount := range groupCounts {
 		result = append(result, map[string]interface{}{
-			"group_name": toString(row["group_name"]),
-			"user_count": toInt64(row["user_count"]),
+			"group_name": groupName,
+			"user_count": userCount,
 		})
 	}
+	sortGroupRows(result)
 	return result
+}
+
+func (s *AutoGroupService) addGroupsFromAbilities(groupCounts map[string]int64) {
+	exists, err := s.db.TableExists("abilities")
+	if err != nil || !exists || !s.db.ColumnExists("abilities", "group") {
+		return
+	}
+	groupCol := s.getGroupCol()
+	rows, err := s.db.Query(fmt.Sprintf(`
+		SELECT DISTINCT COALESCE(NULLIF(%s, ''), 'default') as group_name
+		FROM abilities`, groupCol))
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		addGroupNames(groupCounts, toString(row["group_name"]), 0)
+	}
+}
+
+func (s *AutoGroupService) addGroupsFromChannels(groupCounts map[string]int64) {
+	exists, err := s.db.TableExists("channels")
+	if err != nil || !exists || !s.db.ColumnExists("channels", "group") {
+		return
+	}
+	groupCol := s.getGroupCol()
+	rows, err := s.db.Query(fmt.Sprintf(`
+		SELECT DISTINCT COALESCE(NULLIF(%s, ''), 'default') as group_name
+		FROM channels`, groupCol))
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		addGroupNames(groupCounts, toString(row["group_name"]), 0)
+	}
+}
+
+func (s *AutoGroupService) addGroupsFromOptions(groupCounts map[string]int64) {
+	exists, err := s.db.TableExists("options")
+	if err != nil || !exists {
+		return
+	}
+	keyCol := "`key`"
+	if s.db.IsPG {
+		keyCol = `"key"`
+	}
+	query := s.db.RebindQuery(fmt.Sprintf(`
+		SELECT %s as option_key, value
+		FROM options
+		WHERE %s IN (?, ?, ?, ?, ?)`, keyCol, keyCol))
+	rows, err := s.db.Query(query,
+		"GroupRatio",
+		"UserUsableGroups",
+		"GroupGroupRatio",
+		"group_ratio_setting.group_special_usable_group",
+		"AutoGroups",
+	)
+	if err != nil {
+		return
+	}
+	for _, row := range rows {
+		addGroupsFromOptionValue(groupCounts, toString(row["option_key"]), toString(row["value"]))
+	}
+}
+
+func addGroupsFromOptionValue(groupCounts map[string]int64, key, rawValue string) {
+	rawValue = strings.TrimSpace(rawValue)
+	if rawValue == "" || rawValue == "{}" || rawValue == "[]" {
+		return
+	}
+	var decoded interface{}
+	if err := json.Unmarshal([]byte(rawValue), &decoded); err != nil {
+		return
+	}
+	switch key {
+	case "GroupRatio", "UserUsableGroups":
+		if obj, ok := decoded.(map[string]interface{}); ok {
+			for groupName := range obj {
+				addGroupNames(groupCounts, groupName, 0)
+			}
+		}
+	case "GroupGroupRatio":
+		if obj, ok := decoded.(map[string]interface{}); ok {
+			for userGroup, inner := range obj {
+				addGroupNames(groupCounts, userGroup, 0)
+				if innerObj, ok := inner.(map[string]interface{}); ok {
+					for usingGroup := range innerObj {
+						addGroupNames(groupCounts, usingGroup, 0)
+					}
+				}
+			}
+		}
+	case "group_ratio_setting.group_special_usable_group":
+		if obj, ok := decoded.(map[string]interface{}); ok {
+			for userGroup, inner := range obj {
+				addGroupNames(groupCounts, userGroup, 0)
+				if innerObj, ok := inner.(map[string]interface{}); ok {
+					for rawGroup := range innerObj {
+						groupName := strings.TrimPrefix(strings.TrimPrefix(rawGroup, "+:"), "-:")
+						addGroupNames(groupCounts, groupName, 0)
+					}
+				}
+			}
+		}
+	case "AutoGroups":
+		switch value := decoded.(type) {
+		case []interface{}:
+			for _, item := range value {
+				addGroupNames(groupCounts, toString(item), 0)
+			}
+		case map[string]interface{}:
+			for groupName := range value {
+				addGroupNames(groupCounts, groupName, 0)
+			}
+		}
+	}
+}
+
+func addGroupNames(groupCounts map[string]int64, raw string, userCount int64) {
+	for _, groupName := range strings.Split(raw, ",") {
+		groupName = strings.TrimSpace(groupName)
+		if groupName == "" {
+			continue
+		}
+		if _, exists := groupCounts[groupName]; !exists {
+			groupCounts[groupName] = 0
+		}
+		if userCount > 0 {
+			groupCounts[groupName] += userCount
+		}
+	}
+}
+
+func sortGroupRows(rows []map[string]interface{}) {
+	for i := 0; i < len(rows); i++ {
+		for j := i + 1; j < len(rows); j++ {
+			ci := toInt64(rows[i]["user_count"])
+			cj := toInt64(rows[j]["user_count"])
+			gi := toString(rows[i]["group_name"])
+			gj := toString(rows[j]["group_name"])
+			if cj > ci || (cj == ci && gj < gi) {
+				rows[i], rows[j] = rows[j], rows[i]
+			}
+		}
+	}
 }
 
 // GetPendingUsers returns users not yet assigned to a group

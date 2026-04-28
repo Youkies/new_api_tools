@@ -16,6 +16,7 @@
 - 目标分组默认为空，必须手动选择才能执行分配
 - 不预设任何危险分组
 """
+import json
 import time
 import math
 from dataclasses import dataclass
@@ -154,6 +155,7 @@ class AutoGroupService:
 
             is_pg = db.config.engine == DatabaseEngine.POSTGRESQL
             group_col = '"group"' if is_pg else '`group`'
+            group_counts: Dict[str, int] = {}
 
             sql = f"""
                 SELECT COALESCE({group_col}, 'default') as group_name, COUNT(*) as user_count
@@ -164,16 +166,170 @@ class AutoGroupService:
             """
 
             rows = db.execute(sql, {})
+            for row in rows or []:
+                self._add_group_names(group_counts, row.get("group_name") or "default", int(row.get("user_count") or 0))
+
+            self._add_groups_from_abilities(group_counts)
+            self._add_groups_from_channels(group_counts)
+            self._add_groups_from_options(group_counts)
+
             return [
-                {
-                    "group_name": r.get("group_name") or "default",
-                    "user_count": int(r.get("user_count") or 0)
-                }
-                for r in (rows or [])
+                {"group_name": group, "user_count": count}
+                for group, count in sorted(group_counts.items(), key=lambda item: (-item[1], item[0]))
+                if group
             ]
         except Exception as e:
             logger.error(f"获取可用分组列表失败: {e}")
             return []
+
+    def _add_groups_from_abilities(self, group_counts: Dict[str, int]) -> None:
+        try:
+            db = get_db_manager()
+            if not self._table_exists("abilities") or not self._column_exists("abilities", "group"):
+                return
+            is_pg = db.config.engine == DatabaseEngine.POSTGRESQL
+            group_col = '"group"' if is_pg else '`group`'
+            rows = db.execute(f"""
+                SELECT DISTINCT COALESCE(NULLIF({group_col}, ''), 'default') as group_name
+                FROM abilities
+            """, {})
+            for row in rows or []:
+                self._add_group_names(group_counts, row.get("group_name") or "default", 0)
+        except Exception:
+            return
+
+    def _add_groups_from_channels(self, group_counts: Dict[str, int]) -> None:
+        try:
+            db = get_db_manager()
+            if not self._table_exists("channels") or not self._column_exists("channels", "group"):
+                return
+            is_pg = db.config.engine == DatabaseEngine.POSTGRESQL
+            group_col = '"group"' if is_pg else '`group`'
+            rows = db.execute(f"""
+                SELECT DISTINCT COALESCE(NULLIF({group_col}, ''), 'default') as group_name
+                FROM channels
+            """, {})
+            for row in rows or []:
+                self._add_group_names(group_counts, row.get("group_name") or "default", 0)
+        except Exception:
+            return
+
+    def _add_groups_from_options(self, group_counts: Dict[str, int]) -> None:
+        try:
+            db = get_db_manager()
+            if not self._table_exists("options"):
+                return
+            key_col = '"key"' if db.config.engine == DatabaseEngine.POSTGRESQL else '`key`'
+            keys = [
+                "GroupRatio",
+                "UserUsableGroups",
+                "GroupGroupRatio",
+                "group_ratio_setting.group_special_usable_group",
+                "AutoGroups",
+            ]
+            placeholders = ", ".join([f":key_{i}" for i in range(len(keys))])
+            params = {f"key_{i}": key for i, key in enumerate(keys)}
+            rows = db.execute(f"""
+                SELECT {key_col} as option_key, value
+                FROM options
+                WHERE {key_col} IN ({placeholders})
+            """, params)
+            for row in rows or []:
+                self._add_groups_from_option_value(
+                    group_counts,
+                    str(row.get("option_key") or ""),
+                    str(row.get("value") or ""),
+                )
+        except Exception:
+            return
+
+    def _add_groups_from_option_value(self, group_counts: Dict[str, int], key: str, raw_value: str) -> None:
+        raw_value = (raw_value or "").strip()
+        if raw_value in ("", "{}", "[]"):
+            return
+        try:
+            decoded = json.loads(raw_value)
+        except (TypeError, ValueError):
+            return
+
+        if key in ("GroupRatio", "UserUsableGroups") and isinstance(decoded, dict):
+            for group in decoded.keys():
+                self._add_group_names(group_counts, group, 0)
+            return
+
+        if key == "GroupGroupRatio" and isinstance(decoded, dict):
+            for user_group, inner in decoded.items():
+                self._add_group_names(group_counts, user_group, 0)
+                if isinstance(inner, dict):
+                    for using_group in inner.keys():
+                        self._add_group_names(group_counts, using_group, 0)
+            return
+
+        if key == "group_ratio_setting.group_special_usable_group" and isinstance(decoded, dict):
+            for user_group, inner in decoded.items():
+                self._add_group_names(group_counts, user_group, 0)
+                if isinstance(inner, dict):
+                    for raw_group in inner.keys():
+                        group = str(raw_group or "")
+                        if group.startswith("+:") or group.startswith("-:"):
+                            group = group[2:]
+                        self._add_group_names(group_counts, group, 0)
+            return
+
+        if key == "AutoGroups":
+            if isinstance(decoded, list):
+                for item in decoded:
+                    self._add_group_names(group_counts, str(item or ""), 0)
+            elif isinstance(decoded, dict):
+                for group in decoded.keys():
+                    self._add_group_names(group_counts, group, 0)
+
+    def _add_group_names(self, group_counts: Dict[str, int], raw: Any, user_count: int = 0) -> None:
+        for group in str(raw or "").split(","):
+            group = group.strip()
+            if not group:
+                continue
+            group_counts.setdefault(group, 0)
+            if user_count > 0:
+                group_counts[group] += user_count
+
+    def _table_exists(self, table_name: str) -> bool:
+        db = get_db_manager()
+        try:
+            if db.config.engine == DatabaseEngine.POSTGRESQL:
+                rows = db.execute("""
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = :table_name
+                    LIMIT 1
+                """, {"table_name": table_name})
+            else:
+                rows = db.execute("""
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = :db_name AND table_name = :table_name
+                    LIMIT 1
+                """, {"db_name": db.config.database, "table_name": table_name})
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        db = get_db_manager()
+        try:
+            if db.config.engine == DatabaseEngine.POSTGRESQL:
+                rows = db.execute("""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = :table_name AND column_name = :column_name
+                    LIMIT 1
+                """, {"table_name": table_name, "column_name": column_name})
+            else:
+                rows = db.execute("""
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = :db_name AND table_name = :table_name AND column_name = :column_name
+                    LIMIT 1
+                """, {"db_name": db.config.database, "table_name": table_name, "column_name": column_name})
+            return bool(rows)
+        except Exception:
+            return False
 
     def detect_registration_source(self, user: Dict[str, Any]) -> RegistrationSource:
         """
