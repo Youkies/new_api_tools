@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NewAPI 日志导出助手
 // @namespace    https://newapi.youkies.space/
-// @version      1.2.13
-// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出
+// @version      1.2.14
+// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出和上传到 NewAPI Tools 日志对账
 // @author       Youkies
 // @match        *://*/*
 // @grant        none
@@ -636,6 +636,78 @@
     return `newapi_logs_${site}_${nowDateStr()}`;
   }
 
+  function getStoredToolsConfig() {
+    try {
+      return {
+        toolsUrl: "",
+        apiKey: "",
+        uploadEnabled: false,
+        ...(JSON.parse(localStorage.getItem(CONFIG.TOOLS_CONFIG_KEY) || "{}") || {}),
+      };
+    } catch (_) {
+      return {
+        toolsUrl: "",
+        apiKey: "",
+        uploadEnabled: false,
+      };
+    }
+  }
+
+  function saveToolsConfig(config) {
+    localStorage.setItem(CONFIG.TOOLS_CONFIG_KEY, JSON.stringify(config));
+  }
+
+  function getToolsOptionsFromForm() {
+    return {
+      uploadEnabled: Boolean($id("lex-upload-tools")?.checked),
+      toolsUrl: String($id("lex-tools-url")?.value || "").trim().replace(/\/+$/, ""),
+      apiKey: String($id("lex-tools-key")?.value || "").trim(),
+    };
+  }
+
+  function getToolsAuthHeaders(apiKey) {
+    const token = String(apiKey || "").trim();
+    if (!token) return {};
+    if (/^bearer\s+/i.test(token)) {
+      return { Authorization: token };
+    }
+    return { "X-API-Key": token };
+  }
+
+  async function uploadCSVToTools(csvContent, filename, options, toolsOptions) {
+    if (!toolsOptions.uploadEnabled) return null;
+    if (!toolsOptions.toolsUrl) {
+      throw new Error("已启用上传，但未填写 NewAPI Tools 地址");
+    }
+    if (!toolsOptions.apiKey) {
+      throw new Error("已启用上传，但未填写 NewAPI Tools API Key/JWT");
+    }
+
+    const form = new FormData();
+    form.append(
+      "files",
+      new Blob(["\ufeff" + csvContent], { type: "text/csv;charset=utf-8" }),
+      filename
+    );
+    form.append("source_url", location.origin);
+    form.append("source_name", document.title || location.host);
+    form.append("start_time", String(options.startTs || ""));
+    form.append("end_time", String(options.endTs || ""));
+
+    const resp = await fetch(`${toolsOptions.toolsUrl}/api/log-match/uploads`, {
+      method: "POST",
+      headers: getToolsAuthHeaders(toolsOptions.apiKey),
+      body: form,
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.success === false) {
+      const message =
+        data?.error?.message || data?.message || `HTTP ${resp.status}`;
+      throw new Error(`上传 NewAPI Tools 失败：${message}`);
+    }
+    return data.data || data;
+  }
+
   function todayStart() {
     const date = new Date();
     date.setHours(0, 0, 0, 0);
@@ -944,6 +1016,7 @@
   function buildModalHTML() {
     const start = toLocalDatetimeStr(todayStart());
     const end = toLocalDatetimeStr(new Date());
+    const tools = getStoredToolsConfig();
 
     return `
       <div id="log-export-modal">
@@ -1025,6 +1098,25 @@
             </div>
           </div>
           <div class="lex-hint">默认：500000 quota = 1 USD。</div>
+
+          <div class="lex-row full">
+            <label class="lex-check">
+              <input type="checkbox" id="lex-upload-tools" ${tools.uploadEnabled ? "checked" : ""}>
+              导出后上传到 NewAPI Tools 日志对账
+            </label>
+          </div>
+
+          <div class="lex-row">
+            <div class="lex-field">
+              <label for="lex-tools-url">NewAPI Tools 地址</label>
+              <input type="text" id="lex-tools-url" value="${escapeAttr(tools.toolsUrl)}" placeholder="https://tools.example.com">
+            </div>
+            <div class="lex-field">
+              <label for="lex-tools-key">Tools API Key / Bearer JWT</label>
+              <input type="password" id="lex-tools-key" value="${escapeAttr(tools.apiKey)}" placeholder="填写 tools 的 API_KEY">
+            </div>
+          </div>
+          <div class="lex-hint">仅上传本次导出的 CSV 到 Tools 暂存区，不保存当前站点登录态。</div>
 
           <div class="lex-actions">
             <button class="lex-btn lex-btn-secondary" id="lex-btn-sync" type="button" title="从页面当前筛选条件同步">同步页面筛选</button>
@@ -1166,6 +1258,8 @@
       Number.parseInt($id("lex-quota-unit").value, 10) ||
       CONFIG.QUOTA_PER_UNIT;
     const format = $id("lex-format").value;
+    const toolsOptions = getToolsOptionsFromForm();
+    saveToolsConfig(toolsOptions);
 
     setExportingState(true);
 
@@ -1194,8 +1288,9 @@
       }
 
       const filename = exportFilenameBase();
+      const csvContent = logsToCSV(logs, quotaPerUnit);
       if (format === "csv") {
-        downloadFile(logsToCSV(logs, quotaPerUnit), `${filename}.csv`, "text/csv");
+        downloadFile(csvContent, `${filename}.csv`, "text/csv");
       } else {
         downloadFile(
           logsToJSON(logs, quotaPerUnit),
@@ -1218,14 +1313,38 @@
       );
       const models = new Set(logs.map((log) => log.model_name).filter(Boolean));
       const users = new Set(logs.map((log) => log.username).filter(Boolean));
+      let uploadText = "";
+      let uploadFailed = false;
+      try {
+        if (toolsOptions.uploadEnabled) {
+          $id("lex-progress-text").textContent = "正在上传到 NewAPI Tools...";
+          const uploadResult = await uploadCSVToTools(
+            csvContent,
+            `${filename}.csv`,
+            options,
+            toolsOptions
+          );
+          const uploads = uploadResult?.uploads || [];
+          if (uploads.length > 0) {
+            uploadText =
+              `\n上传：已保存 ${uploads.length} 个文件到 Tools 日志对账` +
+              `\n请到 Tools 的“日志对账”页刷新后选择分析`;
+          }
+        }
+      } catch (uploadErr) {
+        console.error("[LogExporter] Upload failed:", uploadErr);
+        uploadFailed = true;
+        uploadText = `\n上传失败：${uploadErr.message}`;
+      }
 
       showResult(
         `导出成功。\n` +
           `共 ${logs.length} 条记录\n` +
           `总费用：$${(totalQuota / quotaPerUnit).toFixed(4)}\n` +
           `输入：${totalInput.toLocaleString()} tokens，输出：${totalOutput.toLocaleString()} tokens\n` +
-          `模型数：${models.size}，用户数：${users.size}`,
-        false
+          `模型数：${models.size}，用户数：${users.size}` +
+          uploadText,
+        uploadFailed
       );
     } catch (err) {
       console.error("[LogExporter] Export failed:", err);

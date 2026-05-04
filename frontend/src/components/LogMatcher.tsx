@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Database, FileSearch, FileText, Loader2, RefreshCw, Search, Upload, XCircle } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { AlertTriangle, CheckCircle2, Database, FileSearch, FileText, Loader2, RefreshCw, Search, Trash2, Upload, XCircle } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { Badge } from './ui/badge'
@@ -84,6 +84,19 @@ interface UploadedFileInfo {
   name: string
   host: string
   rows: number
+}
+
+interface StoredUpload {
+  id: string
+  name: string
+  host: string
+  source_url?: string
+  source_name?: string
+  start_time?: number
+  end_time?: number
+  rows: number
+  size: number
+  uploaded_at: number
 }
 
 interface LogMatchResult {
@@ -220,6 +233,9 @@ export function LogMatcher() {
   const [timeWindow, setTimeWindow] = useState('120')
   const [maxRows, setMaxRows] = useState('50000')
   const [files, setFiles] = useState<File[]>([])
+  const [storedUploads, setStoredUploads] = useState<StoredUpload[]>([])
+  const [selectedUploadIds, setSelectedUploadIds] = useState<string[]>([])
+  const [uploadsLoading, setUploadsLoading] = useState(false)
   const [result, setResult] = useState<LogMatchResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [statusFilter, setStatusFilter] = useState<Record<MatchStatus, boolean>>({
@@ -236,6 +252,7 @@ export function LogMatcher() {
   const channelOptions = useMemo(() => uniqueSorted(result?.records.map((record) => record.local_channel) || []), [result])
   const modelOptions = useMemo(() => uniqueSorted(result?.records.map((record) => record.local_model) || []), [result])
   const hostOptions = useMemo(() => Object.keys(result?.summary.by_host || {}).sort((a, b) => a.localeCompare(b)), [result])
+  const selectedUploadCount = selectedUploadIds.length
 
   const filteredRecords = useMemo(() => {
     if (!result) return []
@@ -272,6 +289,61 @@ export function LogMatcher() {
     setFiles(Array.from(event.target.files || []))
   }
 
+  const fetchStoredUploads = useCallback(async () => {
+    setUploadsLoading(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/log-match/uploads`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+      const payload = await response.json()
+      if (!response.ok || !payload?.success) {
+        throw new Error(errorMessage(payload, '加载已上传日志失败'))
+      }
+      const uploads = (payload.data?.uploads || []) as StoredUpload[]
+      setStoredUploads(uploads)
+      setSelectedUploadIds((current) => current.filter((id) => uploads.some((item) => item.id === id)))
+    } catch (error) {
+      showToast('error', error instanceof Error ? error.message : '加载已上传日志失败')
+    } finally {
+      setUploadsLoading(false)
+    }
+  }, [apiUrl, showToast, token])
+
+  useEffect(() => {
+    fetchStoredUploads()
+  }, [fetchStoredUploads])
+
+  const toggleStoredUpload = (id: string) => {
+    setSelectedUploadIds((current) => {
+      if (current.includes(id)) {
+        return current.filter((item) => item !== id)
+      }
+      return [...current, id]
+    })
+  }
+
+  const deleteStoredUpload = async (id: string) => {
+    try {
+      const response = await fetch(`${apiUrl}/api/log-match/uploads/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || payload?.success === false) {
+        throw new Error(errorMessage(payload, '删除已上传日志失败'))
+      }
+      setStoredUploads((current) => current.filter((item) => item.id !== id))
+      setSelectedUploadIds((current) => current.filter((item) => item !== id))
+      showToast('success', '已删除上传日志')
+    } catch (error) {
+      showToast('error', error instanceof Error ? error.message : '删除已上传日志失败')
+    }
+  }
+
   const handleAnalyze = async () => {
     const start = toUnixSeconds(startTime)
     const end = toUnixSeconds(endTime)
@@ -279,14 +351,17 @@ export function LogMatcher() {
       showToast('error', '时间范围不正确')
       return
     }
-    if (files.length === 0) {
-      showToast('error', '请上传至少一个上游 CSV')
+    if (files.length === 0 && selectedUploadIds.length === 0) {
+      showToast('error', '请上传或选择至少一个上游 CSV')
       return
     }
 
     const form = new FormData()
     for (const file of files) {
       form.append('files', file)
+    }
+    for (const id of selectedUploadIds) {
+      form.append('uploaded_ids', id)
     }
     form.append('start_time', String(start))
     form.append('end_time', String(end))
@@ -332,10 +407,10 @@ export function LogMatcher() {
           <h2 className="text-2xl font-bold tracking-tight">日志对账</h2>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-sm text-muted-foreground">
             <span className="inline-flex items-center gap-1"><Database className="h-3.5 w-3.5" /> 本站日志来自数据库</span>
-            <span className="inline-flex items-center gap-1"><Upload className="h-3.5 w-3.5" /> 上游日志手动上传</span>
+            <span className="inline-flex items-center gap-1"><Upload className="h-3.5 w-3.5" /> 上游日志手动上传或脚本上传</span>
           </div>
         </div>
-        <Button onClick={handleAnalyze} disabled={loading || files.length === 0} className="gap-2">
+        <Button onClick={handleAnalyze} disabled={loading || (files.length === 0 && selectedUploadIds.length === 0)} className="gap-2">
           {loading ? <Loader2 className="h-4 w-4 animate-spin" /> : <FileSearch className="h-4 w-4" />}
           开始分析
         </Button>
@@ -345,7 +420,7 @@ export function LogMatcher() {
         <CardHeader className="pb-3">
           <CardTitle className="text-base">分析输入</CardTitle>
         </CardHeader>
-        <CardContent className="grid gap-4 lg:grid-cols-[1.1fr_1fr]">
+        <CardContent className="grid gap-4 xl:grid-cols-[1fr_1fr]">
           <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <label className="space-y-1.5">
               <span className="text-xs font-medium text-muted-foreground">开始时间</span>
@@ -378,6 +453,58 @@ export function LogMatcher() {
                     <FileText className="h-3 w-3 shrink-0" />
                     <span className="truncate">{file.name}</span>
                   </Badge>
+                ))}
+              </div>
+            )}
+          </div>
+          <div className="rounded-md border border-border/60 bg-muted/20 p-3 xl:col-span-2">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-sm font-medium">已上传到 Tools 的上游日志</div>
+                <div className="text-xs text-muted-foreground">可与本次手动选择的 CSV 一起分析</div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Button variant="outline" size="sm" className="gap-2" onClick={() => setSelectedUploadIds(storedUploads.map((item) => item.id))} disabled={storedUploads.length === 0}>
+                  全选
+                </Button>
+                <Button variant="outline" size="sm" className="gap-2" onClick={() => setSelectedUploadIds([])} disabled={selectedUploadCount === 0}>
+                  清空
+                </Button>
+                <Button variant="outline" size="sm" className="gap-2" onClick={fetchStoredUploads} disabled={uploadsLoading}>
+                  {uploadsLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                  刷新
+                </Button>
+              </div>
+            </div>
+            {storedUploads.length === 0 ? (
+              <div className="rounded-md border border-dashed border-border/70 py-8 text-center text-sm text-muted-foreground">
+                暂无脚本上传的上游日志
+              </div>
+            ) : (
+              <div className="grid max-h-72 gap-2 overflow-y-auto pr-1 custom-scrollbar lg:grid-cols-2">
+                {storedUploads.map((item) => (
+                  <div key={item.id} className="flex items-start gap-3 rounded-md border border-border/60 bg-background/70 p-3">
+                    <input
+                      type="checkbox"
+                      className="mt-1 h-4 w-4 accent-primary"
+                      checked={selectedUploadIds.includes(item.id)}
+                      onChange={() => toggleStoredUpload(item.id)}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <Badge variant="secondary" className="shrink-0">{item.host || 'unknown'}</Badge>
+                        <div className="truncate text-sm font-medium" title={item.name}>{item.name}</div>
+                      </div>
+                      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                        <span>{formatNumber(item.rows)} 行</span>
+                        <span>{new Date(item.uploaded_at * 1000).toLocaleString('zh-CN')}</span>
+                        {item.source_url && <span className="truncate">{item.source_url}</span>}
+                      </div>
+                    </div>
+                    <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive" onClick={() => deleteStoredUpload(item.id)}>
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </div>
                 ))}
               </div>
             )}

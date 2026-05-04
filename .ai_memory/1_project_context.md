@@ -16,5 +16,6 @@
 - 2026-05-04 已按用户要求回退“上游 NewAPI 日志同步/成本统计”集成：移除 Go/Python `/api/cost/upstream-sync/*`、`/api/cost/tools-access`、后台上游同步任务、前端成本核算页的日志助手接入/上游同步面板，以及 `api_tools_upstream_logs` 匹配汇总逻辑；保留更早的基础 `成本核算` 页和 `/api/analytics/export` 日志导出能力。
 - 2026-05-04 先以本地 CLI 方式重启上游日志对账方向：`scripts/newapi_log_matcher.py` 读取导出的 `newapi_logs_{host}_{date}.csv`，通过渠道 alias 映射上游、标准化模型名，并按 `输入Tokens + 输出Tokens + 总Tokens + 时间窗口` 做一对一高置信匹配；默认规则在 `scripts/newapi_log_rules.example.json`，其中 `api.opusclaw.me` 按 1:10 充值比例配置 `cost_multiplier=0.1`。工具输出 `report.html` 静态 UI，可按本站模型、本站渠道、状态、上游筛选查看每条本地日志；该工具不接数据库和后台，后续稳定后再迁入 NewAPI Tools。
 - 2026-05-04 已将日志对账迁入 Go 版 NewAPI Tools：新增 `/api/log-match/analyze`，Youkies/本站日志直接从 `logs` 数据库按时间范围读取消费日志，上游日志由用户上传 CSV；匹配口径沿用本地工具（渠道 alias -> 上游、标准化模型、tokens + 时间窗口），前端新增 `日志对账` 页面，支持勾选本站渠道和本站模型筛选每条匹配状态。
+- 2026-05-04 日志对账新增轻量上传链路：Go 后端提供 `/api/log-match/uploads` 暂存上游 CSV 到 `DATA_DIR/log_match_uploads`，前端 `日志对账` 页可勾选已上传文件参与分析；userscript 1.2.14 恢复“导出后上传到 NewAPI Tools 日志对账”，但不保存上游登录态、不做后台定时拉取。
 - 用户确认偏好：功能完成并验证通过后，默认自动提交并 push 当前分支；提交前仍需检查 `git status` 和 diff 范围，避免带入无关改动。
 - 常用验证命令：`go test ./...`（在 `backend/`）、`python -m py_compile ...`、`npm run build`（在 `frontend/`）。

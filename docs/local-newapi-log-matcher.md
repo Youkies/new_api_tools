@@ -61,7 +61,15 @@ python scripts\newapi_log_matcher.py .\日志 --config .\日志\newapi_log_rules
 
 ## 当前迁移方向
 
-本地工具稳定后，可以把以下逻辑迁入 NewAPI Tools：
+Go 版 NewAPI Tools 已迁入基础日志对账能力：
+
+- 本站日志从 Tools 连接的 NewAPI 数据库读取。
+- 上游 CSV 可以在 `日志对账` 页手动上传，也可以由 userscript 导出后上传到 Tools 暂存区。
+- `POST /api/log-match/uploads`：上传上游 CSV 到 `DATA_DIR/log_match_uploads`。
+- `GET /api/log-match/uploads`：列出已上传 CSV，供前端勾选。
+- `POST /api/log-match/analyze`：混合使用已上传文件和本次手动选择文件进行分析。
+
+已经迁入的核心逻辑：
 
 - CSV 解析和 host 识别
 - 上游 alias 规则配置
@@ -69,3 +77,5 @@ python scripts\newapi_log_matcher.py .\日志 --config .\日志\newapi_log_rules
 - 匹配状态表：`matched`、`ambiguous`、`unmatched`
 - 按上游、渠道、模型、按次价格的汇总
 - 后续新增实时映射表，实现真正精确匹配
+
+userscript 只上传导出的 CSV 和来源信息，不保存上游登录态，也不启动后台拉取任务。

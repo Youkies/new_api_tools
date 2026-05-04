@@ -15,6 +15,8 @@
 - 新增 `docs/local-newapi-log-matcher.md`：记录本地使用方式、匹配口径和后续迁入 NewAPI Tools 的方向。
 - 新增 Go 后端 `backend/internal/service/log_matcher.go` 与 `backend/internal/handler/log_matcher.go`：提供 `/api/log-match/analyze`，本站日志从数据库读取，上游 CSV 由 multipart 上传，支持文件名 alias 自动识别正式上游 host。
 - 前端新增 `frontend/src/components/LogMatcher.tsx`，并在导航加入 `日志对账` 页；页面支持上传多个上游 CSV、设置时间窗口、查看总账/上游汇总，并按状态、上游、本站渠道、本站模型、按次和关键词筛选每条记录。
+- 新增轻量上传链路：`backend/internal/service/log_match_upload_store.go` 将脚本上传的上游 CSV 保存到 `DATA_DIR/log_match_uploads`；`/api/log-match/uploads` 支持上传、列出、删除；`/api/log-match/analyze` 支持混合使用已上传文件 ID 和本次手动上传文件。
+- userscript 升级到 1.2.14，恢复“导出后上传到 NewAPI Tools 日志对账”，只上传 CSV 和来源信息，不保存上游登录态。
 
 ## 验证结果
 
@@ -28,6 +30,7 @@
 - NewAPI Tools 集成后，`go test ./...`（`backend/`）通过。
 - NewAPI Tools 集成后，`npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning 和大 chunk warning。
 - 前端 dev server 已启动在 `http://127.0.0.1:3000/log-match`，Vite 代理 `/api` 到 `localhost:8000`。
+- 轻量上传链路新增后，`node --check "NewAPI 日志导出助手-1.2.2.user.js"`、`go test ./...`（`backend/`）、`npm run build`（`frontend/`）通过；前端构建仍有既有 CSS/chunk warning。
 
 ## 注意
 
