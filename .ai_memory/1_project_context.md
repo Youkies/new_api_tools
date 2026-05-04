@@ -14,5 +14,6 @@
 - Go 正式后端已支持自动分组后台定时扫描：启动后按 `enabled`、`auto_scan_enabled`、`scan_interval_minutes` 静默执行 `RunScan(false)`，与前端“自动扫描”开关语义一致。
 - 日志分析页已支持 `/api/analytics/export` 原始日志导出；Go/Python 后端都提供同名接口，按时间、类型、模型、用户、令牌、渠道、分组、Request ID 等条件从 `logs` 表直接流式导出 CSV/JSON，避免前端逐页请求 NewAPI `/api/log` 导致大量请求中断。
 - 成本核算已接入上游日志同步设计：Go 正式后端通过 `/api/cost/upstream-sync/*` 配置、手动同步和后台定时同步上游 NewAPI 消费日志，导入到 `api_tools_upstream_logs`；成本汇总只使用已经一对一匹配到本地 `logs.id` 的上游成本，匹配主策略为“输入 tokens + 输出 tokens + 时间窗口”，`Request ID` 仅作为高置信兜底和诊断统计。参考样本显示本站与 5 个上游的 `Request ID` 精确匹配率为 0%，60 秒 token/time 窗口可匹配约 88%-94%。
+- 上游日志也可由 userscript 上传：Go `/api/cost/upstream-sync/upload` 接收 `source_url`、`source_name` 和原始 `logs` 数组，写入 `api_tools_upstream_logs` 后立即匹配；改造后的 `NewAPI 日志导出助手` 在上游页面复用浏览器登录态拉 `/api/log/` 或 `/api/log/self/`，再用 NewAPI Tools 的 `X-API-Key` 或 Bearer JWT 跨域上传。
 - 用户确认偏好：功能完成并验证通过后，默认自动提交并 push 当前分支；提交前仍需检查 `git status` 和 diff 范围，避免带入无关改动。
 - 常用验证命令：`go test ./...`（在 `backend/`）、`python -m py_compile ...`、`npm run build`（在 `frontend/`）。

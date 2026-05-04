@@ -116,6 +116,16 @@ def run_upstream_sync(_: UpstreamSyncRunRequest, __: str = Depends(verify_auth))
     }
 
 
+@router.post("/upstream-sync/upload")
+def upload_upstream_logs(_: Dict[str, Any], __: str = Depends(verify_auth)):
+    return {
+        "success": False,
+        "error": {
+            "message": "Python compatibility backend does not implement upstream log upload yet; use the Go backend for userscript uploads.",
+        },
+    }
+
+
 def _default_upstream_config() -> Dict[str, Any]:
     return {
         "enabled": False,

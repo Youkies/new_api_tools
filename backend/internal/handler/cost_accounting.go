@@ -21,6 +21,7 @@ func RegisterCostAccountingRoutes(r *gin.RouterGroup) {
 		g.GET("/upstream-sync/config", GetUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/config", SaveUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/run", RunUpstreamLogSync)
+		g.POST("/upstream-sync/upload", UploadUpstreamLogs)
 	}
 }
 
@@ -135,6 +136,23 @@ func RunUpstreamLogSync(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Upstream logs synced", "data": data})
+}
+
+// POST /api/cost/upstream-sync/upload
+func UploadUpstreamLogs(c *gin.Context) {
+	var req service.UpstreamLogUploadRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		return
+	}
+
+	svc := service.NewUpstreamLogSyncService()
+	data, err := svc.UploadLogs(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("UPLOAD_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Upstream logs uploaded", "data": data})
 }
 
 func parseInt64Query(c *gin.Context, key string, defaultVal int64) int64 {

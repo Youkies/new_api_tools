@@ -55,6 +55,16 @@ type UpstreamLogSyncRunOptions struct {
 	LogType   int   `json:"type"`
 }
 
+// UpstreamLogUploadRequest imports logs that were exported in an upstream browser session.
+type UpstreamLogUploadRequest struct {
+	SourceURL             string                   `json:"source_url"`
+	SourceName            string                   `json:"source_name"`
+	Logs                  []map[string]interface{} `json:"logs"`
+	StartTime             int64                    `json:"start_time"`
+	EndTime               int64                    `json:"end_time"`
+	MatchToleranceSeconds int                      `json:"match_tolerance_seconds"`
+}
+
 // UpstreamLogSyncService imports logs from an upstream NewAPI instance.
 type UpstreamLogSyncService struct {
 	db *database.Manager
@@ -154,6 +164,8 @@ func (s *UpstreamLogSyncService) EnsureTables() error {
 			CREATE TABLE IF NOT EXISTS api_tools_upstream_logs (
 				id BIGSERIAL PRIMARY KEY,
 				source_key TEXT NOT NULL UNIQUE,
+				source_url TEXT NOT NULL DEFAULT '',
+				source_name TEXT NOT NULL DEFAULT '',
 				source_log_id TEXT NOT NULL DEFAULT '',
 				created_at BIGINT NOT NULL DEFAULT 0,
 				type INTEGER NOT NULL DEFAULT 0,
@@ -225,6 +237,8 @@ func (s *UpstreamLogSyncService) EnsureTables() error {
 		CREATE TABLE IF NOT EXISTS api_tools_upstream_logs (
 			id BIGINT AUTO_INCREMENT PRIMARY KEY,
 			source_key VARCHAR(191) NOT NULL,
+			source_url TEXT NOT NULL,
+			source_name VARCHAR(191) NOT NULL DEFAULT '',
 			source_log_id VARCHAR(64) NOT NULL DEFAULT '',
 			created_at BIGINT NOT NULL DEFAULT 0,
 			type INT NOT NULL DEFAULT 0,
@@ -275,6 +289,18 @@ func (s *UpstreamLogSyncService) ensureSchemaColumns() error {
 			name:  "match_tolerance_seconds",
 			pgDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INTEGER NOT NULL DEFAULT 60",
 			myDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INT NOT NULL DEFAULT 60",
+		},
+		{
+			table: "api_tools_upstream_logs",
+			name:  "source_url",
+			pgDDL: "ALTER TABLE api_tools_upstream_logs ADD COLUMN source_url TEXT NOT NULL DEFAULT ''",
+			myDDL: "ALTER TABLE api_tools_upstream_logs ADD COLUMN source_url TEXT NULL",
+		},
+		{
+			table: "api_tools_upstream_logs",
+			name:  "source_name",
+			pgDDL: "ALTER TABLE api_tools_upstream_logs ADD COLUMN source_name TEXT NOT NULL DEFAULT ''",
+			myDDL: "ALTER TABLE api_tools_upstream_logs ADD COLUMN source_name VARCHAR(191) NOT NULL DEFAULT ''",
 		},
 		{
 			table: "api_tools_upstream_logs",
@@ -569,7 +595,7 @@ func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[st
 	totalUpserted := 0
 	totalRecords := extractUpstreamTotal(firstResp)
 	items := extractUpstreamItems(firstResp)
-	upserted, err := s.upsertImportedLogs(items)
+	upserted, err := s.upsertImportedLogs(items, cfg.BaseURL, "scheduled")
 	if err != nil {
 		s.markRunFinished(cfg, 0, err)
 		return nil, err
@@ -601,7 +627,7 @@ func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[st
 		if len(pageItems) == 0 {
 			break
 		}
-		upserted, err := s.upsertImportedLogs(pageItems)
+		upserted, err := s.upsertImportedLogs(pageItems, cfg.BaseURL, "scheduled")
 		if err != nil {
 			s.markRunFinished(cfg, totalUpserted, err)
 			return nil, err
@@ -658,6 +684,64 @@ func (s *UpstreamLogSyncService) syncWindow(cfg UpstreamLogSyncConfig, opts Upst
 		startTime = 0
 	}
 	return startTime, endTime
+}
+
+// UploadLogs stores logs uploaded by the browser userscript and immediately reconciles them.
+func (s *UpstreamLogSyncService) UploadLogs(req UpstreamLogUploadRequest) (map[string]interface{}, error) {
+	sourceURL := strings.TrimRight(strings.TrimSpace(req.SourceURL), "/")
+	if sourceURL == "" {
+		return nil, fmt.Errorf("source_url is required")
+	}
+	sourceName := strings.TrimSpace(req.SourceName)
+	if sourceName == "" {
+		sourceName = sourceURL
+	}
+	if len(req.Logs) == 0 {
+		return nil, fmt.Errorf("logs is required")
+	}
+	if len(req.Logs) > 200000 {
+		return nil, fmt.Errorf("too many logs: %d", len(req.Logs))
+	}
+
+	imported, err := s.upsertImportedLogs(req.Logs, sourceURL, sourceName)
+	if err != nil {
+		return nil, err
+	}
+
+	startTime, endTime := req.StartTime, req.EndTime
+	if startTime <= 0 || endTime <= 0 {
+		for _, item := range req.Logs {
+			createdAt := firstInt64Value(item, "created_at", "createdAt", "timestamp")
+			if createdAt <= 0 {
+				continue
+			}
+			if startTime <= 0 || createdAt < startTime {
+				startTime = createdAt
+			}
+			if endTime <= 0 || createdAt > endTime {
+				endTime = createdAt
+			}
+		}
+	}
+	if startTime <= 0 || endTime <= 0 {
+		startTime, endTime = DefaultCostRange()
+	}
+
+	matchResult, err := s.ReconcileMatches(startTime, endTime, req.MatchToleranceSeconds)
+	if err != nil {
+		return nil, err
+	}
+
+	return map[string]interface{}{
+		"success":     true,
+		"source_url":  sourceURL,
+		"source_name": sourceName,
+		"start_time":  startTime,
+		"end_time":    endTime,
+		"uploaded":    len(req.Logs),
+		"imported":    imported,
+		"match":       matchResult,
+	}, nil
 }
 
 // ReconcileMatches links imported upstream logs to local logs one-to-one.
@@ -1005,7 +1089,7 @@ func extractUpstreamTotal(resp map[string]interface{}) int {
 	return 0
 }
 
-func (s *UpstreamLogSyncService) upsertImportedLogs(items []map[string]interface{}) (int, error) {
+func (s *UpstreamLogSyncService) upsertImportedLogs(items []map[string]interface{}, sourceURL, sourceName string) (int, error) {
 	if len(items) == 0 {
 		return 0, nil
 	}
@@ -1021,13 +1105,15 @@ func (s *UpstreamLogSyncService) upsertImportedLogs(items []map[string]interface
 
 	query := `
 		INSERT INTO api_tools_upstream_logs
-			(source_key, source_log_id, created_at, type, user_id, username, token_id, token_name,
+			(source_key, source_url, source_name, source_log_id, created_at, type, user_id, username, token_id, token_name,
 			 group_name, model_name, channel_id, channel_name, prompt_tokens, completion_tokens,
 			 quota, use_time, is_stream, request_id, ip, content, other, raw_json, imported_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	if s.db.IsPG {
 		query += `
 			ON CONFLICT (source_key) DO UPDATE SET
+				source_url = EXCLUDED.source_url,
+				source_name = EXCLUDED.source_name,
 				source_log_id = EXCLUDED.source_log_id,
 				created_at = EXCLUDED.created_at,
 				type = EXCLUDED.type,
@@ -1053,6 +1139,8 @@ func (s *UpstreamLogSyncService) upsertImportedLogs(items []map[string]interface
 	} else {
 		query += `
 			ON DUPLICATE KEY UPDATE
+				source_url = VALUES(source_url),
+				source_name = VALUES(source_name),
 				source_log_id = VALUES(source_log_id),
 				created_at = VALUES(created_at),
 				type = VALUES(type),
@@ -1079,13 +1167,15 @@ func (s *UpstreamLogSyncService) upsertImportedLogs(items []map[string]interface
 	query = s.db.RebindQuery(query)
 
 	now := time.Now().Unix()
+	sourceURL = strings.TrimRight(strings.TrimSpace(sourceURL), "/")
+	sourceName = strings.TrimSpace(sourceName)
 	for _, item := range items {
-		row := normalizeUpstreamLogRow(item, now)
+		row := normalizeUpstreamLogRow(item, now, sourceURL, sourceName)
 		if row.SourceKey == "" {
 			continue
 		}
 		if _, err := tx.Exec(query,
-			row.SourceKey, row.SourceLogID, row.CreatedAt, row.Type, row.UserID, row.Username,
+			row.SourceKey, row.SourceURL, row.SourceName, row.SourceLogID, row.CreatedAt, row.Type, row.UserID, row.Username,
 			row.TokenID, row.TokenName, row.GroupName, row.ModelName, row.ChannelID, row.ChannelName,
 			row.PromptTokens, row.CompletionTokens, row.Quota, row.UseTime, row.IsStream,
 			row.RequestID, row.IP, row.Content, row.Other, row.RawJSON, row.ImportedAt,
@@ -1101,6 +1191,8 @@ func (s *UpstreamLogSyncService) upsertImportedLogs(items []map[string]interface
 
 type upstreamLogRow struct {
 	SourceKey        string
+	SourceURL        string
+	SourceName       string
 	SourceLogID      string
 	CreatedAt        int64
 	Type             int
@@ -1125,17 +1217,20 @@ type upstreamLogRow struct {
 	ImportedAt       int64
 }
 
-func normalizeUpstreamLogRow(item map[string]interface{}, importedAt int64) upstreamLogRow {
+func normalizeUpstreamLogRow(item map[string]interface{}, importedAt int64, sourceURL, sourceName string) upstreamLogRow {
 	rawJSONBytes, _ := json.Marshal(item)
 	sourceLogID := toString(item["id"])
 	requestID := firstStringValue(item, "request_id", "requestId")
+	sourceURL = strings.TrimRight(strings.TrimSpace(firstNonEmptyString(sourceURL, firstStringValue(item, "source_url", "sourceUrl"))), "/")
+	sourceName = strings.TrimSpace(firstNonEmptyString(sourceName, firstStringValue(item, "source_name", "sourceName")))
+	sourceHash := sourceFingerprint(sourceURL)
 	sourceKey := ""
 	if sourceLogID != "" && sourceLogID != "0" {
-		sourceKey = "id:" + sourceLogID
+		sourceKey = "src:" + sourceHash + ":id:" + sourceLogID
 	} else if requestID != "" {
-		sourceKey = "request:" + requestID
+		sourceKey = "src:" + sourceHash + ":request:" + requestID
 	} else {
-		hash := sha1.Sum(rawJSONBytes)
+		hash := sha1.Sum([]byte(sourceURL + "\x00" + string(rawJSONBytes)))
 		sourceKey = "sha1:" + hex.EncodeToString(hash[:])
 	}
 	other := item["other"]
@@ -1153,6 +1248,8 @@ func normalizeUpstreamLogRow(item map[string]interface{}, importedAt int64) upst
 
 	return upstreamLogRow{
 		SourceKey:        sourceKey,
+		SourceURL:        sourceURL,
+		SourceName:       sourceName,
 		SourceLogID:      sourceLogID,
 		CreatedAt:        firstInt64Value(item, "created_at", "createdAt", "timestamp"),
 		Type:             int(firstInt64Value(item, "type")),
@@ -1197,6 +1294,25 @@ func firstInt64Value(item map[string]interface{}, keys ...string) int64 {
 
 func firstFloat64Value(item map[string]interface{}, keys ...string) float64 {
 	return toFloat64(firstValue(item, keys...))
+}
+
+func sourceFingerprint(sourceURL string) string {
+	sourceURL = strings.TrimRight(strings.TrimSpace(sourceURL), "/")
+	if sourceURL == "" {
+		sourceURL = "unknown"
+	}
+	hash := sha1.Sum([]byte(sourceURL))
+	return hex.EncodeToString(hash[:])[:12]
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (s *UpstreamLogSyncService) markRunFinished(cfg UpstreamLogSyncConfig, imported int, runErr error) error {
