@@ -67,6 +67,7 @@ Go 版 NewAPI Tools 已迁入基础日志对账能力：
 - 上游 CSV 可以在 `日志对账` 页手动上传，也可以由 userscript 导出后上传到 Tools 暂存区。
 - `POST /api/log-match/uploads`：上传上游 CSV 到 `DATA_DIR/log_match_uploads`。
 - `GET /api/log-match/uploads`：列出已上传 CSV，供前端勾选。
+- `GET/POST /api/log-match/upload-key`：在前端管理日志上传专用 Key；该 Key 仅可调用 `POST /api/log-match/uploads`，不会获得全局 `API_KEY` 权限。
 - `POST /api/log-match/analyze`：混合使用已上传文件和本次手动选择文件进行分析。
 
 已经迁入的核心逻辑：
@@ -78,4 +79,6 @@ Go 版 NewAPI Tools 已迁入基础日志对账能力：
 - 按上游、渠道、模型、按次价格的汇总
 - 后续新增实时映射表，实现真正精确匹配
 
-userscript 只上传导出的 CSV 和来源信息，不保存上游登录态，也不启动后台拉取任务。
+userscript 1.2.15 只上传导出的 CSV 和来源信息，不保存上游登录态，也不启动后台拉取任务。推荐在“日志对账”的“脚本上传接入”区生成上传专用 Key，再填入脚本的 `上传专用 Key / Bearer JWT`。
+
+Zeabur 部署时，建议将后端 `DATA_DIR` 设置到挂载目录，例如 `/app/data`。上传专用 Key 会保存到 `DATA_DIR/log_match_upload_key.json`，脚本上传的 CSV 会保存到 `DATA_DIR/log_match_uploads/`。

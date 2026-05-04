@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NewAPI 日志导出助手
 // @namespace    https://newapi.youkies.space/
-// @version      1.2.14
-// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出和上传到 NewAPI Tools 日志对账
+// @version      1.2.15
+// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出和使用上传专用 Key 上传到 NewAPI Tools 日志对账
 // @author       Youkies
 // @match        *://*/*
 // @grant        none
@@ -680,7 +680,7 @@
       throw new Error("已启用上传，但未填写 NewAPI Tools 地址");
     }
     if (!toolsOptions.apiKey) {
-      throw new Error("已启用上传，但未填写 NewAPI Tools API Key/JWT");
+      throw new Error("已启用上传，但未填写 NewAPI Tools 上传专用 Key/JWT");
     }
 
     const form = new FormData();
@@ -1112,11 +1112,11 @@
               <input type="text" id="lex-tools-url" value="${escapeAttr(tools.toolsUrl)}" placeholder="https://tools.example.com">
             </div>
             <div class="lex-field">
-              <label for="lex-tools-key">Tools API Key / Bearer JWT</label>
-              <input type="password" id="lex-tools-key" value="${escapeAttr(tools.apiKey)}" placeholder="填写 tools 的 API_KEY">
+              <label for="lex-tools-key">上传专用 Key / Bearer JWT</label>
+              <input type="password" id="lex-tools-key" value="${escapeAttr(tools.apiKey)}" placeholder="填写日志对账页生成的上传专用 Key">
             </div>
           </div>
-          <div class="lex-hint">仅上传本次导出的 CSV 到 Tools 暂存区，不保存当前站点登录态。</div>
+          <div class="lex-hint">仅上传本次导出的 CSV 到 Tools 暂存区；推荐使用日志对账页生成的上传专用 Key。</div>
 
           <div class="lex-actions">
             <button class="lex-btn lex-btn-secondary" id="lex-btn-sync" type="button" title="从页面当前筛选条件同步">同步页面筛选</button>

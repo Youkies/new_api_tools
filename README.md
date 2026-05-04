@@ -79,6 +79,7 @@ bash <(curl -sSL https://raw.githubusercontent.com/james-6-23/new_api_tools/main
 | `API_KEY` | 后端 API 密钥（可选） | - |
 | `JWT_SECRET` | JWT 签名密钥 | `random_string` |
 | `JWT_EXPIRE_HOURS` | JWT 过期时间（小时） | `24` |
+| `DATA_DIR` | 本地持久化目录（脚本上传 CSV、日志对账上传专用 Key） | `/app/data`（Zeabur 挂载目录） |
 | **数据库配置** | | |
 | `DB_ENGINE` | 数据库类型 | `postgres` 或 `mysql` |
 | `DB_DNS` | 数据库地址 (Docker网络名或IP) | `new-api-db` |

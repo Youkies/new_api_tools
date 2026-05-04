@@ -17,5 +17,6 @@
 - 2026-05-04 先以本地 CLI 方式重启上游日志对账方向：`scripts/newapi_log_matcher.py` 读取导出的 `newapi_logs_{host}_{date}.csv`，通过渠道 alias 映射上游、标准化模型名，并按 `输入Tokens + 输出Tokens + 总Tokens + 时间窗口` 做一对一高置信匹配；默认规则在 `scripts/newapi_log_rules.example.json`，其中 `api.opusclaw.me` 按 1:10 充值比例配置 `cost_multiplier=0.1`。工具输出 `report.html` 静态 UI，可按本站模型、本站渠道、状态、上游筛选查看每条本地日志；该工具不接数据库和后台，后续稳定后再迁入 NewAPI Tools。
 - 2026-05-04 已将日志对账迁入 Go 版 NewAPI Tools：新增 `/api/log-match/analyze`，Youkies/本站日志直接从 `logs` 数据库按时间范围读取消费日志，上游日志由用户上传 CSV；匹配口径沿用本地工具（渠道 alias -> 上游、标准化模型、tokens + 时间窗口），前端新增 `日志对账` 页面，支持勾选本站渠道和本站模型筛选每条匹配状态。
 - 2026-05-04 日志对账新增轻量上传链路：Go 后端提供 `/api/log-match/uploads` 暂存上游 CSV 到 `DATA_DIR/log_match_uploads`，前端 `日志对账` 页可勾选已上传文件参与分析；userscript 1.2.14 恢复“导出后上传到 NewAPI Tools 日志对账”，但不保存上游登录态、不做后台定时拉取。
+- 2026-05-04 `日志对账` 页新增“脚本上传接入”配置区：显示 Tools 地址和上传接口 `/api/log-match/uploads`，并可在前端生成/修改/复制日志上传专用 Key；该 Key 持久化在 `DATA_DIR/log_match_upload_key.json`，只允许调用 `POST /api/log-match/uploads`，不会拥有全局 `API_KEY` 权限。Zeabur 挂载目录按 `/app/data` 使用时，应设置后端 `DATA_DIR=/app/data`。
 - 用户确认偏好：功能完成并验证通过后，默认自动提交并 push 当前分支；提交前仍需检查 `git status` 和 diff 范围，避免带入无关改动。
 - 常用验证命令：`go test ./...`（在 `backend/`）、`python -m py_compile ...`、`npm run build`（在 `frontend/`）。

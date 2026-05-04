@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { AlertTriangle, CheckCircle2, Database, FileSearch, FileText, Loader2, RefreshCw, Search, Trash2, Upload, XCircle } from 'lucide-react'
+import { AlertTriangle, CheckCircle2, Copy, Database, FileSearch, FileText, Loader2, RefreshCw, Search, Trash2, Upload, XCircle } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { Badge } from './ui/badge'
@@ -97,6 +97,14 @@ interface StoredUpload {
   rows: number
   size: number
   uploaded_at: number
+}
+
+interface UploadKeyConfig {
+  configured: boolean
+  key: string
+  masked_key: string
+  updated_at: number
+  data_dir: string
 }
 
 interface LogMatchResult {
@@ -227,6 +235,11 @@ export function LogMatcher() {
   const { token } = useAuth()
   const { showToast } = useToast()
   const apiUrl = import.meta.env.VITE_API_URL || ''
+  const toolsBaseUrl = useMemo(() => {
+    const base = apiUrl || window.location.origin
+    return base.replace(/\/+$/, '')
+  }, [apiUrl])
+  const uploadEndpoint = `${toolsBaseUrl}/api/log-match/uploads`
 
   const [startTime, setStartTime] = useState(defaultStartValue)
   const [endTime, setEndTime] = useState(defaultEndValue)
@@ -248,6 +261,12 @@ export function LogMatcher() {
   const [search, setSearch] = useState('')
   const [selectedChannels, setSelectedChannels] = useState<string[]>([])
   const [selectedModels, setSelectedModels] = useState<string[]>([])
+  const [uploadKey, setUploadKey] = useState('')
+  const [uploadKeyConfigured, setUploadKeyConfigured] = useState(false)
+  const [uploadKeyUpdatedAt, setUploadKeyUpdatedAt] = useState(0)
+  const [uploadKeyDataDir, setUploadKeyDataDir] = useState('')
+  const [uploadKeyLoading, setUploadKeyLoading] = useState(false)
+  const [uploadKeySaving, setUploadKeySaving] = useState(false)
 
   const channelOptions = useMemo(() => uniqueSorted(result?.records.map((record) => record.local_channel) || []), [result])
   const modelOptions = useMemo(() => uniqueSorted(result?.records.map((record) => record.local_model) || []), [result])
@@ -285,9 +304,77 @@ export function LogMatcher() {
     ? Math.round((result.summary.matched_rows / result.summary.local_rows) * 100)
     : 0
 
+  const copyText = useCallback(async (value: string, label: string) => {
+    if (!value) {
+      showToast('error', `${label}为空`)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(value)
+      showToast('success', `已复制${label}`)
+    } catch (_) {
+      showToast('error', `复制${label}失败`)
+    }
+  }, [showToast])
+
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
     setFiles(Array.from(event.target.files || []))
   }
+
+  const applyUploadKeyConfig = (data: UploadKeyConfig) => {
+    setUploadKey(data.key || '')
+    setUploadKeyConfigured(Boolean(data.configured))
+    setUploadKeyUpdatedAt(Number(data.updated_at || 0))
+    setUploadKeyDataDir(data.data_dir || '')
+  }
+
+  const fetchUploadKey = useCallback(async () => {
+    setUploadKeyLoading(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/log-match/upload-key`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || !payload?.success) {
+        throw new Error(errorMessage(payload, '加载上传专用 Key 失败'))
+      }
+      applyUploadKeyConfig(payload.data as UploadKeyConfig)
+    } catch (error) {
+      showToast('error', error instanceof Error ? error.message : '加载上传专用 Key 失败')
+    } finally {
+      setUploadKeyLoading(false)
+    }
+  }, [apiUrl, showToast, token])
+
+  useEffect(() => {
+    fetchUploadKey()
+  }, [fetchUploadKey])
+
+  const saveUploadKey = useCallback(async (generate = false) => {
+    setUploadKeySaving(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/log-match/upload-key`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify(generate ? { generate: true } : { key: uploadKey.trim() }),
+      })
+      const payload = await response.json().catch(() => null)
+      if (!response.ok || !payload?.success) {
+        throw new Error(errorMessage(payload, '保存上传专用 Key 失败'))
+      }
+      applyUploadKeyConfig(payload.data as UploadKeyConfig)
+      showToast('success', generate ? '已生成上传专用 Key' : uploadKey.trim() ? '上传专用 Key 已保存' : '已关闭上传专用 Key')
+    } catch (error) {
+      showToast('error', error instanceof Error ? error.message : '保存上传专用 Key 失败')
+    } finally {
+      setUploadKeySaving(false)
+    }
+  }, [apiUrl, showToast, token, uploadKey])
 
   const fetchStoredUploads = useCallback(async () => {
     setUploadsLoading(true)
@@ -415,6 +502,76 @@ export function LogMatcher() {
           开始分析
         </Button>
       </div>
+
+      <Card>
+        <CardHeader className="pb-3">
+          <CardTitle className="text-base">脚本上传接入</CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="rounded-md border border-border/60 bg-muted/20 p-3">
+              <div className="mb-2 text-xs font-medium text-muted-foreground">NewAPI Tools 地址</div>
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 break-all rounded bg-background px-2 py-1.5 text-xs">{toolsBaseUrl}</code>
+                <Button variant="outline" size="icon" className="h-8 w-8 shrink-0" title="复制 Tools 地址" onClick={() => copyText(toolsBaseUrl, 'Tools 地址')}>
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+            <div className="rounded-md border border-border/60 bg-muted/20 p-3">
+              <div className="mb-2 text-xs font-medium text-muted-foreground">上传接口</div>
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 break-all rounded bg-background px-2 py-1.5 text-xs">{uploadEndpoint}</code>
+                <Button variant="outline" size="icon" className="h-8 w-8 shrink-0" title="复制上传接口" onClick={() => copyText(uploadEndpoint, '上传接口')}>
+                  <Copy className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            </div>
+          </div>
+          <div className="rounded-md border border-border/60 bg-muted/20 p-3">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-medium text-muted-foreground">上传专用 Key</div>
+                <div className="mt-1 text-[11px] text-muted-foreground">
+                  {uploadKeyConfigured ? `已配置${uploadKeyUpdatedAt ? `，更新于 ${new Date(uploadKeyUpdatedAt * 1000).toLocaleString('zh-CN')}` : ''}` : '未配置'}
+                </div>
+              </div>
+              <Button variant="outline" size="sm" className="gap-2" onClick={fetchUploadKey} disabled={uploadKeyLoading || uploadKeySaving}>
+                {uploadKeyLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+                刷新
+              </Button>
+            </div>
+            <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto]">
+              <Input
+                value={uploadKey}
+                onChange={(event) => setUploadKey(event.target.value)}
+                placeholder="点击生成或输入自定义上传 Key"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={uploadKeyLoading || uploadKeySaving}
+              />
+              <div className="flex flex-wrap gap-2">
+                <Button variant="outline" size="sm" onClick={() => saveUploadKey(true)} disabled={uploadKeySaving}>
+                  生成
+                </Button>
+                <Button variant="outline" size="sm" onClick={() => saveUploadKey(false)} disabled={uploadKeySaving}>
+                  保存
+                </Button>
+                <Button variant="outline" size="sm" className="gap-2" onClick={() => copyText(uploadKey.trim(), '上传专用 Key')} disabled={!uploadKey.trim()}>
+                  <Copy className="h-3.5 w-3.5" />
+                  复制
+                </Button>
+              </div>
+            </div>
+            <div className="mt-2 text-xs text-muted-foreground">
+              脚本里的 Tools API Key / Bearer JWT 填这个上传专用 Key。它只允许上传 CSV 到日志对账，持久化在后端 DATA_DIR{uploadKeyDataDir ? `（当前 ${uploadKeyDataDir}）` : ''}。
+            </div>
+          </div>
+          <div className="text-xs text-muted-foreground">
+            Zeabur 挂载目录使用 `/app/data` 时，将后端环境变量 `DATA_DIR` 设置为 `/app/data`，上传专用 Key 和脚本上传的 CSV 都会随挂载目录保留。
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader className="pb-3">

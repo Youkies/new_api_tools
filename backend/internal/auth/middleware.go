@@ -50,12 +50,25 @@ func AuthMiddleware() gin.HandlerFunc {
 				c.Next()
 				return
 			}
+			if isLogMatchUploadRequest(c.Request.Method, path) && VerifyLogMatchUploadKey(apiKey) {
+				c.Set("auth_method", "log_match_upload_key")
+				c.Next()
+				return
+			}
 
 			logger.L.Warn("Invalid API key for request: "+c.Request.Method+" "+path, logger.CatAuth)
 			c.AbortWithStatusJSON(http.StatusUnauthorized, models.NewErrorResponse(
 				"UNAUTHORIZED",
 				"Invalid API key",
 			))
+			return
+		}
+
+		// Allow the upload-only key for userscript CSV uploads.
+		uploadKey := c.GetHeader("X-Log-Match-Upload-Key")
+		if uploadKey != "" && isLogMatchUploadRequest(c.Request.Method, path) && VerifyLogMatchUploadKey(uploadKey) {
+			c.Set("auth_method", "log_match_upload_key")
+			c.Next()
 			return
 		}
 
@@ -91,4 +104,8 @@ func AuthMiddleware() gin.HandlerFunc {
 			"Authentication required (API Key or JWT Token)",
 		))
 	}
+}
+
+func isLogMatchUploadRequest(method string, path string) bool {
+	return method == http.MethodPost && path == "/api/log-match/uploads"
 }
