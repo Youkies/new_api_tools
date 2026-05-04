@@ -26,7 +26,9 @@ const (
 
 // UpstreamLogSyncConfig stores upstream NewAPI log import settings.
 type UpstreamLogSyncConfig struct {
+	ID                    int64  `json:"id"`
 	Enabled               bool   `json:"enabled"`
+	SourceName            string `json:"source_name"`
 	BaseURL               string `json:"base_url"`
 	Endpoint              string `json:"endpoint"`
 	AuthToken             string `json:"auth_token,omitempty"`
@@ -110,20 +112,22 @@ func StartBackgroundUpstreamLogSync(stop <-chan struct{}) {
 		for {
 			select {
 			case <-ticker.C:
-				cfg, err := svc.GetConfig(false)
+				configs, err := svc.ListConfigs(true)
 				if err != nil {
 					logger.L.Warn("读取上游日志同步配置失败: "+err.Error(), logger.CatDatabase)
 					continue
 				}
-				if !cfg.Enabled || cfg.IntervalMinutes <= 0 || cfg.BaseURL == "" {
-					continue
-				}
 				now := time.Now().Unix()
-				if cfg.LastSyncAt > 0 && now-cfg.LastSyncAt < int64(cfg.IntervalMinutes*60) {
-					continue
-				}
-				if _, err := svc.RunSync(UpstreamLogSyncRunOptions{}); err != nil {
-					logger.L.Warn("上游日志定时同步失败: "+err.Error(), logger.CatBusiness)
+				for _, cfg := range configs {
+					if !cfg.Enabled || cfg.IntervalMinutes <= 0 || cfg.BaseURL == "" || strings.TrimSpace(cfg.AuthToken) == "" {
+						continue
+					}
+					if cfg.LastSyncAt > 0 && now-cfg.LastSyncAt < int64(cfg.IntervalMinutes*60) {
+						continue
+					}
+					if _, err := svc.RunSyncForConfig(cfg, UpstreamLogSyncRunOptions{}); err != nil {
+						logger.L.Warn(fmt.Sprintf("上游日志定时同步失败: id=%d base_url=%s err=%s", cfg.ID, cfg.BaseURL, err.Error()), logger.CatBusiness)
+					}
 				}
 			case <-stop:
 				logger.L.System("上游日志同步后台任务已停止")
@@ -140,6 +144,7 @@ func (s *UpstreamLogSyncService) EnsureTables() error {
 			CREATE TABLE IF NOT EXISTS api_tools_upstream_log_sync_config (
 				id INTEGER PRIMARY KEY,
 				enabled BOOLEAN NOT NULL DEFAULT FALSE,
+				source_name TEXT NOT NULL DEFAULT '',
 				base_url TEXT NOT NULL DEFAULT '',
 				endpoint TEXT NOT NULL DEFAULT 'auto',
 				auth_token TEXT NOT NULL DEFAULT '',
@@ -213,6 +218,7 @@ func (s *UpstreamLogSyncService) EnsureTables() error {
 		CREATE TABLE IF NOT EXISTS api_tools_upstream_log_sync_config (
 			id INT PRIMARY KEY,
 			enabled TINYINT(1) NOT NULL DEFAULT 0,
+			source_name VARCHAR(191) NOT NULL DEFAULT '',
 			base_url TEXT NOT NULL,
 			endpoint VARCHAR(64) NOT NULL DEFAULT 'auto',
 			auth_token TEXT NOT NULL,
@@ -284,6 +290,12 @@ func (s *UpstreamLogSyncService) ensureSchemaColumns() error {
 		pgDDL string
 		myDDL string
 	}{
+		{
+			table: "api_tools_upstream_log_sync_config",
+			name:  "source_name",
+			pgDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN source_name TEXT NOT NULL DEFAULT ''",
+			myDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN source_name VARCHAR(191) NOT NULL DEFAULT ''",
+		},
 		{
 			table: "api_tools_upstream_log_sync_config",
 			name:  "match_tolerance_seconds",
@@ -383,6 +395,7 @@ func (s *UpstreamLogSyncService) indexExists(tableName, indexName string) bool {
 
 func defaultUpstreamLogSyncConfig() UpstreamLogSyncConfig {
 	return UpstreamLogSyncConfig{
+		ID:                    upstreamSyncConfigID,
 		Endpoint:              "auto",
 		PageSize:              100,
 		RequestDelayMS:        80,
@@ -397,46 +410,96 @@ func defaultUpstreamLogSyncConfig() UpstreamLogSyncConfig {
 
 // GetConfig returns upstream log sync config. Secrets are masked unless includeSecret is true.
 func (s *UpstreamLogSyncService) GetConfig(includeSecret bool) (UpstreamLogSyncConfig, error) {
+	return s.GetConfigByID(upstreamSyncConfigID, includeSecret)
+}
+
+// GetConfigByID returns one upstream log sync config. Secrets are masked unless includeSecret is true.
+func (s *UpstreamLogSyncService) GetConfigByID(id int64, includeSecret bool) (UpstreamLogSyncConfig, error) {
+	if id <= 0 {
+		id = upstreamSyncConfigID
+	}
 	if err := s.EnsureTables(); err != nil {
 		return UpstreamLogSyncConfig{}, err
 	}
 
 	row, err := s.db.QueryOne(s.db.RebindQuery(`
-		SELECT enabled, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
+		SELECT id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
 			interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
 			last_sync_at, last_success_at, last_error, total_imported, updated_at
 		FROM api_tools_upstream_log_sync_config
-		WHERE id = ?`), upstreamSyncConfigID)
+		WHERE id = ?`), id)
 	if err != nil {
 		return UpstreamLogSyncConfig{}, err
 	}
 	cfg := defaultUpstreamLogSyncConfig()
+	cfg.ID = id
 	if row != nil {
-		cfg.Enabled = toBool(row["enabled"])
-		cfg.BaseURL = toString(row["base_url"])
-		cfg.Endpoint = toString(row["endpoint"])
-		cfg.AuthToken = toString(row["auth_token"])
-		cfg.UserID = toString(row["user_id"])
-		cfg.PageSize = int(toInt64(row["page_size"]))
-		cfg.RequestDelayMS = int(toInt64(row["request_delay_ms"]))
-		cfg.IntervalMinutes = int(toInt64(row["interval_minutes"]))
-		cfg.LookbackMinutes = int(toInt64(row["lookback_minutes"]))
-		cfg.OverlapMinutes = int(toInt64(row["overlap_minutes"]))
-		cfg.MatchToleranceSeconds = int(toInt64(row["match_tolerance_seconds"]))
-		cfg.LogType = int(toInt64(row["log_type"]))
-		cfg.MaxPagesPerRun = int(toInt64(row["max_pages_per_run"]))
-		cfg.LastSyncAt = toInt64(row["last_sync_at"])
-		cfg.LastSuccessAt = toInt64(row["last_success_at"])
-		cfg.LastError = toString(row["last_error"])
-		cfg.TotalImported = toInt64(row["total_imported"])
-		cfg.UpdatedAt = toInt64(row["updated_at"])
+		cfg = upstreamSyncConfigFromRow(row)
 	}
 	cfg = normalizeUpstreamSyncConfig(cfg)
+	maskUpstreamConfigSecret(&cfg, includeSecret)
+	return cfg, nil
+}
+
+// ListConfigs returns all stored upstream log sync configs.
+func (s *UpstreamLogSyncService) ListConfigs(includeSecret bool) ([]UpstreamLogSyncConfig, error) {
+	if err := s.EnsureTables(); err != nil {
+		return nil, err
+	}
+
+	rows, err := s.db.Query(s.db.RebindQuery(`
+		SELECT id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
+			interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
+			last_sync_at, last_success_at, last_error, total_imported, updated_at
+		FROM api_tools_upstream_log_sync_config
+		ORDER BY id ASC`))
+	if err != nil {
+		return nil, err
+	}
+
+	configs := make([]UpstreamLogSyncConfig, 0, len(rows))
+	for _, row := range rows {
+		cfg := upstreamSyncConfigFromRow(row)
+		cfg = normalizeUpstreamSyncConfig(cfg)
+		maskUpstreamConfigSecret(&cfg, includeSecret)
+		configs = append(configs, cfg)
+	}
+	return configs, nil
+}
+
+func upstreamSyncConfigFromRow(row map[string]interface{}) UpstreamLogSyncConfig {
+	cfg := defaultUpstreamLogSyncConfig()
+	cfg.ID = toInt64(row["id"])
+	if cfg.ID <= 0 {
+		cfg.ID = upstreamSyncConfigID
+	}
+	cfg.Enabled = toBool(row["enabled"])
+	cfg.SourceName = toString(row["source_name"])
+	cfg.BaseURL = toString(row["base_url"])
+	cfg.Endpoint = toString(row["endpoint"])
+	cfg.AuthToken = toString(row["auth_token"])
+	cfg.UserID = toString(row["user_id"])
+	cfg.PageSize = int(toInt64(row["page_size"]))
+	cfg.RequestDelayMS = int(toInt64(row["request_delay_ms"]))
+	cfg.IntervalMinutes = int(toInt64(row["interval_minutes"]))
+	cfg.LookbackMinutes = int(toInt64(row["lookback_minutes"]))
+	cfg.OverlapMinutes = int(toInt64(row["overlap_minutes"]))
+	cfg.MatchToleranceSeconds = int(toInt64(row["match_tolerance_seconds"]))
+	cfg.LogType = int(toInt64(row["log_type"]))
+	cfg.MaxPagesPerRun = int(toInt64(row["max_pages_per_run"]))
+	cfg.LastSyncAt = toInt64(row["last_sync_at"])
+	cfg.LastSuccessAt = toInt64(row["last_success_at"])
+	cfg.LastError = toString(row["last_error"])
+	cfg.TotalImported = toInt64(row["total_imported"])
+	cfg.UpdatedAt = toInt64(row["updated_at"])
+	return cfg
+}
+
+func maskUpstreamConfigSecret(cfg *UpstreamLogSyncConfig, includeSecret bool) {
 	cfg.AuthTokenSet = strings.TrimSpace(cfg.AuthToken) != ""
 	if !includeSecret {
 		cfg.AuthToken = ""
 	}
-	return cfg, nil
 }
 
 // SaveConfig stores upstream log sync config.
@@ -444,14 +507,92 @@ func (s *UpstreamLogSyncService) SaveConfig(next UpstreamLogSyncConfig) (Upstrea
 	if err := s.EnsureTables(); err != nil {
 		return UpstreamLogSyncConfig{}, err
 	}
+	if next.ID <= 0 {
+		next.ID = upstreamSyncConfigID
+	}
 
-	current, _ := s.GetConfig(true)
+	current, _ := s.GetConfigByID(next.ID, true)
+	return s.saveConfigRecord(next, current)
+}
+
+// RegisterConfig creates or updates a scheduled upstream config from a userscript session.
+func (s *UpstreamLogSyncService) RegisterConfig(next UpstreamLogSyncConfig) (UpstreamLogSyncConfig, error) {
+	if err := s.EnsureTables(); err != nil {
+		return UpstreamLogSyncConfig{}, err
+	}
+
+	next = normalizeUpstreamSyncConfig(next)
+	if err := validateUpstreamBaseURL(next.BaseURL); err != nil {
+		return UpstreamLogSyncConfig{}, err
+	}
+	if strings.TrimSpace(next.AuthToken) == "" {
+		return UpstreamLogSyncConfig{}, fmt.Errorf("upstream auth token is required")
+	}
+
+	next.Enabled = true
+	if next.IntervalMinutes <= 0 {
+		next.IntervalMinutes = 1
+	}
+	if next.LookbackMinutes <= 0 {
+		next.LookbackMinutes = 60
+	}
+	if next.OverlapMinutes <= 0 {
+		next.OverlapMinutes = 10
+	}
+	if next.MatchToleranceSeconds <= 0 {
+		next.MatchToleranceSeconds = 60
+	}
+	if next.PageSize <= 0 {
+		next.PageSize = 100
+	}
+	if next.RequestDelayMS <= 0 {
+		next.RequestDelayMS = 80
+	}
+	if next.LogType <= 0 {
+		next.LogType = 2
+	}
+	if next.MaxPagesPerRun <= 0 {
+		next.MaxPagesPerRun = 1000
+	}
+
+	current, found, err := s.findConfigByBaseURL(next.BaseURL)
+	if err != nil {
+		return UpstreamLogSyncConfig{}, err
+	}
+	if !found {
+		current, found, err = s.findReusableEmptyConfig()
+		if err != nil {
+			return UpstreamLogSyncConfig{}, err
+		}
+	}
+	if found {
+		next.ID = current.ID
+	} else {
+		id, err := s.nextConfigID()
+		if err != nil {
+			return UpstreamLogSyncConfig{}, err
+		}
+		next.ID = id
+		current = defaultUpstreamLogSyncConfig()
+		current.ID = id
+	}
+	if strings.TrimSpace(next.SourceName) == "" {
+		next.SourceName = firstNonEmptyString(current.SourceName, upstreamDisplayNameFromURL(next.BaseURL), next.BaseURL)
+	}
+	return s.saveConfigRecord(next, current)
+}
+
+func (s *UpstreamLogSyncService) saveConfigRecord(next, current UpstreamLogSyncConfig) (UpstreamLogSyncConfig, error) {
+	if next.ID <= 0 {
+		next.ID = upstreamSyncConfigID
+	}
 	if strings.TrimSpace(next.AuthToken) == "" && !next.ClearAuthToken {
 		next.AuthToken = current.AuthToken
 	}
 	if next.ClearAuthToken {
 		next.AuthToken = ""
 	}
+	next.AuthToken = normalizeBearerToken(next.AuthToken)
 	next.LastSyncAt = current.LastSyncAt
 	next.LastSuccessAt = current.LastSuccessAt
 	next.LastError = current.LastError
@@ -461,12 +602,12 @@ func (s *UpstreamLogSyncService) SaveConfig(next UpstreamLogSyncConfig) (Upstrea
 
 	query := `
 		INSERT INTO api_tools_upstream_log_sync_config
-			(id, enabled, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
+			(id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
 			 interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
 			 last_sync_at, last_success_at, last_error, total_imported, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	args := []interface{}{
-		upstreamSyncConfigID, next.Enabled, next.BaseURL, next.Endpoint, next.AuthToken, next.UserID,
+		next.ID, next.Enabled, next.SourceName, next.BaseURL, next.Endpoint, next.AuthToken, next.UserID,
 		next.PageSize, next.RequestDelayMS, next.IntervalMinutes, next.LookbackMinutes,
 		next.OverlapMinutes, next.MatchToleranceSeconds, next.LogType, next.MaxPagesPerRun, next.LastSyncAt, next.LastSuccessAt,
 		next.LastError, next.TotalImported, next.UpdatedAt,
@@ -475,6 +616,7 @@ func (s *UpstreamLogSyncService) SaveConfig(next UpstreamLogSyncConfig) (Upstrea
 		query += `
 			ON CONFLICT (id) DO UPDATE SET
 				enabled = EXCLUDED.enabled,
+				source_name = EXCLUDED.source_name,
 				base_url = EXCLUDED.base_url,
 				endpoint = EXCLUDED.endpoint,
 				auth_token = EXCLUDED.auth_token,
@@ -496,6 +638,7 @@ func (s *UpstreamLogSyncService) SaveConfig(next UpstreamLogSyncConfig) (Upstrea
 		query += `
 			ON DUPLICATE KEY UPDATE
 				enabled = VALUES(enabled),
+				source_name = VALUES(source_name),
 				base_url = VALUES(base_url),
 				endpoint = VALUES(endpoint),
 				auth_token = VALUES(auth_token),
@@ -517,10 +660,83 @@ func (s *UpstreamLogSyncService) SaveConfig(next UpstreamLogSyncConfig) (Upstrea
 	if _, err := s.db.Execute(s.db.RebindQuery(query), args...); err != nil {
 		return UpstreamLogSyncConfig{}, err
 	}
-	return s.GetConfig(false)
+	return s.GetConfigByID(next.ID, false)
+}
+
+func (s *UpstreamLogSyncService) findConfigByBaseURL(baseURL string) (UpstreamLogSyncConfig, bool, error) {
+	normalized := normalizeUpstreamSyncConfig(UpstreamLogSyncConfig{BaseURL: baseURL}).BaseURL
+	configs, err := s.ListConfigs(true)
+	if err != nil {
+		return UpstreamLogSyncConfig{}, false, err
+	}
+	for _, cfg := range configs {
+		if normalizeUpstreamSyncConfig(cfg).BaseURL == normalized {
+			return cfg, true, nil
+		}
+	}
+	return UpstreamLogSyncConfig{}, false, nil
+}
+
+func (s *UpstreamLogSyncService) findReusableEmptyConfig() (UpstreamLogSyncConfig, bool, error) {
+	configs, err := s.ListConfigs(true)
+	if err != nil {
+		return UpstreamLogSyncConfig{}, false, err
+	}
+	for _, cfg := range configs {
+		if strings.TrimSpace(cfg.BaseURL) == "" {
+			return cfg, true, nil
+		}
+	}
+	return UpstreamLogSyncConfig{}, false, nil
+}
+
+func (s *UpstreamLogSyncService) nextConfigID() (int64, error) {
+	row, err := s.db.QueryOne(`SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM api_tools_upstream_log_sync_config`)
+	if err != nil {
+		return 0, err
+	}
+	if row == nil {
+		return upstreamSyncConfigID, nil
+	}
+	nextID := toInt64(row["next_id"])
+	if nextID <= 0 {
+		nextID = upstreamSyncConfigID
+	}
+	return nextID, nil
+}
+
+func validateUpstreamBaseURL(baseURL string) error {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("valid upstream base_url is required")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("upstream base_url scheme must be http or https")
+	}
+	return nil
+}
+
+func upstreamDisplayNameFromURL(baseURL string) string {
+	parsed, err := url.Parse(baseURL)
+	if err != nil || parsed.Host == "" {
+		return ""
+	}
+	return parsed.Host
+}
+
+func normalizeBearerToken(token string) string {
+	token = strings.TrimSpace(token)
+	if strings.HasPrefix(strings.ToLower(token), "bearer ") {
+		return strings.TrimSpace(token[7:])
+	}
+	return token
 }
 
 func normalizeUpstreamSyncConfig(cfg UpstreamLogSyncConfig) UpstreamLogSyncConfig {
+	if cfg.ID <= 0 {
+		cfg.ID = upstreamSyncConfigID
+	}
+	cfg.SourceName = strings.TrimSpace(cfg.SourceName)
 	cfg.BaseURL = strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 	cfg.Endpoint = strings.TrimSpace(cfg.Endpoint)
 	if cfg.Endpoint == "" {
@@ -537,6 +753,8 @@ func normalizeUpstreamSyncConfig(cfg UpstreamLogSyncConfig) UpstreamLogSyncConfi
 	cfg.MatchToleranceSeconds = clampIntValue(cfg.MatchToleranceSeconds, 1, 3600, 60)
 	cfg.LogType = clampIntValue(cfg.LogType, 0, 9, 2)
 	cfg.MaxPagesPerRun = clampIntValue(cfg.MaxPagesPerRun, 1, 100000, 1000)
+	cfg.UserID = strings.TrimSpace(cfg.UserID)
+	cfg.AuthToken = normalizeBearerToken(cfg.AuthToken)
 	return cfg
 }
 
@@ -555,10 +773,16 @@ func clampIntValue(value, minVal, maxVal, fallback int) int {
 
 // RunSync fetches upstream logs and upserts them into api_tools_upstream_logs.
 func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[string]interface{}, error) {
-	cfg, err := s.GetConfig(true)
+	cfg, err := s.GetConfigByID(upstreamSyncConfigID, true)
 	if err != nil {
 		return nil, err
 	}
+	return s.RunSyncForConfig(cfg, opts)
+}
+
+// RunSyncForConfig fetches upstream logs for a specific stored config.
+func (s *UpstreamLogSyncService) RunSyncForConfig(cfg UpstreamLogSyncConfig, opts UpstreamLogSyncRunOptions) (map[string]interface{}, error) {
+	cfg = normalizeUpstreamSyncConfig(cfg)
 	if cfg.BaseURL == "" {
 		err := fmt.Errorf("upstream base_url is required")
 		s.markRunFinished(cfg, 0, err)
@@ -595,7 +819,8 @@ func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[st
 	totalUpserted := 0
 	totalRecords := extractUpstreamTotal(firstResp)
 	items := extractUpstreamItems(firstResp)
-	upserted, err := s.upsertImportedLogs(items, cfg.BaseURL, "scheduled")
+	sourceName := firstNonEmptyString(cfg.SourceName, upstreamDisplayNameFromURL(cfg.BaseURL), "scheduled")
+	upserted, err := s.upsertImportedLogs(items, cfg.BaseURL, sourceName)
 	if err != nil {
 		s.markRunFinished(cfg, 0, err)
 		return nil, err
@@ -627,7 +852,7 @@ func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[st
 		if len(pageItems) == 0 {
 			break
 		}
-		upserted, err := s.upsertImportedLogs(pageItems, cfg.BaseURL, "scheduled")
+		upserted, err := s.upsertImportedLogs(pageItems, cfg.BaseURL, sourceName)
 		if err != nil {
 			s.markRunFinished(cfg, totalUpserted, err)
 			return nil, err
@@ -646,7 +871,9 @@ func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[st
 		return nil, err
 	}
 	logger.L.Business(fmt.Sprintf(
-		"上游日志同步完成: endpoint=%s fetched=%d upserted=%d matched=%d",
+		"上游日志同步完成: id=%d base_url=%s endpoint=%s fetched=%d upserted=%d matched=%d",
+		cfg.ID,
+		cfg.BaseURL,
 		endpoint,
 		totalFetched,
 		totalUpserted,
@@ -655,6 +882,9 @@ func (s *UpstreamLogSyncService) RunSync(opts UpstreamLogSyncRunOptions) (map[st
 
 	return map[string]interface{}{
 		"success":       true,
+		"config_id":     cfg.ID,
+		"source_url":    cfg.BaseURL,
+		"source_name":   sourceName,
 		"endpoint":      endpoint,
 		"start_time":    startTime,
 		"end_time":      endTime,
@@ -1317,6 +1547,10 @@ func firstNonEmptyString(values ...string) string {
 
 func (s *UpstreamLogSyncService) markRunFinished(cfg UpstreamLogSyncConfig, imported int, runErr error) error {
 	now := time.Now().Unix()
+	configID := cfg.ID
+	if configID <= 0 {
+		configID = upstreamSyncConfigID
+	}
 	lastError := ""
 	lastSuccessAt := cfg.LastSuccessAt
 	totalImported := cfg.TotalImported + int64(imported)
@@ -1329,7 +1563,7 @@ func (s *UpstreamLogSyncService) markRunFinished(cfg UpstreamLogSyncConfig, impo
 		UPDATE api_tools_upstream_log_sync_config
 		SET last_sync_at = ?, last_success_at = ?, last_error = ?, total_imported = ?, updated_at = ?
 		WHERE id = ?`)
-	_, err := s.db.Execute(query, now, lastSuccessAt, lastError, totalImported, now, upstreamSyncConfigID)
+	_, err := s.db.Execute(query, now, lastSuccessAt, lastError, totalImported, now, configID)
 	return err
 }
 

@@ -17,13 +17,16 @@
 - 前端成本核算页新增“上游日志同步”配置区、手动同步按钮、匹配率和导入/规则成本拆分展示。
 - Go 后端新增 `POST /api/cost/upstream-sync/upload`，支持 userscript 上传已导出的上游原始日志，并保存 `source_url`/`source_name` 后立即执行一对一匹配。
 - `NewAPI 日志导出助手-1.2.2.user.js` 已改造为 1.2.3：导出后可填写 NewAPI Tools 地址和 `API_KEY`/Bearer JWT，上传日志到 tools 后台自动匹配。
+- Go 后端新增 `POST /api/cost/upstream-sync/register`：脚本可显式上传当前上游 `base_url`、`source_name`、`auth_token`、`user_id` 和后台拉取间隔，后端按 `base_url` 建/更新多上游同步配置。
+- Go 后台上游同步从单配置轮询改为扫描所有已启用配置；每个上游按自己的 `interval_minutes`、`lookback_minutes`、`overlap_minutes` 拉取，并继续通过 `source_url` 指纹去重。
+- `NewAPI 日志导出助手-1.2.2.user.js` 已升级为 1.2.4：新增“保存当前上游登录态供 Tools 后台定时拉取”显式勾选项和拉取间隔输入；未勾选时不会上传上游 token。
 - Python 兼容后端补齐配置接口和成本汇总对 `api_tools_upstream_logs.local_log_id` 的兼容读取；实际上游抓取同步仍以 Go 后端为正式实现。
 
 ## 验证结果
 
 - `go test ./...`（`backend/`）通过。
-- `python -m py_compile backend-py/app/cost_accounting_service.py backend-py/app/cost_accounting_routes.py` 通过。
-- `npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning。
+- `python -m py_compile backend-py/app/cost_accounting_routes.py` 通过。
+- `node --check "NewAPI 日志导出助手-1.2.2.user.js"` 通过。
 
 ## 注意
 

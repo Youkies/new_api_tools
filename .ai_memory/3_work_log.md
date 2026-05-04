@@ -17,3 +17,4 @@
 - [2026-05-04 13:10] 新增日志分析导出功能：Go/Python `/api/analytics/export` 流式 CSV/JSON 导出和前端导出弹窗；Go 测试、Python 编译、前端构建通过。
 - [2026-05-04 13:37] 新增上游日志同步与成本整合：按真实参考日志确认 Request ID 不匹配，采用 token/time 一对一匹配；Go/Python/前端验证通过。
 - [2026-05-04 13:46] 适配 NewAPI 日志导出助手上传流程：脚本可带上上游网址上传到 tools，Go 后端新增 upload 接口并自动匹配。
+- [2026-05-04 14:10] 新增 userscript 显式注册上游登录态到 Tools：Go 支持多上游配置和后台轮询所有启用上游；Go、Python、脚本语法验证通过。

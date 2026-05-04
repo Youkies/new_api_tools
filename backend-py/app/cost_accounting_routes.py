@@ -21,6 +21,7 @@ class CostRuleRequest(BaseModel):
 
 class UpstreamSyncConfigRequest(BaseModel):
     enabled: bool = False
+    source_name: str = ""
     base_url: str = ""
     endpoint: str = "auto"
     auth_token: str = ""
@@ -32,6 +33,7 @@ class UpstreamSyncConfigRequest(BaseModel):
     interval_minutes: int = 0
     lookback_minutes: int = 60
     overlap_minutes: int = 10
+    match_tolerance_seconds: int = 60
     log_type: int = 2
     max_pages_per_run: int = 1000
 
@@ -116,6 +118,16 @@ def run_upstream_sync(_: UpstreamSyncRunRequest, __: str = Depends(verify_auth))
     }
 
 
+@router.post("/upstream-sync/register")
+def register_upstream_sync_config(_: UpstreamSyncConfigRequest, __: str = Depends(verify_auth)):
+    return {
+        "success": False,
+        "error": {
+            "message": "Python compatibility backend does not implement upstream log registration yet; use the Go backend for scheduled imports.",
+        },
+    }
+
+
 @router.post("/upstream-sync/upload")
 def upload_upstream_logs(_: Dict[str, Any], __: str = Depends(verify_auth)):
     return {
@@ -129,6 +141,7 @@ def upload_upstream_logs(_: Dict[str, Any], __: str = Depends(verify_auth)):
 def _default_upstream_config() -> Dict[str, Any]:
     return {
         "enabled": False,
+        "source_name": "",
         "base_url": "",
         "endpoint": "auto",
         "auth_token": "",
@@ -157,6 +170,7 @@ def _ensure_upstream_config_table(service) -> None:
             CREATE TABLE IF NOT EXISTS api_tools_upstream_log_sync_config (
                 id INTEGER PRIMARY KEY,
                 enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                source_name TEXT NOT NULL DEFAULT '',
                 base_url TEXT NOT NULL DEFAULT '',
                 endpoint TEXT NOT NULL DEFAULT 'auto',
                 auth_token TEXT NOT NULL DEFAULT '',
@@ -181,6 +195,7 @@ def _ensure_upstream_config_table(service) -> None:
             CREATE TABLE IF NOT EXISTS api_tools_upstream_log_sync_config (
                 id INT PRIMARY KEY,
                 enabled TINYINT(1) NOT NULL DEFAULT 0,
+                source_name VARCHAR(191) NOT NULL DEFAULT '',
                 base_url TEXT NOT NULL,
                 endpoint VARCHAR(64) NOT NULL DEFAULT 'auto',
                 auth_token TEXT NOT NULL,
@@ -201,6 +216,11 @@ def _ensure_upstream_config_table(service) -> None:
             )
         """
     db.execute(ddl)
+    if not service._column_exists("api_tools_upstream_log_sync_config", "source_name"):
+        if db.config.engine == DatabaseEngine.POSTGRESQL:
+            db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN source_name TEXT NOT NULL DEFAULT ''")
+        else:
+            db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN source_name VARCHAR(191) NOT NULL DEFAULT ''")
     if not service._column_exists("api_tools_upstream_log_sync_config", "match_tolerance_seconds"):
         if db.config.engine == DatabaseEngine.POSTGRESQL:
             db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INTEGER NOT NULL DEFAULT 60")
@@ -211,7 +231,7 @@ def _ensure_upstream_config_table(service) -> None:
 def _get_upstream_sync_config(service, include_secret: bool = False) -> Dict[str, Any]:
     _ensure_upstream_config_table(service)
     rows = service.db.execute("""
-        SELECT enabled, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
+        SELECT enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
             interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
             last_sync_at, last_success_at, last_error, total_imported, updated_at
         FROM api_tools_upstream_log_sync_config
@@ -222,6 +242,7 @@ def _get_upstream_sync_config(service, include_secret: bool = False) -> Dict[str
         row = rows[0]
         config.update({
             "enabled": bool(row.get("enabled")),
+            "source_name": str(row.get("source_name") or ""),
             "base_url": str(row.get("base_url") or ""),
             "endpoint": str(row.get("endpoint") or "auto"),
             "auth_token": str(row.get("auth_token") or ""),
@@ -252,11 +273,11 @@ def _save_upstream_sync_config(service, config: Dict[str, Any]) -> Dict[str, Any
     db = service.db
     sql = """
         INSERT INTO api_tools_upstream_log_sync_config
-            (id, enabled, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
+            (id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
              interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
              last_sync_at, last_success_at, last_error, total_imported, updated_at)
         VALUES
-            (:id, :enabled, :base_url, :endpoint, :auth_token, :user_id, :page_size, :request_delay_ms,
+            (:id, :enabled, :source_name, :base_url, :endpoint, :auth_token, :user_id, :page_size, :request_delay_ms,
              :interval_minutes, :lookback_minutes, :overlap_minutes, :match_tolerance_seconds, :log_type, :max_pages_per_run,
              :last_sync_at, :last_success_at, :last_error, :total_imported, :updated_at)
     """
@@ -264,6 +285,7 @@ def _save_upstream_sync_config(service, config: Dict[str, Any]) -> Dict[str, Any
         sql += """
             ON CONFLICT (id) DO UPDATE SET
                 enabled = EXCLUDED.enabled,
+                source_name = EXCLUDED.source_name,
                 base_url = EXCLUDED.base_url,
                 endpoint = EXCLUDED.endpoint,
                 auth_token = EXCLUDED.auth_token,
@@ -286,6 +308,7 @@ def _save_upstream_sync_config(service, config: Dict[str, Any]) -> Dict[str, Any
         sql += """
             ON DUPLICATE KEY UPDATE
                 enabled = VALUES(enabled),
+                source_name = VALUES(source_name),
                 base_url = VALUES(base_url),
                 endpoint = VALUES(endpoint),
                 auth_token = VALUES(auth_token),
@@ -323,6 +346,7 @@ def _normalize_upstream_config(config: Dict[str, Any]) -> Dict[str, Any]:
         endpoint = "/" + endpoint
     return {
         **config,
+        "source_name": str(config.get("source_name") or "").strip(),
         "base_url": str(config.get("base_url") or "").strip().rstrip("/"),
         "endpoint": endpoint,
         "user_id": str(config.get("user_id") or "").strip(),

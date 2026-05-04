@@ -20,6 +20,7 @@ func RegisterCostAccountingRoutes(r *gin.RouterGroup) {
 		g.POST("/rules", SaveCostRules)
 		g.GET("/upstream-sync/config", GetUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/config", SaveUpstreamLogSyncConfig)
+		g.POST("/upstream-sync/register", RegisterUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/run", RunUpstreamLogSync)
 		g.POST("/upstream-sync/upload", UploadUpstreamLogs)
 	}
@@ -119,6 +120,23 @@ func SaveUpstreamLogSyncConfig(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Upstream log sync config saved", "data": data})
+}
+
+// POST /api/cost/upstream-sync/register
+func RegisterUpstreamLogSyncConfig(c *gin.Context) {
+	var req service.UpstreamLogSyncConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		return
+	}
+
+	svc := service.NewUpstreamLogSyncService()
+	data, err := svc.RegisterConfig(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("SAVE_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Upstream log sync config registered", "data": data})
 }
 
 // POST /api/cost/upstream-sync/run

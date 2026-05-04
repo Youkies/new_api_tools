@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NewAPI 日志导出助手
 // @namespace    https://newapi.youkies.space/
-// @version      1.2.3
-// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出和上传到 NewAPI Tools
+// @version      1.2.4
+// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出、上传和注册 NewAPI Tools 后台同步
 // @author       Youkies
 // @match        *://*/*
 // @grant        none
@@ -126,7 +126,9 @@
         toolsUrl: "",
         authToken: "",
         uploadEnabled: false,
+        registerEnabled: false,
         matchToleranceSeconds: 60,
+        syncIntervalMinutes: 1,
         ...(JSON.parse(localStorage.getItem(CONFIG.TOOLS_CONFIG_KEY) || "{}") || {}),
       };
     } catch (_) {
@@ -134,7 +136,9 @@
         toolsUrl: "",
         authToken: "",
         uploadEnabled: false,
+        registerEnabled: false,
         matchToleranceSeconds: 60,
+        syncIntervalMinutes: 1,
       };
     }
   }
@@ -155,40 +159,107 @@
     return headers;
   }
 
-  async function uploadLogsToTools(logs, options) {
+  function getToolsOptionsFromForm() {
     const toolsUrl = $id("lex-tools-url").value.trim().replace(/\/+$/, "");
     const authToken = $id("lex-tools-token").value.trim();
     const uploadEnabled = Boolean($id("lex-upload-tools").checked);
+    const registerEnabled = Boolean($id("lex-register-tools").checked);
     const matchToleranceSeconds =
       Number.parseInt($id("lex-match-window").value, 10) || 60;
+    const syncIntervalMinutes =
+      Number.parseInt($id("lex-sync-interval").value, 10) || 1;
 
-    saveToolsConfig({
+    return {
       toolsUrl,
       authToken,
       uploadEnabled,
+      registerEnabled,
       matchToleranceSeconds,
-    });
+      syncIntervalMinutes,
+    };
+  }
 
-    if (!uploadEnabled) {
+  function getUpstreamLoginState() {
+    const headers = getAuthHeaders();
+    const auth = String(headers.Authorization || "");
+    return {
+      token: auth.replace(/^bearer\s+/i, "").trim(),
+      userId: String(headers["New-API-User"] || "").trim(),
+    };
+  }
+
+  async function registerUpstreamToTools(toolsOptions) {
+    saveToolsConfig(toolsOptions);
+
+    if (!toolsOptions.registerEnabled) {
       return null;
     }
-    if (!toolsUrl) {
+    if (!toolsOptions.toolsUrl) {
+      throw new Error("已启用后台同步注册，但未填写 NewAPI Tools 地址");
+    }
+    if (!toolsOptions.authToken) {
+      throw new Error("已启用后台同步注册，但未填写 NewAPI Tools API Key/JWT");
+    }
+
+    const upstream = getUpstreamLoginState();
+    if (!upstream.token) {
+      throw new Error("未找到当前上游登录 token，请先登录 NewAPI 后刷新页面");
+    }
+
+    const registerUrl = `${toolsOptions.toolsUrl}/api/cost/upstream-sync/register`;
+    const resp = await fetch(registerUrl, {
+      method: "POST",
+      headers: getToolsAuthHeaders(toolsOptions.authToken),
+      body: JSON.stringify({
+        enabled: true,
+        source_name: document.title || location.host,
+        base_url: location.origin,
+        endpoint: "auto",
+        auth_token: upstream.token,
+        user_id: upstream.userId,
+        page_size: CONFIG.PAGE_SIZE,
+        request_delay_ms: CONFIG.REQUEST_DELAY,
+        interval_minutes: Math.max(1, toolsOptions.syncIntervalMinutes || 1),
+        lookback_minutes: 60,
+        overlap_minutes: 10,
+        match_tolerance_seconds: toolsOptions.matchToleranceSeconds || 60,
+        log_type: Number.parseInt($id("lex-type").value, 10) || 2,
+        max_pages_per_run: 1000,
+      }),
+    });
+
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok || data.success === false) {
+      const message =
+        data?.error?.message || data?.message || `HTTP ${resp.status}`;
+      throw new Error(`注册后台同步失败：${message}`);
+    }
+    return data.data || data;
+  }
+
+  async function uploadLogsToTools(logs, options, toolsOptions) {
+    saveToolsConfig(toolsOptions);
+
+    if (!toolsOptions.uploadEnabled) {
+      return null;
+    }
+    if (!toolsOptions.toolsUrl) {
       throw new Error("已启用上传，但未填写 NewAPI Tools 地址");
     }
-    if (!authToken) {
+    if (!toolsOptions.authToken) {
       throw new Error("已启用上传，但未填写 NewAPI Tools API Key/JWT");
     }
 
-    const uploadUrl = `${toolsUrl}/api/cost/upstream-sync/upload`;
+    const uploadUrl = `${toolsOptions.toolsUrl}/api/cost/upstream-sync/upload`;
     const resp = await fetch(uploadUrl, {
       method: "POST",
-      headers: getToolsAuthHeaders(authToken),
+      headers: getToolsAuthHeaders(toolsOptions.authToken),
       body: JSON.stringify({
         source_url: location.origin,
         source_name: document.title || location.host,
         start_time: options.startTs,
         end_time: options.endTs,
-        match_tolerance_seconds: matchToleranceSeconds,
+        match_tolerance_seconds: toolsOptions.matchToleranceSeconds,
         logs,
       }),
     });
@@ -899,6 +970,13 @@
             </label>
           </div>
 
+          <div class="lex-row full">
+            <label class="lex-check">
+              <input type="checkbox" id="lex-register-tools" ${tools.registerEnabled ? "checked" : ""}>
+              保存当前上游登录态供 Tools 后台定时拉取
+            </label>
+          </div>
+
           <div class="lex-row">
             <div class="lex-field">
               <label for="lex-tools-url">NewAPI Tools 地址</label>
@@ -910,13 +988,17 @@
             </div>
           </div>
 
-          <div class="lex-row full">
+          <div class="lex-row">
             <div class="lex-field">
               <label for="lex-match-window">上传匹配窗口（秒）</label>
               <input type="number" id="lex-match-window" min="1" max="3600" value="${Number(tools.matchToleranceSeconds || 60)}">
             </div>
+            <div class="lex-field">
+              <label for="lex-sync-interval">后台拉取间隔（分钟）</label>
+              <input type="number" id="lex-sync-interval" min="1" max="1440" value="${Number(tools.syncIntervalMinutes || 1)}">
+            </div>
           </div>
-          <div class="lex-hint">上游登录态由当前 NewAPI 页面提供；上传时会带上当前上游网址：${escapeAttr(location.origin)}。</div>
+          <div class="lex-hint">勾选后台拉取会把当前上游网址和登录 token 保存到 Tools：${escapeAttr(location.origin)}。</div>
 
           <div class="lex-actions">
             <button class="lex-btn lex-btn-secondary" id="lex-btn-sync" type="button" title="从页面当前筛选条件同步">同步页面筛选</button>
@@ -1058,10 +1140,29 @@
       Number.parseInt($id("lex-quota-unit").value, 10) ||
       CONFIG.QUOTA_PER_UNIT;
     const format = $id("lex-format").value;
+    const toolsOptions = getToolsOptionsFromForm();
+    saveToolsConfig(toolsOptions);
 
     setExportingState(true);
 
     try {
+      let registerText = "";
+      try {
+        if (toolsOptions.registerEnabled) {
+          $id("lex-progress-text").textContent =
+            "正在保存 Tools 后台同步配置...";
+          const registerResult = await registerUpstreamToTools(toolsOptions);
+          if (registerResult) {
+            registerText =
+              `\n后台同步：已保存 ${registerResult.base_url || location.origin}` +
+              `，每 ${Number(registerResult.interval_minutes || toolsOptions.syncIntervalMinutes || 1)} 分钟拉取`;
+          }
+        }
+      } catch (registerErr) {
+        console.error("[LogExporter] Register failed:", registerErr);
+        registerText = `\n后台同步失败：${registerErr.message}`;
+      }
+
       const logs = await exportLogs(
         options,
         (page, totalPages, count, totalRecords) => {
@@ -1078,7 +1179,10 @@
       );
 
       if (logs.length === 0) {
-        showResult("未查询到任何日志数据，请检查筛选条件。", true);
+        showResult(
+          `未查询到任何日志数据，请检查筛选条件。${registerText}`,
+          true
+        );
         return;
       }
 
@@ -1109,9 +1213,9 @@
       const users = new Set(logs.map((log) => log.username).filter(Boolean));
       let uploadText = "";
       try {
-        if ($id("lex-upload-tools")?.checked) {
+        if (toolsOptions.uploadEnabled) {
           $id("lex-progress-text").textContent = "正在上传到 NewAPI Tools...";
-          const uploadResult = await uploadLogsToTools(logs, options);
+          const uploadResult = await uploadLogsToTools(logs, options, toolsOptions);
           if (uploadResult) {
             const match = uploadResult.match || {};
             uploadText =
@@ -1119,14 +1223,6 @@
               `\n匹配：${Number(match.matched_count || 0).toLocaleString()} 条` +
               `（Token+时间 ${Number(match.tokens_time_matches || 0).toLocaleString()}，Request ID ${Number(match.request_id_matches || 0).toLocaleString()}）`;
           }
-        } else {
-          saveToolsConfig({
-            toolsUrl: $id("lex-tools-url").value.trim().replace(/\/+$/, ""),
-            authToken: $id("lex-tools-token").value.trim(),
-            uploadEnabled: false,
-            matchToleranceSeconds:
-              Number.parseInt($id("lex-match-window").value, 10) || 60,
-          });
         }
       } catch (uploadErr) {
         console.error("[LogExporter] Upload failed:", uploadErr);
@@ -1139,8 +1235,10 @@
           `总费用：$${(totalQuota / quotaPerUnit).toFixed(4)}\n` +
           `输入：${totalInput.toLocaleString()} tokens，输出：${totalOutput.toLocaleString()} tokens\n` +
           `模型数：${models.size}，用户数：${users.size}` +
+          registerText +
           uploadText,
-        uploadText.startsWith("\n上传失败")
+        registerText.startsWith("\n后台同步失败") ||
+          uploadText.startsWith("\n上传失败")
       );
     } catch (err) {
       console.error("[LogExporter] Export failed:", err);
