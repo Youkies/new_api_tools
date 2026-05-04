@@ -2,11 +2,17 @@
 Log Analytics Service for NewAPI Middleware Tool.
 Implements incremental log processing for user rankings and model statistics.
 """
+import csv
+import io
+import json
 import time
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-from .database import get_db_manager
+from sqlalchemy import text
+
+from .database import DatabaseEngine, get_db_manager
 from .local_storage import get_local_storage
 from .logger import logger
 
@@ -27,6 +33,7 @@ BATCH_CONFIG = {
 
 DEFAULT_BATCH_SIZE = 5000
 DEFAULT_MAX_ITERATIONS = 100
+DEFAULT_QUOTA_PER_USD = 500000
 
 
 @dataclass
@@ -930,6 +937,346 @@ class LogAnalyticsService:
             "reset": False,
             "reason": "Data is consistent",
         }
+
+    def export_logs_csv(self, options: Dict[str, Any]) -> Iterator[bytes]:
+        """Stream matching log rows as CSV."""
+        sql, params = self._build_log_export_query(options)
+        quota_per_unit = int(options.get("quota_per_unit") or DEFAULT_QUOTA_PER_USD)
+
+        def generate() -> Iterator[bytes]:
+            output = io.StringIO()
+            writer = csv.writer(output)
+
+            def emit(row: List[Any]) -> bytes:
+                output.seek(0)
+                output.truncate(0)
+                writer.writerow(row)
+                return output.getvalue().encode("utf-8")
+
+            yield "\ufeff".encode("utf-8")
+            yield emit([
+                "时间", "用户名", "用户ID", "令牌名称", "分组", "模型名称", "渠道ID", "渠道名称",
+                "类型", "输入Tokens", "输出Tokens", "总Tokens", "Quota", "费用(USD)",
+                "耗时(ms)", "是否流式", "模型倍率", "分组倍率", "补全倍率", "Request ID", "IP", "详情",
+            ])
+
+            total_quota = 0
+            total_input = 0
+            total_output = 0
+            for row in self._iter_log_export_rows(sql, params):
+                other = self._parse_log_other(row.get("other"))
+                prompt_tokens = int(row.get("prompt_tokens") or 0)
+                completion_tokens = int(row.get("completion_tokens") or 0)
+                quota = int(row.get("quota") or 0)
+                total_quota += quota
+                total_input += prompt_tokens
+                total_output += completion_tokens
+
+                yield emit([
+                    self._format_log_timestamp(row.get("created_at")),
+                    row.get("username") or "",
+                    int(row.get("user_id") or 0),
+                    row.get("token_name") or "",
+                    row.get("group_name") or "",
+                    row.get("model_name") or "",
+                    int(row.get("channel_id") or 0),
+                    row.get("channel_name") or "",
+                    self._log_type_label(row.get("type")),
+                    prompt_tokens,
+                    completion_tokens,
+                    prompt_tokens + completion_tokens,
+                    quota,
+                    f"{quota / quota_per_unit:.6f}",
+                    row.get("use_time") or 0,
+                    "是" if self._truthy(row.get("is_stream")) else "否",
+                    self._other_value(other, "model_ratio"),
+                    self._other_value(other, "group_ratio"),
+                    self._other_value(other, "completion_ratio"),
+                    row.get("request_id") or "",
+                    row.get("ip") or "",
+                    row.get("content") or "",
+                ])
+
+            yield emit([])
+            yield emit([
+                "汇总", "", "", "", "", "", "", "合计", "",
+                total_input,
+                total_output,
+                total_input + total_output,
+                total_quota,
+                f"{total_quota / quota_per_unit:.6f}",
+                "", "", "", "", "", "", "", "",
+            ])
+
+        return generate()
+
+    def export_logs_json(self, options: Dict[str, Any]) -> Iterator[bytes]:
+        """Stream matching log rows as a JSON array."""
+        sql, params = self._build_log_export_query(options)
+        quota_per_unit = int(options.get("quota_per_unit") or DEFAULT_QUOTA_PER_USD)
+
+        def generate() -> Iterator[bytes]:
+            yield b"[\n"
+            first = True
+            for row in self._iter_log_export_rows(sql, params):
+                quota = int(row.get("quota") or 0)
+                row["_formatted_time"] = self._format_log_timestamp(row.get("created_at"))
+                row["_cost_usd"] = f"{quota / quota_per_unit:.6f}"
+                row["_total_tokens"] = int(row.get("prompt_tokens") or 0) + int(row.get("completion_tokens") or 0)
+                row["_other_parsed"] = self._parse_log_other(row.get("other"))
+                if not first:
+                    yield b",\n"
+                first = False
+                yield json.dumps(row, ensure_ascii=False, default=str).encode("utf-8")
+            yield b"\n]\n"
+
+        return generate()
+
+    def _build_log_export_query(self, options: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+        columns = self._log_column_map()
+        if not columns.get("created_at"):
+            raise ValueError("logs.created_at column is required")
+
+        can_join_channels = (
+            self._table_exists("channels")
+            and columns.get("channel_id")
+            and self._column_exists("channels", "id")
+        )
+        channel_name_expr = "'' as channel_name"
+        if can_join_channels and self._column_exists("channels", "name"):
+            channel_name_expr = "COALESCE(c.name, '') as channel_name"
+        elif columns.get("channel_name"):
+            channel_name_expr = self._text_expr(columns, "channel_name", "channel_name")
+
+        use_time_expr = self._number_expr(columns, "use_time", "use_time")
+        if not columns.get("use_time"):
+            use_time_expr = self._number_expr(columns, "duration", "use_time")
+
+        selects = [
+            self._int_expr(columns, "id", "id"),
+            self._int_expr(columns, "user_id", "user_id"),
+            self._int_expr(columns, "created_at", "created_at"),
+            self._int_expr(columns, "type", "type"),
+            self._text_expr(columns, "username", "username"),
+            self._text_expr(columns, "token_name", "token_name"),
+            self._text_expr(columns, "group", "group_name"),
+            self._text_expr(columns, "model_name", "model_name"),
+            self._int_expr(columns, "channel_id", "channel_id"),
+            self._int_expr(columns, "prompt_tokens", "prompt_tokens"),
+            self._int_expr(columns, "completion_tokens", "completion_tokens"),
+            self._int_expr(columns, "quota", "quota"),
+            self._text_expr(columns, "request_id", "request_id"),
+            self._text_expr(columns, "ip", "ip"),
+            self._text_expr(columns, "content", "content"),
+            self._text_expr(columns, "other", "other"),
+            self._bool_expr(columns, "is_stream", "is_stream"),
+            use_time_expr,
+            channel_name_expr,
+        ]
+
+        sql = "SELECT " + ", ".join(selects) + " FROM logs l"
+        if can_join_channels:
+            sql += " LEFT JOIN channels c ON c.id = l.channel_id"
+
+        params: Dict[str, Any] = {}
+        where = ["1=1"]
+
+        start_time = int(options.get("start_time") or 0)
+        end_time = int(options.get("end_time") or 0)
+        if start_time > 0:
+            where.append("l.created_at >= :start_time")
+            params["start_time"] = start_time
+        if end_time > 0:
+            where.append("l.created_at <= :end_time")
+            params["end_time"] = end_time
+
+        log_type = int(options.get("type") or 0)
+        if log_type > 0:
+            if not columns.get("type"):
+                raise ValueError("logs.type column is required for type filter")
+            where.append("l.type = :log_type")
+            params["log_type"] = log_type
+
+        for option_key, column_name, param_name in (
+            ("model_name", "model_name", "model_name"),
+            ("username", "username", "username"),
+            ("token_name", "token_name", "token_name"),
+            ("group", "group", "group_name"),
+            ("request_id", "request_id", "request_id"),
+        ):
+            value = str(options.get(option_key) or "").strip()
+            if not value:
+                continue
+            if not columns.get(column_name):
+                raise ValueError(f"logs.{column_name} column is required for {option_key} filter")
+            where.append(f"{self._column('l', column_name)} = :{param_name}")
+            params[param_name] = value
+
+        channel = str(options.get("channel") or "").strip()
+        if channel:
+            try:
+                channel_id = int(channel)
+            except ValueError:
+                channel_id = 0
+            if channel_id > 0:
+                if not columns.get("channel_id"):
+                    raise ValueError("logs.channel_id column is required for channel filter")
+                where.append("l.channel_id = :channel_id")
+                params["channel_id"] = channel_id
+            elif can_join_channels and self._column_exists("channels", "name"):
+                where.append("c.name = :channel_name_filter")
+                params["channel_name_filter"] = channel
+            else:
+                raise ValueError("channel filter requires logs.channel_id or channels.name")
+
+        sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY l.created_at ASC, l.id ASC"
+
+        max_rows = int(options.get("max_rows") or 0)
+        if max_rows > 0:
+            sql += " LIMIT :max_rows"
+            params["max_rows"] = max_rows
+
+        return sql, params
+
+    def _iter_log_export_rows(self, sql: str, params: Dict[str, Any]) -> Iterator[Dict[str, Any]]:
+        self._db.connect()
+        with self._db.engine.connect().execution_options(stream_results=True) as conn:
+            result = conn.execute(text(sql), params)
+            for row in result.mappings():
+                yield dict(row)
+
+    def _log_column_map(self) -> Dict[str, bool]:
+        names = [
+            "id", "user_id", "created_at", "type", "username", "token_name", "group",
+            "model_name", "channel_id", "channel_name", "prompt_tokens", "completion_tokens",
+            "quota", "request_id", "ip", "content", "other", "is_stream", "use_time", "duration",
+        ]
+        return {name: self._column_exists("logs", name) for name in names}
+
+    def _table_exists(self, table_name: str) -> bool:
+        try:
+            if self._db.config.engine == DatabaseEngine.POSTGRESQL:
+                sql = """
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = :table_name
+                    LIMIT 1
+                """
+                rows = self._db.execute(sql, {"table_name": table_name})
+            else:
+                sql = """
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = :db_name AND table_name = :table_name
+                    LIMIT 1
+                """
+                rows = self._db.execute(sql, {"db_name": self._db.config.database, "table_name": table_name})
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _column_exists(self, table_name: str, column_name: str) -> bool:
+        try:
+            if self._db.config.engine == DatabaseEngine.POSTGRESQL:
+                sql = """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_name = :table_name AND column_name = :column_name
+                    LIMIT 1
+                """
+                rows = self._db.execute(sql, {"table_name": table_name, "column_name": column_name})
+            else:
+                sql = """
+                    SELECT 1 FROM information_schema.columns
+                    WHERE table_schema = :db_name AND table_name = :table_name AND column_name = :column_name
+                    LIMIT 1
+                """
+                rows = self._db.execute(sql, {
+                    "db_name": self._db.config.database,
+                    "table_name": table_name,
+                    "column_name": column_name,
+                })
+            return bool(rows)
+        except Exception:
+            return False
+
+    def _column(self, alias: str, column_name: str) -> str:
+        if column_name == "group":
+            quoted = '"group"' if self._db.config.engine == DatabaseEngine.POSTGRESQL else "`group`"
+            return f"{alias}.{quoted}"
+        return f"{alias}.{column_name}"
+
+    def _text_expr(self, columns: Dict[str, bool], column_name: str, alias: str) -> str:
+        if not columns.get(column_name):
+            return f"'' as {alias}"
+        return f"COALESCE({self._column('l', column_name)}, '') as {alias}"
+
+    def _int_expr(self, columns: Dict[str, bool], column_name: str, alias: str) -> str:
+        if not columns.get(column_name):
+            return f"0 as {alias}"
+        return f"COALESCE({self._column('l', column_name)}, 0) as {alias}"
+
+    def _number_expr(self, columns: Dict[str, bool], column_name: str, alias: str) -> str:
+        if not columns.get(column_name):
+            return f"0 as {alias}"
+        return f"COALESCE({self._column('l', column_name)}, 0) as {alias}"
+
+    def _bool_expr(self, columns: Dict[str, bool], column_name: str, alias: str) -> str:
+        if not columns.get(column_name):
+            return f"0 as {alias}"
+        if self._db.config.engine == DatabaseEngine.POSTGRESQL:
+            return f"COALESCE({self._column('l', column_name)}, FALSE) as {alias}"
+        return f"COALESCE({self._column('l', column_name)}, 0) as {alias}"
+
+    def _parse_log_other(self, raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if raw is None:
+            return {}
+        if isinstance(raw, (bytes, bytearray)):
+            raw = raw.decode("utf-8", errors="ignore")
+        raw_text = str(raw).strip()
+        if not raw_text or raw_text == "null":
+            return {}
+        try:
+            decoded = json.loads(raw_text)
+        except (TypeError, ValueError):
+            return {}
+        return decoded if isinstance(decoded, dict) else {}
+
+    def _other_value(self, other: Dict[str, Any], key: str) -> str:
+        value = other.get(key)
+        if value is None:
+            return ""
+        return str(value)
+
+    def _format_log_timestamp(self, value: Any) -> str:
+        try:
+            ts = int(value or 0)
+        except (TypeError, ValueError):
+            return ""
+        if ts <= 0:
+            return ""
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _log_type_label(self, value: Any) -> str:
+        try:
+            log_type = int(value or 0)
+        except (TypeError, ValueError):
+            return "未知"
+        return {
+            1: "充值",
+            2: "消费",
+            3: "管理",
+            4: "系统",
+            5: "错误",
+            6: "退款",
+        }.get(log_type, "未知" if log_type == 0 else str(log_type))
+
+    def _truthy(self, value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return value != 0
+        return str(value).strip().lower() in ("1", "true", "yes", "y")
 
 
 # Global instance

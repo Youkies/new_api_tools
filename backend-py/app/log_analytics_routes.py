@@ -2,9 +2,12 @@
 Log Analytics API Routes for NewAPI Middleware Tool.
 Implements endpoints for user rankings and model statistics.
 """
+import time
+from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from .auth import verify_auth
@@ -235,6 +238,73 @@ async def get_analytics_summary(
     summary = service.get_summary()
 
     return SummaryResponse(success=True, data=summary)
+
+
+@router.get("/export")
+async def export_logs(
+    format: str = Query(default="csv", description="导出格式：csv 或 json"),
+    start_time: Optional[int] = Query(default=None, description="开始时间戳"),
+    end_time: Optional[int] = Query(default=None, description="结束时间戳"),
+    start_timestamp: Optional[int] = Query(default=None, description="兼容 NewAPI 参数"),
+    end_timestamp: Optional[int] = Query(default=None, description="兼容 NewAPI 参数"),
+    log_type: int = Query(default=0, alias="type", description="日志类型，0 表示全部"),
+    model_name: str = Query(default="", description="模型名称"),
+    username: str = Query(default="", description="用户名"),
+    token_name: str = Query(default="", description="令牌名称"),
+    channel: str = Query(default="", description="渠道 ID 或名称"),
+    channel_id: str = Query(default="", description="渠道 ID"),
+    group: str = Query(default="", description="分组"),
+    request_id: str = Query(default="", description="Request ID"),
+    quota_per_unit: int = Query(default=500000, ge=1, description="每 USD 对应 quota"),
+    max_rows: int = Query(default=0, ge=0, le=5000000, description="最多导出行数，0 表示不限"),
+    _: str = Depends(verify_auth),
+):
+    """
+    导出原始 NewAPI 日志。
+
+    后端直接从数据库流式输出，避免前端逐页请求导致中断。
+    """
+    export_format = (format or "csv").strip().lower()
+    if export_format != "json":
+        export_format = "csv"
+
+    start = int(start_time or start_timestamp or 0)
+    end = int(end_time or end_timestamp or 0)
+    if start <= 0 and end <= 0:
+        now = datetime.now()
+        start = int(datetime(now.year, now.month, now.day).timestamp())
+        end = int(time.time())
+
+    service = get_log_analytics_service()
+    options = {
+        "start_time": start,
+        "end_time": end,
+        "type": max(0, int(log_type or 0)),
+        "model_name": model_name.strip(),
+        "username": username.strip(),
+        "token_name": token_name.strip(),
+        "channel": (channel or channel_id).strip(),
+        "group": group.strip(),
+        "request_id": request_id.strip(),
+        "quota_per_unit": quota_per_unit,
+        "max_rows": max_rows,
+    }
+
+    try:
+        stream = service.export_logs_json(options) if export_format == "json" else service.export_logs_csv(options)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    filename = f"newapi_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.{export_format}"
+    media_type = "application/json; charset=utf-8" if export_format == "json" else "text/csv; charset=utf-8"
+    return StreamingResponse(
+        stream,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @router.post("/reset", response_model=ResetResponse)

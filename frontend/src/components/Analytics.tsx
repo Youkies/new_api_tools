@@ -2,11 +2,13 @@ import { useState, useEffect, useCallback, useRef } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { cn } from '../lib/utils'
-import { RefreshCw, Trash2, AlertTriangle, Loader2, Timer, ChevronDown } from 'lucide-react'
+import { RefreshCw, Trash2, AlertTriangle, Loader2, Timer, ChevronDown, Download } from 'lucide-react'
 import { Card, CardContent, CardHeader, CardTitle } from './ui/card'
 import { Button } from './ui/button'
 import { Progress } from './ui/progress'
 import { Badge } from './ui/badge'
+import { Input } from './ui/input'
+import { Select } from './ui/select'
 import {
   Table,
   TableBody,
@@ -81,6 +83,27 @@ const getIntervalLabel = (interval: number) => {
   }
 }
 
+const toDatetimeLocalValue = (date: Date) => {
+  const pad = (num: number) => num.toString().padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`
+}
+
+const todayStartValue = () => {
+  const date = new Date()
+  date.setHours(0, 0, 0, 0)
+  return toDatetimeLocalValue(date)
+}
+
+const nowValue = () => toDatetimeLocalValue(new Date())
+
+const filenameFromDisposition = (disposition: string | null, fallback: string) => {
+  if (!disposition) return fallback
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
+  if (utf8Match?.[1]) return decodeURIComponent(utf8Match[1])
+  const plainMatch = disposition.match(/filename="?([^"]+)"?/i)
+  return plainMatch?.[1] || fallback
+}
+
 export function Analytics() {
   const { token } = useAuth()
   const { showToast } = useToast()
@@ -124,6 +147,20 @@ export function Analytics() {
   const batchAbortRef = useRef(false)
   const batchStartTimeRef = useRef(0)
   const batchTotalProcessedRef = useRef(0)
+  const [exportDialogOpen, setExportDialogOpen] = useState(false)
+  const [exporting, setExporting] = useState(false)
+  const [exportStart, setExportStart] = useState(todayStartValue)
+  const [exportEnd, setExportEnd] = useState(nowValue)
+  const [exportType, setExportType] = useState('2')
+  const [exportFormat, setExportFormat] = useState<'csv' | 'json'>('csv')
+  const [exportModelName, setExportModelName] = useState('')
+  const [exportUsername, setExportUsername] = useState('')
+  const [exportTokenName, setExportTokenName] = useState('')
+  const [exportChannel, setExportChannel] = useState('')
+  const [exportGroup, setExportGroup] = useState('')
+  const [exportRequestId, setExportRequestId] = useState('')
+  const [exportQuotaPerUnit, setExportQuotaPerUnit] = useState('500000')
+  const [exportMaxRows, setExportMaxRows] = useState('')
 
   // 从 localStorage 恢复倒计时，或使用默认值
   const [countdown, setCountdown] = useState(() => {
@@ -535,6 +572,72 @@ export function Analytics() {
     })
   }
 
+  const openExportDialog = () => {
+    setExportEnd(nowValue())
+    if (!exportStart) setExportStart(todayStartValue())
+    setExportDialogOpen(true)
+  }
+
+  const handleExportLogs = async () => {
+    if (!exportStart || !exportEnd) {
+      showToast('error', '请选择导出时间范围')
+      return
+    }
+
+    const startTs = Math.floor(new Date(exportStart).getTime() / 1000)
+    const endTs = Math.floor(new Date(exportEnd).getTime() / 1000)
+    if (!Number.isFinite(startTs) || !Number.isFinite(endTs) || startTs >= endTs) {
+      showToast('error', '导出时间范围无效')
+      return
+    }
+
+    const params = new URLSearchParams({
+      format: exportFormat,
+      start_time: startTs.toString(),
+      end_time: endTs.toString(),
+      quota_per_unit: (parseInt(exportQuotaPerUnit, 10) || 500000).toString(),
+    })
+    if (exportType && exportType !== '0') params.set('type', exportType)
+    if (exportModelName.trim()) params.set('model_name', exportModelName.trim())
+    if (exportUsername.trim()) params.set('username', exportUsername.trim())
+    if (exportTokenName.trim()) params.set('token_name', exportTokenName.trim())
+    if (exportChannel.trim()) params.set('channel', exportChannel.trim())
+    if (exportGroup.trim()) params.set('group', exportGroup.trim())
+    if (exportRequestId.trim()) params.set('request_id', exportRequestId.trim())
+    const maxRows = parseInt(exportMaxRows, 10)
+    if (Number.isFinite(maxRows) && maxRows > 0) params.set('max_rows', Math.min(maxRows, 5000000).toString())
+
+    setExporting(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/analytics/export?${params.toString()}`, {
+        headers: getAuthHeaders(),
+      })
+      if (!response.ok) {
+        const text = await response.text()
+        throw new Error(text || `HTTP ${response.status}`)
+      }
+
+      const blob = await response.blob()
+      const fallback = `newapi_logs_${new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '')}.${exportFormat}`
+      const filename = filenameFromDisposition(response.headers.get('Content-Disposition'), fallback)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+      showToast('success', '日志导出已开始下载')
+      setExportDialogOpen(false)
+    } catch (error) {
+      console.error('Failed to export logs:', error)
+      showToast('error', error instanceof Error ? `导出失败：${error.message.slice(0, 120)}` : '导出失败')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const autoResetInconsistent = async () => {
     try {
       const response = await fetch(`${apiUrl}/api/analytics/check-consistency?auto_reset=true`, {
@@ -658,7 +761,7 @@ export function Analytics() {
                 {state?.last_processed_at && <span className="ml-2">· 上次更新: {formatTimestamp(state.last_processed_at)}</span>}
               </p>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               {/* 刷新间隔选择和倒计时 - 只有初始化完成后才显示 */}
               {syncStatus && !syncStatus.needs_initial_sync && !syncStatus.is_initializing && (
                 <div className="relative" ref={dropdownRef}>
@@ -705,6 +808,10 @@ export function Analytics() {
                   )}
                 </div>
               )}
+              <Button variant="outline" onClick={openExportDialog} disabled={exporting}>
+                {exporting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Download className="h-4 w-4 mr-2" />}
+                导出
+              </Button>
               <Button onClick={processLogs} disabled={processing || batchProcessing}>
                 {processing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
                 处理新日志
@@ -867,6 +974,105 @@ export function Analytics() {
           </div>
         </CardContent>
       </Card>
+
+      {/* Export Dialog */}
+      <Dialog open={exportDialogOpen} onOpenChange={setExportDialogOpen}>
+        <DialogContent className="max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>导出日志</DialogTitle>
+            <DialogDescription>按筛选条件生成 CSV 或 JSON 文件。</DialogDescription>
+          </DialogHeader>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">开始时间</label>
+              <Input type="datetime-local" value={exportStart} onChange={(e) => setExportStart(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">结束时间</label>
+              <Input type="datetime-local" value={exportEnd} onChange={(e) => setExportEnd(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">日志类型</label>
+              <Select value={exportType} onChange={(e) => setExportType(e.target.value)}>
+                <option value="0">全部</option>
+                <option value="2">消费</option>
+                <option value="5">错误</option>
+                <option value="1">充值</option>
+                <option value="3">管理</option>
+                <option value="4">系统</option>
+                <option value="6">退款</option>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">导出格式</label>
+              <Select value={exportFormat} onChange={(e) => setExportFormat(e.target.value as 'csv' | 'json')}>
+                <option value="csv">CSV (Excel)</option>
+                <option value="json">JSON</option>
+              </Select>
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">模型名称</label>
+              <Input value={exportModelName} onChange={(e) => setExportModelName(e.target.value)} placeholder="全部模型" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">用户名</label>
+              <Input value={exportUsername} onChange={(e) => setExportUsername(e.target.value)} placeholder="全部用户" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">令牌名称</label>
+              <Input value={exportTokenName} onChange={(e) => setExportTokenName(e.target.value)} placeholder="全部令牌" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">渠道 ID</label>
+              <Input value={exportChannel} onChange={(e) => setExportChannel(e.target.value)} placeholder="全部渠道" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">分组</label>
+              <Input value={exportGroup} onChange={(e) => setExportGroup(e.target.value)} placeholder="全部分组" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">Request ID</label>
+              <Input value={exportRequestId} onChange={(e) => setExportRequestId(e.target.value)} placeholder="全部请求" />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">Quota/USD</label>
+              <Input type="number" min={1} value={exportQuotaPerUnit} onChange={(e) => setExportQuotaPerUnit(e.target.value)} />
+            </div>
+            <div className="space-y-1.5">
+              <label className="text-xs font-medium text-muted-foreground">最多行数</label>
+              <Input type="number" min={0} value={exportMaxRows} onChange={(e) => setExportMaxRows(e.target.value)} placeholder="不限" />
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setExportStart(todayStartValue())
+                setExportEnd(nowValue())
+                setExportType('2')
+                setExportFormat('csv')
+                setExportModelName('')
+                setExportUsername('')
+                setExportTokenName('')
+                setExportChannel('')
+                setExportGroup('')
+                setExportRequestId('')
+                setExportQuotaPerUnit('500000')
+                setExportMaxRows('')
+              }}
+              disabled={exporting}
+            >
+              重置
+            </Button>
+            <Button onClick={handleExportLogs} disabled={exporting}>
+              {exporting ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Download className="h-4 w-4 mr-2" />}
+              {exporting ? '导出中...' : '开始导出'}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       {/* Confirm Dialog */}
       <Dialog open={confirmDialog.isOpen} onOpenChange={(open: boolean) => setConfirmDialog(prev => ({ ...prev, isOpen: open }))}>

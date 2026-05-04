@@ -12,5 +12,6 @@
 - 手动分组迁移支持先测试再执行：`/api/auto-group/batch-move` 使用 `dry_run=true` 只返回预览，不修改用户；正式迁移写入 `batch_id`，撤销整批迁移使用 `/api/auto-group/revert-batch`。自动分组日志需保留 `batch_id`、`reverted_at`、`revert_log_id`、`revert_of` 元数据，避免重复或错误撤销。
 - Go 正式后端已补齐性能基础设施：前端使用路由级懒加载；Go `/api/system/scale` 基于用户数、日志估算和 24h 请求量返回刷新建议；`/api/system/warmup-status` 反映后台热缓存预热状态；模型状态使用批量 SQL 按 `model_name + slot` 聚合；风控排行榜、模型状态和 IP 列表支持 `no_cache=true` 真刷新。
 - Go 正式后端已支持自动分组后台定时扫描：启动后按 `enabled`、`auto_scan_enabled`、`scan_interval_minutes` 静默执行 `RunScan(false)`，与前端“自动扫描”开关语义一致。
+- 日志分析页已支持 `/api/analytics/export` 原始日志导出；Go/Python 后端都提供同名接口，按时间、类型、模型、用户、令牌、渠道、分组、Request ID 等条件从 `logs` 表直接流式导出 CSV/JSON，避免前端逐页请求 NewAPI `/api/log` 导致大量请求中断。
 - 用户确认偏好：功能完成并验证通过后，默认自动提交并 push 当前分支；提交前仍需检查 `git status` 和 diff 范围，避免带入无关改动。
 - 常用验证命令：`go test ./...`（在 `backend/`）、`python -m py_compile ...`、`npm run build`（在 `frontend/`）。
