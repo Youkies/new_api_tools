@@ -13,7 +13,6 @@ from sqlalchemy import text
 from .database import DatabaseEngine, DatabaseManager, get_db_manager
 
 QUOTA_PER_USD = 500000.0
-UPSTREAM_MIN_SYNC_START_TIME = 1777564800  # 2026-05-01 00:00:00 Asia/Shanghai
 
 
 @dataclass
@@ -118,31 +117,6 @@ class CostAccountingService:
         except Exception:
             return False
 
-    def _table_exists(self, table_name: str) -> bool:
-        try:
-            if self.db.config.engine == DatabaseEngine.POSTGRESQL:
-                sql = """
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_name = :table_name
-                    LIMIT 1
-                """
-                rows = self.db.execute(sql, {"table_name": table_name})
-            else:
-                sql = """
-                    SELECT 1
-                    FROM information_schema.tables
-                    WHERE table_schema = :db_name AND table_name = :table_name
-                    LIMIT 1
-                """
-                rows = self.db.execute(sql, {
-                    "db_name": self.db.config.database,
-                    "table_name": table_name,
-                })
-            return bool(rows)
-        except Exception:
-            return False
-
     def list_rules(self) -> List[Dict[str, Any]]:
         self._ensure_table()
         rows = self.db.execute("""
@@ -222,53 +196,12 @@ class CostAccountingService:
         rules = self.list_rules()
         rule_map = self._build_rule_map(rules)
         channel_model_mappings = self._load_channel_model_mappings(channel_id)
-        upstream_join_available = (
-            self._column_exists("logs", "id")
-            and self._table_exists("api_tools_upstream_logs")
-            and self._column_exists("api_tools_upstream_logs", "local_log_id")
-        )
 
-        upstream_start_time = max(start_time, UPSTREAM_MIN_SYNC_START_TIME)
-        params: Dict[str, Any] = {
-            "start_time": start_time,
-            "end_time": end_time,
-            "upstream_start_time": upstream_start_time,
-        }
+        params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
         channel_clause = ""
         if channel_id and channel_id > 0:
             channel_clause = " AND l.channel_id = :channel_id"
             params["channel_id"] = channel_id
-
-        upstream_select = """
-                COALESCE(SUM(ul.upstream_quota), 0) as upstream_quota,
-                COALESCE(SUM(ul.upstream_adjusted_quota), 0) as upstream_adjusted_quota,
-                COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN 1 ELSE 0 END), 0) as upstream_matched_count,
-                COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN l.prompt_tokens ELSE 0 END), 0) as upstream_matched_prompt_tokens,
-                COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN l.completion_tokens ELSE 0 END), 0) as upstream_matched_completion_tokens,
-                COALESCE(SUM(ul.request_id_matches), 0) as upstream_request_id_matches,
-                COALESCE(SUM(ul.tokens_time_matches), 0) as upstream_tokens_time_matches
-        """ if upstream_join_available else """
-                0 as upstream_quota,
-                0 as upstream_adjusted_quota,
-                0 as upstream_matched_count,
-                0 as upstream_matched_prompt_tokens,
-                0 as upstream_matched_completion_tokens,
-                0 as upstream_request_id_matches,
-                0 as upstream_tokens_time_matches
-        """
-        upstream_join = """
-            LEFT JOIN (
-                SELECT local_log_id,
-                    COALESCE(SUM(u.quota), 0) as upstream_quota,
-                    COALESCE(SUM(CASE WHEN cfg.recharge_multiplier > 0 THEN u.quota / cfg.recharge_multiplier ELSE u.quota END), 0) as upstream_adjusted_quota,
-                    COALESCE(SUM(CASE WHEN u.match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
-                    COALESCE(SUM(CASE WHEN u.match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches
-                FROM api_tools_upstream_logs u
-                LEFT JOIN api_tools_upstream_log_sync_config cfg ON cfg.base_url = u.source_url
-                WHERE u.created_at >= :upstream_start_time AND u.created_at <= :end_time AND u.type = 2 AND u.local_log_id > 0
-                GROUP BY local_log_id
-            ) ul ON ul.local_log_id = l.id
-        """ if upstream_join_available else ""
 
         rows = self.db.execute(f"""
             SELECT COALESCE(l.channel_id, 0) as channel_id,
@@ -277,11 +210,9 @@ class CostAccountingService:
                 COUNT(*) as request_count,
                 COALESCE(SUM(l.quota), 0) as quota_used,
                 COALESCE(SUM(l.prompt_tokens), 0) as prompt_tokens,
-                COALESCE(SUM(l.completion_tokens), 0) as completion_tokens,
-                {upstream_select}
+                COALESCE(SUM(l.completion_tokens), 0) as completion_tokens
             FROM logs l
             LEFT JOIN channels c ON c.id = l.channel_id
-            {upstream_join}
             WHERE l.created_at >= :start_time AND l.created_at <= :end_time AND l.type = 2
                 {channel_clause}
             GROUP BY COALESCE(l.channel_id, 0), COALESCE(NULLIF(l.model_name, ''), 'unknown')
@@ -296,11 +227,6 @@ class CostAccountingService:
             "completion_tokens": 0,
             "billed_amount": 0.0,
             "estimated_cost": 0.0,
-            "rule_estimated_cost": 0.0,
-            "upstream_imported_cost": 0.0,
-            "upstream_matched_requests": 0,
-            "upstream_request_id_matches": 0,
-            "upstream_tokens_time_matches": 0,
             "configured_models": 0,
             "unconfigured_models": 0,
         }
@@ -317,32 +243,11 @@ class CostAccountingService:
             prompt_tokens = int(row.get("prompt_tokens") or 0)
             completion_tokens = int(row.get("completion_tokens") or 0)
             billed_amount = quota_used / QUOTA_PER_USD
-            upstream_quota = int(row.get("upstream_quota") or 0)
-            upstream_adjusted_quota = float(row.get("upstream_adjusted_quota") or 0)
-            upstream_imported_cost = upstream_adjusted_quota / QUOTA_PER_USD
-            upstream_matched_requests = self._clamp_matched_count(int(row.get("upstream_matched_count") or 0), requests)
-            upstream_matched_prompt = self._clamp_matched_count(int(row.get("upstream_matched_prompt_tokens") or 0), prompt_tokens)
-            upstream_matched_completion = self._clamp_matched_count(
-                int(row.get("upstream_matched_completion_tokens") or 0),
-                completion_tokens,
-            )
-            upstream_request_id_matches = self._clamp_matched_count(
-                int(row.get("upstream_request_id_matches") or 0),
-                upstream_matched_requests,
-            )
-            upstream_tokens_time_matches = self._clamp_matched_count(
-                int(row.get("upstream_tokens_time_matches") or 0),
-                upstream_matched_requests,
-            )
-            unmatched_requests = requests - upstream_matched_requests
-            unmatched_prompt_tokens = prompt_tokens - upstream_matched_prompt
-            unmatched_completion_tokens = completion_tokens - upstream_matched_completion
 
             upstream_model = self._resolve_upstream_model(channel_model_mappings, cid, model_name)
             rule = self._find_rule(rule_map, cid, model_name, upstream_model)
             configured = rule is not None
             estimated_cost = 0.0
-            rule_estimated_cost = 0.0
             billing_mode = "token"
             rule_id = 0
             if rule:
@@ -351,14 +256,8 @@ class CostAccountingService:
                     upstream_model = rule_upstream_model
                 billing_mode = rule.get("billing_mode") or "token"
                 rule_id = int(rule.get("id") or 0)
-                rule_estimated_cost = self._calculate_cost(
-                    rule,
-                    unmatched_requests,
-                    unmatched_prompt_tokens,
-                    unmatched_completion_tokens,
-                )
+                estimated_cost = self._calculate_cost(rule, requests, prompt_tokens, completion_tokens)
 
-            estimated_cost = upstream_imported_cost + rule_estimated_cost
             margin = billed_amount - estimated_cost
             model_row = {
                 "channel_id": cid,
@@ -372,11 +271,6 @@ class CostAccountingService:
                 "completion_tokens": completion_tokens,
                 "billed_amount": self._round_money(billed_amount),
                 "estimated_cost": self._round_money(estimated_cost),
-                "rule_estimated_cost": self._round_money(rule_estimated_cost),
-                "upstream_imported_cost": self._round_money(upstream_imported_cost),
-                "upstream_matched_requests": upstream_matched_requests,
-                "upstream_request_id_matches": upstream_request_id_matches,
-                "upstream_tokens_time_matches": upstream_tokens_time_matches,
                 "gross_margin": self._round_money(margin),
                 "margin_rate": self._margin_rate(margin, billed_amount),
                 "cost_multiplier": self._cost_multiplier(rule if rule else None),
@@ -393,11 +287,6 @@ class CostAccountingService:
                 "completion_tokens": 0,
                 "billed_amount": 0.0,
                 "estimated_cost": 0.0,
-                "rule_estimated_cost": 0.0,
-                "upstream_imported_cost": 0.0,
-                "upstream_matched_requests": 0,
-                "upstream_request_id_matches": 0,
-                "upstream_tokens_time_matches": 0,
                 "gross_margin": 0.0,
                 "configured_models": 0,
                 "unconfigured_models": 0,
@@ -409,11 +298,6 @@ class CostAccountingService:
             channel["completion_tokens"] += completion_tokens
             channel["billed_amount"] += billed_amount
             channel["estimated_cost"] += estimated_cost
-            channel["rule_estimated_cost"] += rule_estimated_cost
-            channel["upstream_imported_cost"] += upstream_imported_cost
-            channel["upstream_matched_requests"] += upstream_matched_requests
-            channel["upstream_request_id_matches"] += upstream_request_id_matches
-            channel["upstream_tokens_time_matches"] += upstream_tokens_time_matches
             channel["gross_margin"] += margin
             channel["configured_models" if configured else "unconfigured_models"] += 1
             channel["models"].append(model_row)
@@ -424,19 +308,12 @@ class CostAccountingService:
             totals["completion_tokens"] += completion_tokens
             totals["billed_amount"] += billed_amount
             totals["estimated_cost"] += estimated_cost
-            totals["rule_estimated_cost"] += rule_estimated_cost
-            totals["upstream_imported_cost"] += upstream_imported_cost
-            totals["upstream_matched_requests"] += upstream_matched_requests
-            totals["upstream_request_id_matches"] += upstream_request_id_matches
-            totals["upstream_tokens_time_matches"] += upstream_tokens_time_matches
             totals["configured_models" if configured else "unconfigured_models"] += 1
 
         channels = list(channels_by_id.values())
         for channel in channels:
             channel["billed_amount"] = self._round_money(channel["billed_amount"])
             channel["estimated_cost"] = self._round_money(channel["estimated_cost"])
-            channel["rule_estimated_cost"] = self._round_money(channel["rule_estimated_cost"])
-            channel["upstream_imported_cost"] = self._round_money(channel["upstream_imported_cost"])
             channel["gross_margin"] = self._round_money(channel["gross_margin"])
             channel["margin_rate"] = self._margin_rate(channel["gross_margin"], channel["billed_amount"])
             channel["models"].sort(key=lambda item: (item["estimated_cost"], item["request_count"]), reverse=True)
@@ -447,79 +324,16 @@ class CostAccountingService:
             **totals,
             "billed_amount": self._round_money(totals["billed_amount"]),
             "estimated_cost": self._round_money(totals["estimated_cost"]),
-            "rule_estimated_cost": self._round_money(totals["rule_estimated_cost"]),
-            "upstream_imported_cost": self._round_money(totals["upstream_imported_cost"]),
             "gross_margin": self._round_money(gross_margin),
             "margin_rate": self._margin_rate(gross_margin, totals["billed_amount"]),
         }
-        upstream_import = self._upstream_import_summary(start_time, end_time, channel_id)
-        summary["upstream_unmatched_cost"] = self._round_money(max(
-            0.0,
-            float(upstream_import.get("cost") or 0) - float(totals["upstream_imported_cost"] or 0),
-        ))
 
         return {
             "range": {"start_time": start_time, "end_time": end_time},
             "summary": summary,
             "channels": channels,
             "rules": rules,
-            "upstream_import": upstream_import,
         }
-
-    def _upstream_import_summary(
-        self,
-        start_time: int,
-        end_time: int,
-        channel_id: Optional[int] = None,
-    ) -> Dict[str, Any]:
-        result = {
-            "available": False,
-            "request_count": 0,
-            "matched_request_count": 0,
-            "unmatched_request_count": 0,
-            "request_id_matches": 0,
-            "tokens_time_matches": 0,
-            "quota_used": 0,
-            "cost": 0.0,
-        }
-        if not self._table_exists("api_tools_upstream_logs"):
-            return result
-
-        start_time = max(start_time, UPSTREAM_MIN_SYNC_START_TIME)
-        params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
-        channel_clause = ""
-        if channel_id and channel_id > 0:
-            channel_clause = " AND u.channel_id = :channel_id"
-            params["channel_id"] = channel_id
-        rows = self.db.execute(f"""
-            SELECT COUNT(*) as request_count,
-                COALESCE(SUM(CASE WHEN u.local_log_id > 0 THEN 1 ELSE 0 END), 0) as matched_request_count,
-                COALESCE(SUM(CASE WHEN u.match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
-                COALESCE(SUM(CASE WHEN u.match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches,
-                COALESCE(SUM(u.quota), 0) as quota_used,
-                COALESCE(SUM(CASE WHEN cfg.recharge_multiplier > 0 THEN u.quota / cfg.recharge_multiplier ELSE u.quota END), 0) as adjusted_quota
-            FROM api_tools_upstream_logs u
-            LEFT JOIN api_tools_upstream_log_sync_config cfg ON cfg.base_url = u.source_url
-            WHERE u.created_at >= :start_time AND u.created_at <= :end_time AND u.type = 2
-                {channel_clause}
-        """, params)
-        if not rows:
-            return result
-        quota = int(rows[0].get("quota_used") or 0)
-        adjusted_quota = float(rows[0].get("adjusted_quota") or 0)
-        request_count = int(rows[0].get("request_count") or 0)
-        matched_count = int(rows[0].get("matched_request_count") or 0)
-        result.update({
-            "available": True,
-            "request_count": request_count,
-            "matched_request_count": matched_count,
-            "unmatched_request_count": max(0, request_count - matched_count),
-            "request_id_matches": int(rows[0].get("request_id_matches") or 0),
-            "tokens_time_matches": int(rows[0].get("tokens_time_matches") or 0),
-            "quota_used": quota,
-            "cost": self._round_money(adjusted_quota / QUOTA_PER_USD),
-        })
-        return result
 
     def _load_channel_model_mappings(self, channel_id: Optional[int] = None) -> Dict[int, Dict[str, str]]:
         mappings: Dict[int, Dict[str, str]] = {}
@@ -700,13 +514,6 @@ class CostAccountingService:
         if billed <= 0:
             return 0.0
         return round(margin / billed * 100, 2)
-
-    def _clamp_matched_count(self, value: int, total: int) -> int:
-        if value < 0:
-            return 0
-        if value > total:
-            return total
-        return value
 
 
 _service: Optional[CostAccountingService] = None

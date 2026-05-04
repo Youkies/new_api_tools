@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NewAPI 日志导出助手
 // @namespace    https://newapi.youkies.space/
-// @version      1.2.5
-// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出、上传和注册 NewAPI Tools 后台同步
+// @version      1.2.13
+// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出
 // @author       Youkies
 // @match        *://*/*
 // @grant        none
@@ -20,6 +20,7 @@
   };
 
   let lastCapturedParams = {};
+  let lastCapturedAuth = {};
   let isExporting = false;
   let shouldAbort = false;
   let routeCheckTimer = null;
@@ -48,9 +49,63 @@
     return path === "/api/log" || path === "/api/log/self";
   }
 
-  function captureLogParams(rawUrl) {
+  function requestUrl(rawUrl) {
+    return typeof rawUrl === "string" ? rawUrl : rawUrl?.url || "";
+  }
+
+  function readHeaderValue(headers, name) {
+    if (!headers) return "";
+    const lowerName = String(name || "").toLowerCase();
+
     try {
-      const url = typeof rawUrl === "string" ? rawUrl : rawUrl?.url || "";
+      if (typeof headers.get === "function") {
+        return headers.get(name) || headers.get(lowerName) || "";
+      }
+      if (Array.isArray(headers)) {
+        const found = headers.find(
+          ([key]) => String(key || "").toLowerCase() === lowerName
+        );
+        return found ? String(found[1] || "") : "";
+      }
+      for (const [key, value] of Object.entries(headers)) {
+        if (String(key || "").toLowerCase() === lowerName) {
+          return String(value || "");
+        }
+      }
+    } catch (_) {
+      return "";
+    }
+    return "";
+  }
+
+  function captureLogAuth(rawUrl, init, requestHeaders) {
+    const url = requestUrl(rawUrl);
+    if (!url || !url.includes("/api/log")) return;
+
+    let parsed;
+    try {
+      parsed = new URL(url, location.origin);
+    } catch (_) {
+      return;
+    }
+    if (!isLogListPath(parsed.pathname)) return;
+
+    const headers = requestHeaders || init?.headers || rawUrl?.headers;
+    const auth = readHeaderValue(headers, "Authorization");
+    const userId = readHeaderValue(headers, "New-API-User");
+    if (auth || userId) {
+      lastCapturedAuth = {
+        token: normalizeStoredToken(auth),
+        userId: String(userId || "").trim(),
+      };
+    }
+  }
+
+  function captureLogParams(rawUrl, init, requestHeaders) {
+    try {
+      captureLogAuth(rawUrl, init, requestHeaders);
+
+      const url = requestUrl(rawUrl);
       if (!url || !url.includes("/api/log")) return;
 
       const parsed = new URL(url, location.origin);
@@ -86,7 +141,7 @@
 
     if (_origFetch) {
       window.fetch = function (...args) {
-        captureLogParams(args[0]);
+        captureLogParams(args[0], args[1]);
         return _origFetch(...args);
       };
     }
@@ -97,187 +152,168 @@
       captureLogParams(url);
       return origXHROpen.call(this, method, url, ...rest);
     };
+
+    const origXHRSetRequestHeader = XMLHttpRequest.prototype.setRequestHeader;
+    XMLHttpRequest.prototype.setRequestHeader = function (name, value) {
+      this.__logExporterHeaders = this.__logExporterHeaders || {};
+      this.__logExporterHeaders[name] = value;
+      return origXHRSetRequestHeader.call(this, name, value);
+    };
+
+    const origXHRSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function (...args) {
+      captureLogParams(this.__logExporterUrl, null, this.__logExporterHeaders);
+      return origXHRSend.apply(this, args);
+    };
   }
 
   installNetworkInterceptor();
 
+  function normalizeStoredToken(value) {
+    const token = String(value || "").replace(/^bearer\s+/i, "").trim();
+    if (!token || token === "null" || token === "undefined") return "";
+    if (token.length < 8) return "";
+    if (/^[{[]/.test(token)) return "";
+    return token;
+  }
+
+  function parseMaybeJSON(value) {
+    if (!value || typeof value !== "string") return value;
+    const trimmed = value.trim();
+    if (!trimmed || !/^[{[]/.test(trimmed)) return value;
+    try {
+      return JSON.parse(trimmed);
+    } catch (_) {
+      return value;
+    }
+  }
+
+  function findTokenInValue(value, depth = 0) {
+    if (depth > 4 || value === null || value === undefined) return "";
+    if (typeof value === "string") {
+      const parsed = parseMaybeJSON(value);
+      if (parsed !== value) return findTokenInValue(parsed, depth + 1);
+      return normalizeStoredToken(value);
+    }
+    if (typeof value !== "object") return "";
+
+    const tokenKeys = [
+      "token",
+      "access_token",
+      "accessToken",
+      "jwt",
+      "jwt_token",
+      "auth_token",
+      "session",
+    ];
+    for (const key of tokenKeys) {
+      const token = normalizeStoredToken(value[key]);
+      if (token) return token;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (key === "authToken" || key === "toolsToken") continue;
+      const token = findTokenInValue(child, depth + 1);
+      if (token) return token;
+    }
+    return "";
+  }
+
+  function findUserIdInValue(value, depth = 0) {
+    if (depth > 4 || value === null || value === undefined) return "";
+    if (typeof value !== "object") return "";
+
+    for (const key of ["id", "user_id", "userId"]) {
+      const userId = String(value[key] || "").trim();
+      if (userId) return userId;
+    }
+    for (const child of Object.values(value)) {
+      const userId = findUserIdInValue(child, depth + 1);
+      if (userId) return userId;
+    }
+    return "";
+  }
+
+  function findStoredLoginState() {
+    const state = { token: "", userId: "" };
+    const storages = [localStorage, sessionStorage].filter(Boolean);
+    const preferredKeys = [
+      "user",
+      "session",
+      "token",
+      "access_token",
+      "accessToken",
+      "jwt",
+      "jwt_token",
+      "auth_token",
+      "newapi_token",
+    ];
+
+    for (const storage of storages) {
+      for (const key of preferredKeys) {
+        const value = parseMaybeJSON(storage.getItem(key));
+        if (!state.token) state.token = findTokenInValue(value);
+        if (!state.userId) state.userId = findUserIdInValue(value);
+        if (state.token && state.userId) return state;
+      }
+    }
+
+    for (const storage of storages) {
+      for (let idx = 0; idx < storage.length; idx++) {
+        const key = storage.key(idx) || "";
+        const lowerKey = key.toLowerCase();
+        if (key === CONFIG.TOOLS_CONFIG_KEY || lowerKey.includes("newapi_tools")) {
+          continue;
+        }
+        if (!/(user|token|session|auth|jwt)/.test(lowerKey)) {
+          continue;
+        }
+        const value = parseMaybeJSON(storage.getItem(key));
+        if (!state.token) state.token = findTokenInValue(value);
+        if (!state.userId) state.userId = findUserIdInValue(value);
+        if (state.token && state.userId) return state;
+      }
+    }
+
+    return state;
+  }
+
   function getAuthHeaders() {
     const headers = {};
 
+    if (lastCapturedAuth.userId) {
+      headers["New-API-User"] = String(lastCapturedAuth.userId);
+    }
+    if (lastCapturedAuth.token) {
+      headers.Authorization = `Bearer ${lastCapturedAuth.token}`;
+    }
+
     try {
       const user = JSON.parse(localStorage.getItem("user") || "{}");
-      if (user.id) headers["New-API-User"] = String(user.id);
-      if (user.token) headers.Authorization = `Bearer ${user.token}`;
+      if (!headers["New-API-User"] && user.id) {
+        headers["New-API-User"] = String(user.id);
+      }
+      const userToken = normalizeStoredToken(user.token);
+      if (!headers.Authorization && userToken) {
+        headers.Authorization = `Bearer ${userToken}`;
+      }
     } catch (_) {
       // User info is optional; cookie auth may still work.
     }
 
-    const session = localStorage.getItem("session");
+    const session = normalizeStoredToken(localStorage.getItem("session"));
     if (!headers.Authorization && session) {
       headers.Authorization = `Bearer ${session}`;
     }
 
+    const stored = findStoredLoginState();
+    if (!headers.Authorization && stored.token) {
+      headers.Authorization = `Bearer ${stored.token}`;
+    }
+    if (!headers["New-API-User"] && stored.userId) {
+      headers["New-API-User"] = stored.userId;
+    }
+
     return headers;
-  }
-
-  function getStoredToolsConfig() {
-    try {
-      return {
-        toolsUrl: "",
-        authToken: "",
-        uploadEnabled: false,
-        registerEnabled: false,
-        matchToleranceSeconds: 60,
-        syncIntervalMinutes: 1,
-        rechargeMultiplier: 1,
-        ...(JSON.parse(localStorage.getItem(CONFIG.TOOLS_CONFIG_KEY) || "{}") || {}),
-      };
-    } catch (_) {
-      return {
-        toolsUrl: "",
-        authToken: "",
-        uploadEnabled: false,
-        registerEnabled: false,
-        matchToleranceSeconds: 60,
-        syncIntervalMinutes: 1,
-        rechargeMultiplier: 1,
-      };
-    }
-  }
-
-  function saveToolsConfig(config) {
-    localStorage.setItem(CONFIG.TOOLS_CONFIG_KEY, JSON.stringify(config));
-  }
-
-  function getToolsAuthHeaders(authToken) {
-    const token = String(authToken || "").trim();
-    const headers = { "Content-Type": "application/json" };
-    if (!token) return headers;
-    if (/^bearer\s+/i.test(token)) {
-      headers.Authorization = token;
-    } else {
-      headers["X-API-Key"] = token;
-    }
-    return headers;
-  }
-
-  function getToolsOptionsFromForm() {
-    const toolsUrl = $id("lex-tools-url").value.trim().replace(/\/+$/, "");
-    const authToken = $id("lex-tools-token").value.trim();
-    const uploadEnabled = Boolean($id("lex-upload-tools").checked);
-    const registerEnabled = Boolean($id("lex-register-tools").checked);
-    const matchToleranceSeconds =
-      Number.parseInt($id("lex-match-window").value, 10) || 60;
-    const syncIntervalMinutes =
-      Number.parseInt($id("lex-sync-interval").value, 10) || 1;
-    const rechargeMultiplier =
-      Number.parseFloat($id("lex-recharge-multiplier").value) || 1;
-
-    return {
-      toolsUrl,
-      authToken,
-      uploadEnabled,
-      registerEnabled,
-      matchToleranceSeconds,
-      syncIntervalMinutes,
-      rechargeMultiplier,
-    };
-  }
-
-  function getUpstreamLoginState() {
-    const headers = getAuthHeaders();
-    const auth = String(headers.Authorization || "");
-    return {
-      token: auth.replace(/^bearer\s+/i, "").trim(),
-      userId: String(headers["New-API-User"] || "").trim(),
-    };
-  }
-
-  async function registerUpstreamToTools(toolsOptions) {
-    saveToolsConfig(toolsOptions);
-
-    if (!toolsOptions.registerEnabled) {
-      return null;
-    }
-    if (!toolsOptions.toolsUrl) {
-      throw new Error("已启用后台同步注册，但未填写 NewAPI Tools 地址");
-    }
-    if (!toolsOptions.authToken) {
-      throw new Error("已启用后台同步注册，但未填写 NewAPI Tools API Key/JWT");
-    }
-
-    const upstream = getUpstreamLoginState();
-    if (!upstream.token) {
-      throw new Error("未找到当前上游登录 token，请先登录 NewAPI 后刷新页面");
-    }
-
-    const registerUrl = `${toolsOptions.toolsUrl}/api/cost/upstream-sync/register`;
-    const resp = await fetch(registerUrl, {
-      method: "POST",
-      headers: getToolsAuthHeaders(toolsOptions.authToken),
-      body: JSON.stringify({
-        enabled: true,
-        source_name: document.title || location.host,
-        base_url: location.origin,
-        endpoint: "auto",
-        auth_token: upstream.token,
-        user_id: upstream.userId,
-        page_size: CONFIG.PAGE_SIZE,
-        request_delay_ms: CONFIG.REQUEST_DELAY,
-        interval_minutes: Math.max(1, toolsOptions.syncIntervalMinutes || 1),
-        lookback_minutes: 60,
-        overlap_minutes: 10,
-        match_tolerance_seconds: toolsOptions.matchToleranceSeconds || 60,
-        recharge_multiplier: Math.max(0.000001, toolsOptions.rechargeMultiplier || 1),
-        min_sync_start_time: 1777564800,
-        log_type: Number.parseInt($id("lex-type").value, 10) || 2,
-        max_pages_per_run: 1000,
-      }),
-    });
-
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || data.success === false) {
-      const message =
-        data?.error?.message || data?.message || `HTTP ${resp.status}`;
-      throw new Error(`注册后台同步失败：${message}`);
-    }
-    return data.data || data;
-  }
-
-  async function uploadLogsToTools(logs, options, toolsOptions) {
-    saveToolsConfig(toolsOptions);
-
-    if (!toolsOptions.uploadEnabled) {
-      return null;
-    }
-    if (!toolsOptions.toolsUrl) {
-      throw new Error("已启用上传，但未填写 NewAPI Tools 地址");
-    }
-    if (!toolsOptions.authToken) {
-      throw new Error("已启用上传，但未填写 NewAPI Tools API Key/JWT");
-    }
-
-    const uploadUrl = `${toolsOptions.toolsUrl}/api/cost/upstream-sync/upload`;
-    const resp = await fetch(uploadUrl, {
-      method: "POST",
-      headers: getToolsAuthHeaders(toolsOptions.authToken),
-      body: JSON.stringify({
-        source_url: location.origin,
-        source_name: document.title || location.host,
-        start_time: options.startTs,
-        end_time: options.endTs,
-        match_tolerance_seconds: toolsOptions.matchToleranceSeconds,
-        logs,
-      }),
-    });
-
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok || data.success === false) {
-      const message =
-        data?.error?.message || data?.message || `HTTP ${resp.status}`;
-      throw new Error(`上传 NewAPI Tools 失败：${message}`);
-    }
-    return data.data || data;
   }
 
   async function apiFetch(path, params = {}) {
@@ -399,10 +435,16 @@
 
   function parseOther(otherStr) {
     if (!otherStr) return {};
-    if (typeof otherStr === "object") return otherStr;
+    if (typeof otherStr === "object") {
+      return Array.isArray(otherStr) ? {} : otherStr;
+    }
 
     try {
-      return JSON.parse(otherStr);
+      const parsed = JSON.parse(otherStr);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        return {};
+      }
+      return parsed;
     } catch (_) {
       return {};
     }
@@ -577,6 +619,21 @@
       `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}_` +
       `${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}`
     );
+  }
+
+  function safeFilenamePart(value) {
+    const text = String(value || "")
+      .trim()
+      .replace(/^https?:\/\//i, "")
+      .replace(/[\\/:*?"<>|]+/g, "_")
+      .replace(/\s+/g, "_")
+      .replace(/^_+|_+$/g, "");
+    return text || "site";
+  }
+
+  function exportFilenameBase() {
+    const site = safeFilenamePart(location.hostname || location.host || "site");
+    return `newapi_logs_${site}_${nowDateStr()}`;
   }
 
   function todayStart() {
@@ -887,7 +944,6 @@
   function buildModalHTML() {
     const start = toLocalDatetimeStr(todayStart());
     const end = toLocalDatetimeStr(new Date());
-    const tools = getStoredToolsConfig();
 
     return `
       <div id="log-export-modal">
@@ -969,49 +1025,6 @@
             </div>
           </div>
           <div class="lex-hint">默认：500000 quota = 1 USD。</div>
-
-          <div class="lex-row full">
-            <label class="lex-check">
-              <input type="checkbox" id="lex-upload-tools" ${tools.uploadEnabled ? "checked" : ""}>
-              导出后上传到 NewAPI Tools 自动匹配成本
-            </label>
-          </div>
-
-          <div class="lex-row full">
-            <label class="lex-check">
-              <input type="checkbox" id="lex-register-tools" ${tools.registerEnabled ? "checked" : ""}>
-              保存当前上游登录态供 Tools 后台定时拉取
-            </label>
-          </div>
-
-          <div class="lex-row">
-            <div class="lex-field">
-              <label for="lex-tools-url">NewAPI Tools 地址</label>
-              <input type="text" id="lex-tools-url" value="${escapeAttr(tools.toolsUrl)}" placeholder="https://tools.example.com">
-            </div>
-            <div class="lex-field">
-              <label for="lex-tools-token">Tools API Key / Bearer JWT</label>
-              <input type="password" id="lex-tools-token" value="${escapeAttr(tools.authToken)}" placeholder="推荐填写 tools 的 API_KEY">
-            </div>
-          </div>
-
-          <div class="lex-row">
-            <div class="lex-field">
-              <label for="lex-match-window">上传匹配窗口（秒）</label>
-              <input type="number" id="lex-match-window" min="1" max="3600" value="${Number(tools.matchToleranceSeconds || 60)}">
-            </div>
-            <div class="lex-field">
-              <label for="lex-sync-interval">后台拉取间隔（分钟）</label>
-              <input type="number" id="lex-sync-interval" min="1" max="1440" value="${Number(tools.syncIntervalMinutes || 1)}">
-            </div>
-          </div>
-          <div class="lex-row full">
-            <div class="lex-field">
-              <label for="lex-recharge-multiplier">上游充值倍率</label>
-              <input type="number" id="lex-recharge-multiplier" min="0.000001" step="0.01" value="${Number(tools.rechargeMultiplier || 1)}">
-            </div>
-          </div>
-          <div class="lex-hint">勾选后台拉取会把当前上游网址和登录 token 保存到 Tools：${escapeAttr(location.origin)}。1:10 的上游充值倍率填 10，后台只拉取 2026-05-01 之后的日志。</div>
 
           <div class="lex-actions">
             <button class="lex-btn lex-btn-secondary" id="lex-btn-sync" type="button" title="从页面当前筛选条件同步">同步页面筛选</button>
@@ -1153,29 +1166,10 @@
       Number.parseInt($id("lex-quota-unit").value, 10) ||
       CONFIG.QUOTA_PER_UNIT;
     const format = $id("lex-format").value;
-    const toolsOptions = getToolsOptionsFromForm();
-    saveToolsConfig(toolsOptions);
 
     setExportingState(true);
 
     try {
-      let registerText = "";
-      try {
-        if (toolsOptions.registerEnabled) {
-          $id("lex-progress-text").textContent =
-            "正在保存 Tools 后台同步配置...";
-          const registerResult = await registerUpstreamToTools(toolsOptions);
-          if (registerResult) {
-            registerText =
-              `\n后台同步：已保存 ${registerResult.base_url || location.origin}` +
-              `，每 ${Number(registerResult.interval_minutes || toolsOptions.syncIntervalMinutes || 1)} 分钟拉取`;
-          }
-        }
-      } catch (registerErr) {
-        console.error("[LogExporter] Register failed:", registerErr);
-        registerText = `\n后台同步失败：${registerErr.message}`;
-      }
-
       const logs = await exportLogs(
         options,
         (page, totalPages, count, totalRecords) => {
@@ -1193,13 +1187,13 @@
 
       if (logs.length === 0) {
         showResult(
-          `未查询到任何日志数据，请检查筛选条件。${registerText}`,
+          "未查询到任何日志数据，请检查筛选条件。",
           true
         );
         return;
       }
 
-      const filename = `newapi_logs_${nowDateStr()}`;
+      const filename = exportFilenameBase();
       if (format === "csv") {
         downloadFile(logsToCSV(logs, quotaPerUnit), `${filename}.csv`, "text/csv");
       } else {
@@ -1224,34 +1218,14 @@
       );
       const models = new Set(logs.map((log) => log.model_name).filter(Boolean));
       const users = new Set(logs.map((log) => log.username).filter(Boolean));
-      let uploadText = "";
-      try {
-        if (toolsOptions.uploadEnabled) {
-          $id("lex-progress-text").textContent = "正在上传到 NewAPI Tools...";
-          const uploadResult = await uploadLogsToTools(logs, options, toolsOptions);
-          if (uploadResult) {
-            const match = uploadResult.match || {};
-            uploadText =
-              `\n上传：已导入 ${Number(uploadResult.imported || 0).toLocaleString()} 条` +
-              `\n匹配：${Number(match.matched_count || 0).toLocaleString()} 条` +
-              `（Token+时间 ${Number(match.tokens_time_matches || 0).toLocaleString()}，Request ID ${Number(match.request_id_matches || 0).toLocaleString()}）`;
-          }
-        }
-      } catch (uploadErr) {
-        console.error("[LogExporter] Upload failed:", uploadErr);
-        uploadText = `\n上传失败：${uploadErr.message}`;
-      }
 
       showResult(
         `导出成功。\n` +
           `共 ${logs.length} 条记录\n` +
           `总费用：$${(totalQuota / quotaPerUnit).toFixed(4)}\n` +
           `输入：${totalInput.toLocaleString()} tokens，输出：${totalOutput.toLocaleString()} tokens\n` +
-          `模型数：${models.size}，用户数：${users.size}` +
-          registerText +
-          uploadText,
-        registerText.startsWith("\n后台同步失败") ||
-          uploadText.startsWith("\n上传失败")
+          `模型数：${models.size}，用户数：${users.size}`,
+        false
       );
     } catch (err) {
       console.error("[LogExporter] Export failed:", err);

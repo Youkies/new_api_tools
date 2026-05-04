@@ -3,13 +3,10 @@ package config
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -61,19 +58,6 @@ type Config struct {
 
 // Global config instance
 var cfg *Config
-var runtimeAuthMu sync.RWMutex
-
-type runtimeAuthConfig struct {
-	APIKey    string `json:"api_key"`
-	UpdatedAt int64  `json:"updated_at"`
-}
-
-type APIKeyInfo struct {
-	APIKey     string `json:"api_key"`
-	Source     string `json:"source"`
-	ConfigPath string `json:"config_path"`
-	UpdatedAt  int64  `json:"updated_at"`
-}
 
 // Load reads configuration from environment variables
 func Load() *Config {
@@ -123,7 +107,6 @@ func Load() *Config {
 
 	// Auto-detect database engine from DSN
 	cfg.DatabaseEngine = detectEngine(cfg.SQLDSN)
-	cfg.loadRuntimeAuthConfig()
 
 	// Generate random JWT secret if not explicitly configured
 	if cfg.JWTSecretKey == "" {
@@ -196,110 +179,6 @@ func Get() *Config {
 		panic("config not loaded, call config.Load() first")
 	}
 	return cfg
-}
-
-// EffectiveAPIKey returns the API key used by X-API-Key authentication.
-// A persisted key in DATA_DIR overrides the API_KEY environment variable.
-func EffectiveAPIKey() string {
-	info := GetAPIKeyInfo()
-	return info.APIKey
-}
-
-// GetAPIKeyInfo returns the active API key and where it came from.
-func GetAPIKeyInfo() APIKeyInfo {
-	c := Get()
-	runtimeAuthMu.RLock()
-	defer runtimeAuthMu.RUnlock()
-
-	if runtimeAPIKey != "" {
-		return APIKeyInfo{
-			APIKey:     runtimeAPIKey,
-			Source:     "file",
-			ConfigPath: c.runtimeAuthConfigPath(),
-			UpdatedAt:  runtimeAPIKeyUpdatedAt,
-		}
-	}
-	if c.APIKey != "" {
-		return APIKeyInfo{
-			APIKey:     c.APIKey,
-			Source:     "env",
-			ConfigPath: c.runtimeAuthConfigPath(),
-		}
-	}
-	return APIKeyInfo{
-		Source:     "missing",
-		ConfigPath: c.runtimeAuthConfigPath(),
-	}
-}
-
-// SetRuntimeAPIKey stores an editable API key in DATA_DIR.
-func SetRuntimeAPIKey(apiKey string) (APIKeyInfo, error) {
-	c := Get()
-	apiKey = strings.TrimSpace(apiKey)
-	if len(apiKey) < 8 {
-		return APIKeyInfo{}, fmt.Errorf("api_key must be at least 8 characters")
-	}
-
-	now := time.Now().Unix()
-	authCfg := runtimeAuthConfig{
-		APIKey:    apiKey,
-		UpdatedAt: now,
-	}
-	payload, err := json.MarshalIndent(authCfg, "", "  ")
-	if err != nil {
-		return APIKeyInfo{}, err
-	}
-	path := c.runtimeAuthConfigPath()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return APIKeyInfo{}, err
-	}
-	if err := os.WriteFile(path, payload, 0o600); err != nil {
-		return APIKeyInfo{}, err
-	}
-
-	runtimeAuthMu.Lock()
-	runtimeAPIKey = apiKey
-	runtimeAPIKeyUpdatedAt = now
-	runtimeAuthMu.Unlock()
-
-	return GetAPIKeyInfo(), nil
-}
-
-var runtimeAPIKey string
-var runtimeAPIKeyUpdatedAt int64
-
-func (c *Config) runtimeAuthConfigPath() string {
-	dataDir := strings.TrimSpace(c.DataDir)
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-	if !filepath.IsAbs(dataDir) {
-		if absDir, err := filepath.Abs(dataDir); err == nil {
-			dataDir = absDir
-		}
-	}
-	return filepath.Join(dataDir, "tools_auth.json")
-}
-
-func (c *Config) loadRuntimeAuthConfig() {
-	path := c.runtimeAuthConfigPath()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			log.Warn().Err(err).Str("path", path).Msg("读取持久化 API Key 配置失败")
-		}
-		return
-	}
-
-	var authCfg runtimeAuthConfig
-	if err := json.Unmarshal(data, &authCfg); err != nil {
-		log.Warn().Err(err).Str("path", path).Msg("解析持久化 API Key 配置失败")
-		return
-	}
-	runtimeAuthMu.Lock()
-	runtimeAPIKey = strings.TrimSpace(authCfg.APIKey)
-	runtimeAPIKeyUpdatedAt = authCfg.UpdatedAt
-	runtimeAuthMu.Unlock()
 }
 
 // detectEngine determines the database engine from DSN format

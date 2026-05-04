@@ -93,6 +93,7 @@ func main() {
 		handler.RegisterUserManagementRoutes(api)
 		handler.RegisterLogAnalyticsRoutes(api)
 		handler.RegisterCostAccountingRoutes(api)
+		handler.RegisterLogMatcherRoutes(api)
 
 		// Phase 2.3: IP Monitoring, Risk Monitoring, Model Status
 		handler.RegisterIPMonitoringRoutes(api)
@@ -120,10 +121,6 @@ func main() {
 	// Auto group scheduled scans.
 	stopAutoGroup := make(chan struct{})
 	service.StartBackgroundAutoGroupScan(stopAutoGroup)
-
-	// Upstream NewAPI log import for cost reconciliation.
-	stopUpstreamLogSync := make(chan struct{})
-	service.StartBackgroundUpstreamLogSync(stopUpstreamLogSync)
 
 	// IP recording enforcement: check every 10 minutes, enable if any user disabled it
 	stopIPEnforce := make(chan struct{})
@@ -156,7 +153,6 @@ func main() {
 	// Stop background tasks
 	close(stopSystemTasks)
 	close(stopAutoGroup)
-	close(stopUpstreamLogSync)
 	close(stopIPEnforce)
 
 	// Give the server 10 seconds to finish processing requests

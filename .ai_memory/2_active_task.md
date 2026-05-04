@@ -2,39 +2,37 @@
 
 ## 目标
 
-把 NewAPI 日志导出助手的思路融合进工具的成本核算：支持从上游 NewAPI 手动或定时同步消费日志，并把上游真实成本与本站本地日志成本合并。
+先在本地完成 NewAPI 多站点 CSV 日志匹配核算器，验证匹配口径、成本倍率和按次不亏价；随后迁入 NewAPI Tools，让本站日志从数据库读取，上游日志手动上传分析。
 
 ## 已完成
 
-- Go 后端新增上游日志同步服务，持久化配置到 `api_tools_upstream_log_sync_config`，导入上游日志到 `api_tools_upstream_logs`。
-- Go `/api/cost` 新增：
-  - `GET /api/cost/upstream-sync/config`
-  - `POST /api/cost/upstream-sync/config`
-  - `POST /api/cost/upstream-sync/run`
-- Go 启动后新增后台定时同步任务；启用后按配置的 `interval_minutes`、`lookback_minutes`、`overlap_minutes` 执行。
-- 成本核算改为优先使用已匹配的上游导入成本，未匹配部分继续按本地成本规则估算。
-- 根据 `参考日志/` 的真实样本验证：本站与上游 `Request ID` 精确匹配率为 0%，因此匹配主策略改为“一对一输入 tokens + 输出 tokens + 时间窗口”，`Request ID` 仅保留为高置信兜底和诊断统计。
-- 前端成本核算页新增“上游日志同步”配置区、手动同步按钮、匹配率和导入/规则成本拆分展示。
-- Go 后端新增 `POST /api/cost/upstream-sync/upload`，支持 userscript 上传已导出的上游原始日志，并保存 `source_url`/`source_name` 后立即执行一对一匹配。
-- `NewAPI 日志导出助手-1.2.2.user.js` 已改造为 1.2.3：导出后可填写 NewAPI Tools 地址和 `API_KEY`/Bearer JWT，上传日志到 tools 后台自动匹配。
-- Go 后端新增 `POST /api/cost/upstream-sync/register`：脚本可显式上传当前上游 `base_url`、`source_name`、`auth_token`、`user_id` 和后台拉取间隔，后端按 `base_url` 建/更新多上游同步配置。
-- Go 后台上游同步从单配置轮询改为扫描所有已启用配置；每个上游按自己的 `interval_minutes`、`lookback_minutes`、`overlap_minutes` 拉取，并继续通过 `source_url` 指纹去重。
-- `NewAPI 日志导出助手-1.2.2.user.js` 已升级为 1.2.4：新增“保存当前上游登录态供 Tools 后台定时拉取”显式勾选项和拉取间隔输入；未勾选时不会上传上游 token。
-- 成本核算页新增“日志助手接入”面板，直接显示可填入脚本的 `NewAPI Tools 地址`、`Tools API Key` 和配置文件路径，并支持复制与保存 API Key。
-- Go 后端新增 `/api/cost/tools-access` 读写接口；脚本 API Key 会持久化到 `DATA_DIR/tools_auth.json`，容器默认对应 `/app/data/tools_auth.json`，文件 key 优先于环境变量 `API_KEY`。
-- 上游同步配置新增 `recharge_multiplier` 和 `min_sync_start_time`：成本按 `账面 quota / 500000 / 充值倍率` 折算，默认只获取/上传 `2026-05-01 00:00:00` 之后的上游日志。
-- 成本核算页“已注册上游”列表支持分别调整每个上游的充值倍率、最早同步时间和启用状态；userscript 升级为 1.2.5，注册时可带上充值倍率。
-- Python 兼容后端补齐配置接口和成本汇总对 `api_tools_upstream_logs.local_log_id` 的兼容读取；实际上游抓取同步仍以 Go 后端为正式实现。
+- 已将 Go/Python 后端、前端成本核算页恢复到 `a749d55`（日志分析导出完成后、上游成本整合开始前）的状态。
+- 已删除 `backend/internal/service/upstream_log_sync.go`，移除后台上游同步服务。
+- 已回退 `/api/cost/upstream-sync/*`、`/api/cost/tools-access`、上游日志导入/匹配汇总、日志助手接入面板、充值倍率和最早同步时间等相关实现。
+- 保留 `NewAPI 日志导出助手-1.2.2.user.js`，并升级到 1.2.13：导出文件名改为包含站点 host 和导出日期时间，例如 `newapi_logs_us.llmgate.io_20260504_155700.csv`；脚本已移除 Tools 上传、后台同步、检测接入等成本统计入口。
+- 新增 `scripts/newapi_log_matcher.py`：读取 `日志/` 下多站点 CSV，按渠道 alias 映射上游，标准化模型名，并用 `输入Tokens + 输出Tokens + 总Tokens + 时间窗口` 做一对一匹配；输出 `report.html` 静态 UI、`summary.md`、`matches.csv`、`local_status.csv`、`unmatched_upstream.csv`、`by_upstream.csv`。
+- 新增 `scripts/newapi_log_rules.example.json`：默认配置本地站 `newapi.youkies.space`，上游 `llmgate`、`omnai`、`opusclaw`、`guicore`，其中 `opusclaw` 按 1:10 充值比例使用 `cost_multiplier=0.1`。
+- 新增 `docs/local-newapi-log-matcher.md`：记录本地使用方式、匹配口径和后续迁入 NewAPI Tools 的方向。
+- 新增 Go 后端 `backend/internal/service/log_matcher.go` 与 `backend/internal/handler/log_matcher.go`：提供 `/api/log-match/analyze`，本站日志从数据库读取，上游 CSV 由 multipart 上传，支持文件名 alias 自动识别正式上游 host。
+- 前端新增 `frontend/src/components/LogMatcher.tsx`，并在导航加入 `日志对账` 页；页面支持上传多个上游 CSV、设置时间窗口、查看总账/上游汇总，并按状态、上游、本站渠道、本站模型、按次和关键词筛选每条记录。
 
 ## 验证结果
 
-- `go test ./...`（`backend/`）通过。
-- `python -m py_compile backend-py/app/auth.py backend-py/app/cost_accounting_routes.py` 通过。
 - `node --check "NewAPI 日志导出助手-1.2.2.user.js"` 通过。
-- `npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning。
+- `go test ./...`（`backend/`）通过。
+- `python -m py_compile backend-py/app/auth.py backend-py/app/cost_accounting_routes.py backend-py/app/cost_accounting_service.py` 通过。
+- `npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning 和大 chunk warning。
+- `python -m py_compile scripts\newapi_log_matcher.py` 通过。
+- `python scripts\newapi_log_matcher.py .\日志 --config scripts\newapi_log_rules.example.json` 通过；当前样本总账为本地收入 `$830.853798`、上游折算成本 `$703.264537`、毛利 `$127.589261`，匹配 3164 条、ambiguous 0 条、未匹配本地 1528 条。
+- `report.html` 内联 JS 已通过 `node --check` 验证；UI 支持按匹配状态、上游站点、本站渠道、本站模型筛选，并可只看按次。
+- NewAPI Tools 集成后，`go test ./...`（`backend/`）通过。
+- NewAPI Tools 集成后，`npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning 和大 chunk warning。
+- 前端 dev server 已启动在 `http://127.0.0.1:3000/log-match`，Vite 代理 `/api` 到 `localhost:8000`。
 
 ## 注意
 
-- `参考日志/` 和 `NewAPI 日志导出助手-1.2.2.user.js` 是用户提供/参考文件，当前未纳入提交范围。
-- `参考日志/` 是用户提供的样本文件，不纳入提交范围。
-- 当前已有本地提交 `ffa6174 新增上游日志同步成本整合`，本轮 userscript 上传适配尚未提交或 push。
+- 当前改动尚未提交或 push。
+- 最近 5 个已推送提交（`ffa6174`、`80d62d4`、`7272ed0`、`be4bd1f`、`ff5a5bf`）未用 `git revert` 生成反向提交，而是在工作区按文件恢复到 `a749d55` 后保留为未提交改动。
+- 当前本地工具默认只用渠道名做上游归属，避免 `claude-opus` 模型名误匹配到 `opusclaw`；模型名只参与匹配，不参与上游归属。
+- 现有 CSV 无法保证每条都 100% 精确对应；工具会给每条本地日志标记 `matched`、`ambiguous` 或 `unmatched`，真正全量精确需要后续在转发链路保存 `local_request_id -> upstream_request_id` 映射。
+- 本轮先完成 Go 后端和前端集成；Python 后端尚未新增 `/api/log-match/analyze` 兼容接口。

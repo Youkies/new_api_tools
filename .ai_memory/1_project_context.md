@@ -13,10 +13,8 @@
 - Go 正式后端已补齐性能基础设施：前端使用路由级懒加载；Go `/api/system/scale` 基于用户数、日志估算和 24h 请求量返回刷新建议；`/api/system/warmup-status` 反映后台热缓存预热状态；模型状态使用批量 SQL 按 `model_name + slot` 聚合；风控排行榜、模型状态和 IP 列表支持 `no_cache=true` 真刷新。
 - Go 正式后端已支持自动分组后台定时扫描：启动后按 `enabled`、`auto_scan_enabled`、`scan_interval_minutes` 静默执行 `RunScan(false)`，与前端“自动扫描”开关语义一致。
 - 日志分析页已支持 `/api/analytics/export` 原始日志导出；Go/Python 后端都提供同名接口，按时间、类型、模型、用户、令牌、渠道、分组、Request ID 等条件从 `logs` 表直接流式导出 CSV/JSON，避免前端逐页请求 NewAPI `/api/log` 导致大量请求中断。
-- 成本核算已接入上游日志同步设计：Go 正式后端通过 `/api/cost/upstream-sync/*` 配置、手动同步和后台定时同步上游 NewAPI 消费日志，导入到 `api_tools_upstream_logs`；成本汇总只使用已经一对一匹配到本地 `logs.id` 的上游成本，匹配主策略为“输入 tokens + 输出 tokens + 时间窗口”，`Request ID` 仅作为高置信兜底和诊断统计。参考样本显示本站与 5 个上游的 `Request ID` 精确匹配率为 0%，60 秒 token/time 窗口可匹配约 88%-94%。
-- 上游日志也可由 userscript 上传：Go `/api/cost/upstream-sync/upload` 接收 `source_url`、`source_name` 和原始 `logs` 数组，写入 `api_tools_upstream_logs` 后立即匹配；改造后的 `NewAPI 日志导出助手` 在上游页面复用浏览器登录态拉 `/api/log/` 或 `/api/log/self/`，再用 NewAPI Tools 的 `X-API-Key` 或 Bearer JWT 跨域上传。
-- 上游后台同步可由 userscript 显式注册：Go `/api/cost/upstream-sync/register` 接收当前上游 `base_url`、`source_name`、`auth_token`、`user_id` 和拉取间隔，按 `base_url` 建/更新多条上游配置；后台任务每分钟扫描所有已启用配置，按各自 `interval_minutes` 拉取，`source_key` 继续按上游 URL 指纹去重。
-- 成本核算页显示“日志助手接入”信息：`NewAPI Tools 地址`、脚本使用的 `Tools API Key` 和配置文件路径；Go 正式后端通过 `/api/cost/tools-access` 读取/保存 API Key，保存位置为 `DATA_DIR/tools_auth.json`，容器默认落在 `/app/data/tools_auth.json`，该文件中的 key 优先于环境变量 `API_KEY` 生效。
-- 上游配置支持 `recharge_multiplier` 充值倍率和 `min_sync_start_time` 最早同步时间：真实上游成本按 `quota / 500000 / recharge_multiplier` 折算，`1:10` 上游填 `10`；默认最早同步时间固定为 `2026-05-01 00:00:00`（Asia/Shanghai，Unix `1777564800`），同步和脚本上传都会过滤更早的上游日志。
+- 2026-05-04 已按用户要求回退“上游 NewAPI 日志同步/成本统计”集成：移除 Go/Python `/api/cost/upstream-sync/*`、`/api/cost/tools-access`、后台上游同步任务、前端成本核算页的日志助手接入/上游同步面板，以及 `api_tools_upstream_logs` 匹配汇总逻辑；保留更早的基础 `成本核算` 页和 `/api/analytics/export` 日志导出能力。
+- 2026-05-04 先以本地 CLI 方式重启上游日志对账方向：`scripts/newapi_log_matcher.py` 读取导出的 `newapi_logs_{host}_{date}.csv`，通过渠道 alias 映射上游、标准化模型名，并按 `输入Tokens + 输出Tokens + 总Tokens + 时间窗口` 做一对一高置信匹配；默认规则在 `scripts/newapi_log_rules.example.json`，其中 `api.opusclaw.me` 按 1:10 充值比例配置 `cost_multiplier=0.1`。工具输出 `report.html` 静态 UI，可按本站模型、本站渠道、状态、上游筛选查看每条本地日志；该工具不接数据库和后台，后续稳定后再迁入 NewAPI Tools。
+- 2026-05-04 已将日志对账迁入 Go 版 NewAPI Tools：新增 `/api/log-match/analyze`，Youkies/本站日志直接从 `logs` 数据库按时间范围读取消费日志，上游日志由用户上传 CSV；匹配口径沿用本地工具（渠道 alias -> 上游、标准化模型、tokens + 时间窗口），前端新增 `日志对账` 页面，支持勾选本站渠道和本站模型筛选每条匹配状态。
 - 用户确认偏好：功能完成并验证通过后，默认自动提交并 push 当前分支；提交前仍需检查 `git status` 和 diff 范围，避免带入无关改动。
 - 常用验证命令：`go test ./...`（在 `backend/`）、`python -m py_compile ...`、`npm run build`（在 `frontend/`）。

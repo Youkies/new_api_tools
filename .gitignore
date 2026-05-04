@@ -76,6 +76,7 @@ Thumbs.db
 response.json
 NewApi.apifox.json
 默认模块.openapi.json
+日志/
 
 
 new_api_tools/insert_mysql.sh

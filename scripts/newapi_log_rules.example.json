@@ -1,0 +1,33 @@
+{
+  "local_host": "newapi.youkies.space",
+  "quota_per_unit": 500000,
+  "time_window_seconds": 120,
+  "upstreams": {
+    "us.llmgate.io": {
+      "aliases": ["llmgate"],
+      "cost_multiplier": 1
+    },
+    "www.omnai.xyz": {
+      "aliases": ["ominiai", "omnai", "omni"],
+      "cost_multiplier": 1
+    },
+    "api.opusclaw.me": {
+      "aliases": ["opus", "opusclaw"],
+      "cost_multiplier": 0.1
+    },
+    "api.guicore.com": {
+      "aliases": ["guicore", "cpa", "gui"],
+      "cost_multiplier": 1
+    }
+  },
+  "model_suffix_patterns": [
+    "-\\u6e20\\u9053\\d+$",
+    "-nothinking$",
+    "-backup$",
+    "-standby$",
+    "-\\u5907\\u7528$",
+    "-windsurf$",
+    "-kiro$",
+    "-cli$"
+  ]
+}

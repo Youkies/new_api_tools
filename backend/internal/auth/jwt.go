@@ -73,10 +73,10 @@ func VerifyPassword(password string) bool {
 // VerifyAPIKey checks if the provided API key is valid
 // Uses constant-time comparison to prevent timing attacks
 func VerifyAPIKey(apiKey string) bool {
-	activeKey := config.EffectiveAPIKey()
-	if activeKey == "" {
+	cfg := config.Get()
+	if cfg.APIKey == "" {
 		// API key not configured: reject all requests to enforce explicit configuration
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(apiKey), []byte(activeKey)) == 1
+	return subtle.ConstantTimeCompare([]byte(apiKey), []byte(cfg.APIKey)) == 1
 }

@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ElementType } from 'react'
-import { Activity, AlertTriangle, Calculator, CheckCircle2, ChevronDown, ChevronRight, Copy, KeyRound, Loader2, Plus, RefreshCw, Save, Settings2, Trash2 } from 'lucide-react'
+import { Activity, AlertTriangle, Calculator, CheckCircle2, ChevronDown, ChevronRight, Loader2, Plus, RefreshCw, Save, Settings2, Trash2 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { Badge } from './ui/badge'
@@ -53,11 +53,6 @@ interface CostModelRow {
   completion_tokens: number
   billed_amount: number
   estimated_cost: number
-  rule_estimated_cost?: number
-  upstream_imported_cost?: number
-  upstream_matched_requests?: number
-  upstream_request_id_matches?: number
-  upstream_tokens_time_matches?: number
   gross_margin: number
   margin_rate: number
   cost_multiplier: number
@@ -74,11 +69,6 @@ interface CostChannelRow {
   completion_tokens: number
   billed_amount: number
   estimated_cost: number
-  rule_estimated_cost?: number
-  upstream_imported_cost?: number
-  upstream_matched_requests?: number
-  upstream_request_id_matches?: number
-  upstream_tokens_time_matches?: number
   gross_margin: number
   margin_rate: number
   configured_models: number
@@ -93,27 +83,10 @@ interface CostSummary {
   completion_tokens: number
   billed_amount: number
   estimated_cost: number
-  rule_estimated_cost?: number
-  upstream_imported_cost?: number
-  upstream_matched_requests?: number
-  upstream_request_id_matches?: number
-  upstream_tokens_time_matches?: number
-  upstream_unmatched_cost?: number
   gross_margin: number
   margin_rate: number
   configured_models: number
   unconfigured_models: number
-}
-
-interface UpstreamImportSummary {
-  available: boolean
-  request_count: number
-  matched_request_count: number
-  unmatched_request_count: number
-  request_id_matches: number
-  tokens_time_matches: number
-  quota_used: number
-  cost: number
 }
 
 interface CostSummaryPayload {
@@ -124,42 +97,6 @@ interface CostSummaryPayload {
   summary: CostSummary
   channels: CostChannelRow[]
   rules: CostRule[]
-  upstream_import?: UpstreamImportSummary
-}
-
-interface UpstreamSyncConfig {
-  id: number
-  enabled: boolean
-  source_name: string
-  base_url: string
-  endpoint: string
-  auth_token: string
-  auth_token_set: boolean
-  clear_auth_token?: boolean
-  user_id: string
-  page_size: number
-  request_delay_ms: number
-  interval_minutes: number
-  lookback_minutes: number
-  overlap_minutes: number
-  match_tolerance_seconds: number
-  recharge_multiplier: number
-  min_sync_start_time: number
-  log_type: number
-  max_pages_per_run: number
-  last_sync_at: number
-  last_success_at: number
-  last_error: string
-  total_imported: number
-  updated_at: number
-}
-
-interface ToolsAccessConfig {
-  tools_url: string
-  api_key: string
-  source: string
-  config_path: string
-  updated_at: number
 }
 
 const moneyFormatter = new Intl.NumberFormat('en-US', {
@@ -207,46 +144,6 @@ function formatTokens(value: number) {
   return compactFormatter.format(Number(value || 0))
 }
 
-function formatUnixTime(value: number) {
-  if (!value) return '-'
-  return new Date(Number(value) * 1000).toLocaleString('zh-CN')
-}
-
-const defaultUpstreamSyncConfig: UpstreamSyncConfig = {
-  id: 1,
-  enabled: false,
-  source_name: '',
-  base_url: '',
-  endpoint: 'auto',
-  auth_token: '',
-  auth_token_set: false,
-  clear_auth_token: false,
-  user_id: '',
-  page_size: 100,
-  request_delay_ms: 80,
-  interval_minutes: 0,
-  lookback_minutes: 60,
-  overlap_minutes: 10,
-  match_tolerance_seconds: 60,
-  recharge_multiplier: 1,
-  min_sync_start_time: 1777564800,
-  log_type: 2,
-  max_pages_per_run: 1000,
-  last_sync_at: 0,
-  last_success_at: 0,
-  last_error: '',
-  total_imported: 0,
-  updated_at: 0,
-}
-
-const defaultToolsAccessConfig: ToolsAccessConfig = {
-  tools_url: '',
-  api_key: '',
-  source: 'missing',
-  config_path: '',
-  updated_at: 0,
-}
-
 function createEmptyRule(channelId: number): CostRule {
   return {
     channel_id: channelId,
@@ -278,15 +175,7 @@ export function CostAccounting() {
   const [refreshing, setRefreshing] = useState(false)
   const [saving, setSaving] = useState(false)
   const [rulesDirty, setRulesDirty] = useState(false)
-  const [upstreamConfig, setUpstreamConfig] = useState<UpstreamSyncConfig>(defaultUpstreamSyncConfig)
-  const [upstreamConfigs, setUpstreamConfigs] = useState<UpstreamSyncConfig[]>([])
-  const [toolsAccess, setToolsAccess] = useState<ToolsAccessConfig>(defaultToolsAccessConfig)
-  const [savingUpstream, setSavingUpstream] = useState(false)
-  const [savingToolsAccess, setSavingToolsAccess] = useState(false)
-  const [syncingUpstream, setSyncingUpstream] = useState(false)
   const rulesDirtyRef = useRef(false)
-
-  const browserToolsUrl = useMemo(() => window.location.origin.replace(/\/+$/, ''), [])
 
   const getAuthHeaders = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -332,32 +221,6 @@ export function CostAccounting() {
     setSummary(data.data)
   }, [apiUrl, channelFilter, endTime, getAuthHeaders, showToast, startTime])
 
-  const fetchUpstreamConfig = useCallback(async () => {
-    const response = await fetch(`${apiUrl}/api/cost/upstream-sync/config`, { headers: getAuthHeaders() })
-    const data = await response.json()
-    if (!data.success) throw new Error(data.error?.message || '加载上游同步配置失败')
-    setUpstreamConfig({ ...defaultUpstreamSyncConfig, ...(data.data || {}), auth_token: '', clear_auth_token: false })
-  }, [apiUrl, getAuthHeaders])
-
-  const fetchUpstreamConfigs = useCallback(async () => {
-    const response = await fetch(`${apiUrl}/api/cost/upstream-sync/configs`, { headers: getAuthHeaders() })
-    const data = await response.json()
-    if (!data.success) throw new Error(data.error?.message || '加载上游列表失败')
-    setUpstreamConfigs((data.data || []).map((item: Partial<UpstreamSyncConfig>) => ({
-      ...defaultUpstreamSyncConfig,
-      ...item,
-      auth_token: '',
-      clear_auth_token: false,
-    })))
-  }, [apiUrl, getAuthHeaders])
-
-  const fetchToolsAccess = useCallback(async () => {
-    const response = await fetch(`${apiUrl}/api/cost/tools-access`, { headers: getAuthHeaders() })
-    const data = await response.json()
-    if (!data.success) throw new Error(data.error?.message || '加载脚本接入信息失败')
-    setToolsAccess({ ...defaultToolsAccessConfig, ...(data.data || {}), tools_url: browserToolsUrl || data.data?.tools_url || '' })
-  }, [apiUrl, browserToolsUrl, getAuthHeaders])
-
   const loadAll = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true)
     else setLoading(true)
@@ -365,9 +228,6 @@ export function CostAccounting() {
     try {
       await fetchRules()
       await fetchSummary()
-      await fetchUpstreamConfig()
-      await fetchUpstreamConfigs()
-      await fetchToolsAccess()
     } catch (error) {
       console.error('Failed to load cost accounting:', error)
       showToast('error', error instanceof Error ? error.message : '加载成本核算失败')
@@ -375,7 +235,7 @@ export function CostAccounting() {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [fetchRules, fetchSummary, fetchToolsAccess, fetchUpstreamConfig, fetchUpstreamConfigs, showToast])
+  }, [fetchRules, fetchSummary, showToast])
 
   useEffect(() => {
     loadAll(false)
@@ -473,159 +333,6 @@ export function CostAccounting() {
     }
   }
 
-  const updateUpstreamConfig = (patch: Partial<UpstreamSyncConfig>) => {
-    setUpstreamConfig(prev => ({ ...prev, ...patch }))
-  }
-
-  const saveUpstreamConfig = async () => {
-    setSavingUpstream(true)
-    try {
-      const payload = {
-        ...upstreamConfig,
-        page_size: Number(upstreamConfig.page_size || 100),
-        request_delay_ms: Number(upstreamConfig.request_delay_ms || 0),
-        interval_minutes: Number(upstreamConfig.interval_minutes || 0),
-        lookback_minutes: Number(upstreamConfig.lookback_minutes || 60),
-        overlap_minutes: Number(upstreamConfig.overlap_minutes || 0),
-        match_tolerance_seconds: Number(upstreamConfig.match_tolerance_seconds || 60),
-        recharge_multiplier: Number(upstreamConfig.recharge_multiplier || 1),
-        min_sync_start_time: Number(upstreamConfig.min_sync_start_time || 1777564800),
-        log_type: Number(upstreamConfig.log_type || 2),
-        max_pages_per_run: Number(upstreamConfig.max_pages_per_run || 1000),
-      }
-
-      const response = await fetch(`${apiUrl}/api/cost/upstream-sync/config`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify(payload),
-      })
-      const data = await response.json()
-      if (!data.success) throw new Error(data.error?.message || '保存上游同步配置失败')
-
-      setUpstreamConfig({ ...defaultUpstreamSyncConfig, ...(data.data || {}), auth_token: '', clear_auth_token: false })
-      await fetchUpstreamConfigs()
-      showToast('success', '上游同步配置已保存')
-    } catch (error) {
-      console.error('Failed to save upstream sync config:', error)
-      showToast('error', error instanceof Error ? error.message : '保存上游同步配置失败')
-    } finally {
-      setSavingUpstream(false)
-    }
-  }
-
-  const updateUpstreamListConfig = (id: number, patch: Partial<UpstreamSyncConfig>) => {
-    setUpstreamConfigs(prev => prev.map(item => Number(item.id) === Number(id) ? { ...item, ...patch } : item))
-  }
-
-  const saveUpstreamListConfig = async (config: UpstreamSyncConfig) => {
-    setSavingUpstream(true)
-    try {
-      const payload = {
-        ...config,
-        id: Number(config.id || 0),
-        page_size: Number(config.page_size || 100),
-        request_delay_ms: Number(config.request_delay_ms || 0),
-        interval_minutes: Number(config.interval_minutes || 0),
-        lookback_minutes: Number(config.lookback_minutes || 60),
-        overlap_minutes: Number(config.overlap_minutes || 0),
-        match_tolerance_seconds: Number(config.match_tolerance_seconds || 60),
-        recharge_multiplier: Number(config.recharge_multiplier || 1),
-        min_sync_start_time: Number(config.min_sync_start_time || 1777564800),
-        log_type: Number(config.log_type || 2),
-        max_pages_per_run: Number(config.max_pages_per_run || 1000),
-      }
-
-      const response = await fetch(`${apiUrl}/api/cost/upstream-sync/config`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify(payload),
-      })
-      const data = await response.json()
-      if (!data.success) throw new Error(data.error?.message || '保存上游配置失败')
-
-      await fetchUpstreamConfigs()
-      await fetchSummary()
-      showToast('success', '上游配置已保存')
-    } catch (error) {
-      console.error('Failed to save upstream config:', error)
-      showToast('error', error instanceof Error ? error.message : '保存上游配置失败')
-    } finally {
-      setSavingUpstream(false)
-    }
-  }
-
-  const runUpstreamSync = async () => {
-    const start = toUnixSeconds(startTime)
-    const end = toUnixSeconds(endTime)
-    if (!start || !end || end < start) {
-      showToast('error', '时间范围不正确')
-      return
-    }
-
-    setSyncingUpstream(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/cost/upstream-sync/run`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ start_time: start, end_time: end, type: Number(upstreamConfig.log_type || 2) }),
-      })
-      const data = await response.json()
-      if (!data.success) throw new Error(data.error?.message || '上游日志同步失败')
-
-      const match = data.data?.match || {}
-      showToast('success', `上游日志已同步，匹配 ${formatNumber(Number(match.matched_count || 0))} 条`)
-      await fetchUpstreamConfig()
-      await fetchUpstreamConfigs()
-      await fetchSummary()
-    } catch (error) {
-      console.error('Failed to sync upstream logs:', error)
-      showToast('error', error instanceof Error ? error.message : '上游日志同步失败')
-      await fetchUpstreamConfig().catch(() => undefined)
-    } finally {
-      setSyncingUpstream(false)
-    }
-  }
-
-  const saveToolsAccess = async () => {
-    const apiKey = toolsAccess.api_key.trim()
-    if (apiKey.length < 8) {
-      showToast('error', 'API Key 至少需要 8 个字符')
-      return
-    }
-
-    setSavingToolsAccess(true)
-    try {
-      const response = await fetch(`${apiUrl}/api/cost/tools-access`, {
-        method: 'POST',
-        headers: getAuthHeaders(),
-        body: JSON.stringify({ api_key: apiKey }),
-      })
-      const data = await response.json()
-      if (!data.success) throw new Error(data.error?.message || '保存脚本 API Key 失败')
-
-      setToolsAccess({ ...defaultToolsAccessConfig, ...(data.data || {}), tools_url: browserToolsUrl || data.data?.tools_url || '' })
-      showToast('success', '脚本 API Key 已保存')
-    } catch (error) {
-      console.error('Failed to save tools access config:', error)
-      showToast('error', error instanceof Error ? error.message : '保存脚本 API Key 失败')
-    } finally {
-      setSavingToolsAccess(false)
-    }
-  }
-
-  const copyText = async (text: string, label: string) => {
-    if (!text) {
-      showToast('error', `${label} 为空`)
-      return
-    }
-    try {
-      await navigator.clipboard.writeText(text)
-      showToast('success', `${label} 已复制`)
-    } catch {
-      showToast('error', `${label} 复制失败`)
-    }
-  }
-
   const resetDraftRules = () => {
     setDraftRules(rules)
     setRulesDirty(false)
@@ -645,15 +352,6 @@ export function CostAccounting() {
 
   const totals = summary?.summary
   const channelRows = summary?.channels || []
-  const upstreamImport = summary?.upstream_import
-  const upstreamMatchRate = upstreamImport?.request_count
-    ? (Number(upstreamImport.matched_request_count || 0) / Number(upstreamImport.request_count || 1)) * 100
-    : 0
-  const toolsAccessSourceLabel = toolsAccess.source === 'file'
-    ? '持久化配置'
-    : toolsAccess.source === 'env'
-      ? '环境变量'
-      : '未配置'
 
   return (
     <div className="space-y-6">
@@ -711,309 +409,6 @@ export function CostAccounting() {
         </div>
       )}
 
-      {totals && upstreamImport?.available && (
-        <div className="rounded-md border bg-muted/40 px-4 py-3 text-sm flex flex-col gap-1 md:flex-row md:items-center md:justify-between">
-          <div>
-            <span className="font-medium">上游导入：</span>
-            {formatNumber(upstreamImport.request_count)} 条 / {formatMoney(upstreamImport.cost)}
-          </div>
-          <div className="text-muted-foreground">
-            已匹配 {formatNumber(upstreamImport.matched_request_count || 0)} 条（{upstreamMatchRate.toFixed(2)}%），
-            Request ID {formatNumber(totals.upstream_request_id_matches || 0)} 条，
-            Token+时间 {formatNumber(totals.upstream_tokens_time_matches || 0)} 条，
-            未匹配 {formatMoney(totals.upstream_unmatched_cost || 0)}
-          </div>
-        </div>
-      )}
-
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <CardTitle className="text-lg flex items-center gap-2">
-              <KeyRound className="h-5 w-5 text-primary" />
-              日志助手接入
-            </CardTitle>
-            <Button size="sm" onClick={saveToolsAccess} disabled={savingToolsAccess}>
-              {savingToolsAccess ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
-              保存 API Key
-            </Button>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-            <div>
-              <label className="text-xs text-muted-foreground">NewAPI Tools 地址</label>
-              <div className="mt-1 flex gap-2">
-                <Input value={toolsAccess.tools_url || browserToolsUrl} readOnly />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  onClick={() => copyText(toolsAccess.tools_url || browserToolsUrl, 'Tools 地址')}
-                  title="复制 Tools 地址"
-                >
-                  <Copy className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">Tools API Key</label>
-              <div className="mt-1 flex gap-2">
-                <Input
-                  value={toolsAccess.api_key}
-                  onChange={e => setToolsAccess(prev => ({ ...prev, api_key: e.target.value }))}
-                  placeholder="填写脚本使用的 X-API-Key"
-                />
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="icon"
-                  onClick={() => copyText(toolsAccess.api_key, 'API Key')}
-                  title="复制 API Key"
-                >
-                  <Copy className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
-            <span>来源：{toolsAccessSourceLabel}</span>
-            <span>配置文件：{toolsAccess.config_path || '/app/data/tools_auth.json'}</span>
-            {toolsAccess.updated_at > 0 && <span>更新时间：{formatUnixTime(toolsAccess.updated_at)}</span>}
-          </div>
-        </CardContent>
-      </Card>
-
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
-            <CardTitle className="text-lg flex items-center gap-2">
-              <RefreshCw className="h-5 w-5 text-primary" />
-              上游日志同步
-            </CardTitle>
-            <div className="flex flex-wrap gap-2">
-              <Button variant="outline" size="sm" onClick={saveUpstreamConfig} disabled={savingUpstream || syncingUpstream}>
-                {savingUpstream ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
-                保存配置
-              </Button>
-              <Button size="sm" onClick={runUpstreamSync} disabled={syncingUpstream || savingUpstream}>
-                {syncingUpstream ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-                手动同步
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-            <label className="flex h-10 items-center gap-2 rounded-md border px-3 text-sm">
-              <input
-                type="checkbox"
-                checked={upstreamConfig.enabled}
-                onChange={e => updateUpstreamConfig({ enabled: e.target.checked })}
-                className="h-4 w-4 accent-primary"
-              />
-              启用定时同步
-            </label>
-            <div>
-              <label className="text-xs text-muted-foreground">上游地址</label>
-              <Input
-                value={upstreamConfig.base_url}
-                onChange={e => updateUpstreamConfig({ base_url: e.target.value })}
-                placeholder="https://upstream.example.com"
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">Endpoint</label>
-              <Select
-                value={upstreamConfig.endpoint}
-                onChange={e => updateUpstreamConfig({ endpoint: e.target.value })}
-                className="mt-1"
-              >
-                <option value="auto">auto</option>
-                <option value="/api/log/">/api/log/</option>
-                <option value="/api/log/self/">/api/log/self/</option>
-              </Select>
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">Token</label>
-              <Input
-                type="password"
-                value={upstreamConfig.auth_token}
-                onChange={e => updateUpstreamConfig({ auth_token: e.target.value, clear_auth_token: false })}
-                placeholder={upstreamConfig.auth_token_set ? '已保存，留空不变' : 'Bearer token'}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">User ID</label>
-              <Input
-                value={upstreamConfig.user_id}
-                onChange={e => updateUpstreamConfig({ user_id: e.target.value })}
-                placeholder="可选"
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">同步间隔(分钟)</label>
-              <Input
-                type="number"
-                min="0"
-                value={upstreamConfig.interval_minutes}
-                onChange={e => updateUpstreamConfig({ interval_minutes: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">回看(分钟)</label>
-              <Input
-                type="number"
-                min="1"
-                value={upstreamConfig.lookback_minutes}
-                onChange={e => updateUpstreamConfig({ lookback_minutes: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">重叠(分钟)</label>
-              <Input
-                type="number"
-                min="0"
-                value={upstreamConfig.overlap_minutes}
-                onChange={e => updateUpstreamConfig({ overlap_minutes: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">匹配窗口(秒)</label>
-              <Input
-                type="number"
-                min="1"
-                max="3600"
-                value={upstreamConfig.match_tolerance_seconds}
-                onChange={e => updateUpstreamConfig({ match_tolerance_seconds: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">充值倍率</label>
-              <Input
-                type="number"
-                min="0.000001"
-                step="0.01"
-                value={upstreamConfig.recharge_multiplier}
-                onChange={e => updateUpstreamConfig({ recharge_multiplier: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">最早同步时间</label>
-              <Input
-                type="datetime-local"
-                value={toLocalInputValue(new Date(Number(upstreamConfig.min_sync_start_time || 1777564800) * 1000))}
-                onChange={e => updateUpstreamConfig({ min_sync_start_time: toUnixSeconds(e.target.value) || 1777564800 })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">Page Size</label>
-              <Input
-                type="number"
-                min="1"
-                max="1000"
-                value={upstreamConfig.page_size}
-                onChange={e => updateUpstreamConfig({ page_size: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">请求延迟(ms)</label>
-              <Input
-                type="number"
-                min="0"
-                value={upstreamConfig.request_delay_ms}
-                onChange={e => updateUpstreamConfig({ request_delay_ms: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-            <div>
-              <label className="text-xs text-muted-foreground">最大页数</label>
-              <Input
-                type="number"
-                min="1"
-                value={upstreamConfig.max_pages_per_run}
-                onChange={e => updateUpstreamConfig({ max_pages_per_run: Number(e.target.value) })}
-                className="mt-1"
-              />
-            </div>
-          </div>
-          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
-            <span>最近同步：{formatUnixTime(upstreamConfig.last_sync_at)}</span>
-            <span>最近成功：{formatUnixTime(upstreamConfig.last_success_at)}</span>
-            <span>累计导入：{formatNumber(upstreamConfig.total_imported)}</span>
-            {upstreamConfig.last_error && <span className="text-destructive">错误：{upstreamConfig.last_error}</span>}
-          </div>
-
-          {upstreamConfigs.length > 0 && (
-            <div className="space-y-3 border-t pt-4">
-              <div className="text-sm font-medium">已注册上游</div>
-              <div className="space-y-2">
-                {upstreamConfigs.map(config => (
-                  <div key={config.id} className="grid gap-3 rounded-md border p-3 lg:grid-cols-[minmax(0,1.5fr)_130px_210px_120px_96px] lg:items-end">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-medium" title={config.source_name || config.base_url}>
-                        {config.source_name || config.base_url || `上游 #${config.id}`}
-                      </div>
-                      <div className="truncate text-xs text-muted-foreground" title={config.base_url}>
-                        {config.base_url || '未配置地址'}
-                      </div>
-                    </div>
-                    <div>
-                      <label className="text-xs text-muted-foreground">充值倍率</label>
-                      <Input
-                        type="number"
-                        min="0.000001"
-                        step="0.01"
-                        value={config.recharge_multiplier}
-                        onChange={e => updateUpstreamListConfig(config.id, { recharge_multiplier: Number(e.target.value) })}
-                        className="mt-1"
-                      />
-                    </div>
-                    <div>
-                      <label className="text-xs text-muted-foreground">最早同步</label>
-                      <Input
-                        type="datetime-local"
-                        value={toLocalInputValue(new Date(Number(config.min_sync_start_time || 1777564800) * 1000))}
-                        onChange={e => updateUpstreamListConfig(config.id, { min_sync_start_time: toUnixSeconds(e.target.value) || 1777564800 })}
-                        className="mt-1"
-                      />
-                    </div>
-                    <label className="flex h-10 items-center gap-2 rounded-md border px-3 text-sm">
-                      <input
-                        type="checkbox"
-                        checked={config.enabled}
-                        onChange={e => updateUpstreamListConfig(config.id, { enabled: e.target.checked })}
-                        className="h-4 w-4 accent-primary"
-                      />
-                      启用
-                    </label>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={() => saveUpstreamListConfig(config)}
-                      disabled={savingUpstream || syncingUpstream}
-                    >
-                      <Save className="h-4 w-4 mr-2" />
-                      保存
-                    </Button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </CardContent>
-      </Card>
-
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-lg">渠道消耗</CardTitle>
@@ -1049,14 +444,7 @@ export function CostAccounting() {
                       </TableCell>
                       <TableCell className="text-right">{formatNumber(channel.request_count)}</TableCell>
                       <TableCell className="text-right">{formatMoney(channel.billed_amount)}</TableCell>
-                      <TableCell className="text-right font-medium">
-                        {formatMoney(channel.estimated_cost)}
-                        {(channel.upstream_imported_cost || channel.rule_estimated_cost) ? (
-                          <div className="text-xs font-normal text-muted-foreground">
-                            导入 {formatMoney(channel.upstream_imported_cost || 0)} / 规则 {formatMoney(channel.rule_estimated_cost || 0)}
-                          </div>
-                        ) : null}
-                      </TableCell>
+                      <TableCell className="text-right font-medium">{formatMoney(channel.estimated_cost)}</TableCell>
                       <TableCell className={cn("text-right", channel.gross_margin >= 0 ? "text-emerald-600" : "text-destructive")}>
                         {formatMoney(channel.gross_margin)}
                         <div className="text-xs opacity-75">{channel.margin_rate.toFixed(2)}%</div>
@@ -1096,14 +484,7 @@ export function CostAccounting() {
                                     <td className="p-3 text-right">{formatNumber(model.request_count)}</td>
                                     <td className="p-3 text-right">{formatTokens(model.prompt_tokens + model.completion_tokens)}</td>
                                     <td className="p-3 text-right">{model.configured ? `${Number(model.cost_multiplier || 1).toFixed(4)}x` : '-'}</td>
-                                    <td className="p-3 text-right font-medium">
-                                      {formatMoney(model.estimated_cost)}
-                                      {(model.upstream_imported_cost || model.rule_estimated_cost) ? (
-                                        <div className="text-xs font-normal text-muted-foreground">
-                                          导入 {formatMoney(model.upstream_imported_cost || 0)} / 规则 {formatMoney(model.rule_estimated_cost || 0)}
-                                        </div>
-                                      ) : null}
-                                    </td>
+                                    <td className="p-3 text-right font-medium">{formatMoney(model.estimated_cost)}</td>
                                     <td className="p-3 text-right">
                                       <Button variant="outline" size="sm" onClick={(event) => { event.stopPropagation(); createRuleFromModel(model) }}>
                                         <Plus className="h-3.5 w-3.5 mr-1" />

@@ -4,7 +4,6 @@ Implements API Key authentication middleware and JWT-based frontend authenticati
 """
 import os
 import logging
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -22,10 +21,6 @@ ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "newapi-middleware-secret-key-change-in-production")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "24"))
-DATA_DIR = os.getenv("DATA_DIR", "/app/data")
-RUNTIME_AUTH_PATH = os.path.join(DATA_DIR, "tools_auth.json")
-_runtime_api_key = ""
-_runtime_api_key_updated_at = 0
 
 # Password hashing context
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
@@ -33,59 +28,6 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 # Security schemes
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 bearer_scheme = HTTPBearer(auto_error=False)
-
-
-def _load_runtime_auth_config() -> None:
-    global _runtime_api_key, _runtime_api_key_updated_at
-    try:
-        with open(RUNTIME_AUTH_PATH, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        _runtime_api_key = str(data.get("api_key") or "").strip()
-        _runtime_api_key_updated_at = int(data.get("updated_at") or 0)
-    except FileNotFoundError:
-        return
-    except Exception as exc:
-        logger.warning("Failed to load runtime API key config %s: %s", RUNTIME_AUTH_PATH, exc)
-
-
-def get_api_key_info() -> dict:
-    if _runtime_api_key:
-        return {
-            "api_key": _runtime_api_key,
-            "source": "file",
-            "config_path": RUNTIME_AUTH_PATH,
-            "updated_at": _runtime_api_key_updated_at,
-        }
-    if API_KEY:
-        return {
-            "api_key": API_KEY,
-            "source": "env",
-            "config_path": RUNTIME_AUTH_PATH,
-            "updated_at": 0,
-        }
-    return {
-        "api_key": "",
-        "source": "missing",
-        "config_path": RUNTIME_AUTH_PATH,
-        "updated_at": 0,
-    }
-
-
-def set_runtime_api_key(api_key: str) -> dict:
-    global _runtime_api_key, _runtime_api_key_updated_at
-    api_key = str(api_key or "").strip()
-    if len(api_key) < 8:
-        raise ValueError("api_key must be at least 8 characters")
-    os.makedirs(DATA_DIR, exist_ok=True)
-    updated_at = int(datetime.now(timezone.utc).timestamp())
-    with open(RUNTIME_AUTH_PATH, "w", encoding="utf-8") as f:
-        json.dump({"api_key": api_key, "updated_at": updated_at}, f, ensure_ascii=False, indent=2)
-    _runtime_api_key = api_key
-    _runtime_api_key_updated_at = updated_at
-    return get_api_key_info()
-
-
-_load_runtime_auth_config()
 
 
 class TokenData(BaseModel):
@@ -115,12 +57,11 @@ class LogoutResponse(BaseModel):
 
 def verify_api_key(api_key: str) -> bool:
     """Verify if the provided API key is valid."""
-    active_api_key = get_api_key_info().get("api_key") or ""
-    if not active_api_key:
+    if not API_KEY:
         # If no API key is configured, allow all requests (development mode)
         logger.warning("No API_KEY configured - running in development mode")
         return True
-    return api_key == active_api_key
+    return api_key == API_KEY
 
 
 def verify_password(plain_password: str) -> bool:

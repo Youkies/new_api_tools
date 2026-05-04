@@ -13,13 +13,14 @@ const RealtimeRanking = lazy(() => import('./components/RealtimeRanking').then((
 const IPAnalysis = lazy(() => import('./components/IPAnalysis').then((module) => ({ default: module.IPAnalysis })))
 const Analytics = lazy(() => import('./components/Analytics').then((module) => ({ default: module.Analytics })))
 const CostAccounting = lazy(() => import('./components/CostAccounting').then((module) => ({ default: module.CostAccounting })))
+const LogMatcher = lazy(() => import('./components/LogMatcher').then((module) => ({ default: module.LogMatcher })))
 const ModelStatusMonitor = lazy(() => import('./components/ModelStatusMonitor').then((module) => ({ default: module.ModelStatusMonitor })))
 const UserManagement = lazy(() => import('./components/UserManagement').then((module) => ({ default: module.UserManagement })))
 const Tokens = lazy(() => import('./components/Tokens').then((module) => ({ default: module.Tokens })))
 const AutoGroup = lazy(() => import('./components/AutoGroup').then((module) => ({ default: module.AutoGroup })))
 
 // Valid tabs
-const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'ip-analysis', 'analytics', 'costs', 'model-status', 'users', 'tokens', 'auto-group', 'generator', 'redemptions', 'history']
+const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'ip-analysis', 'analytics', 'costs', 'log-match', 'model-status', 'users', 'tokens', 'auto-group', 'generator', 'redemptions', 'history']
 
 function PageFallback() {
   return (
@@ -171,6 +172,8 @@ function App() {
         return <Analytics />
       case 'costs':
         return <CostAccounting />
+      case 'log-match':
+        return <LogMatcher />
       case 'model-status':
         return <ModelStatusMonitor />
       case 'users':
