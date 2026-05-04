@@ -2,21 +2,28 @@
 
 ## 目标
 
-为 tools 的“日志分析”功能新增类似 NewAPI 日志导出助手的导出能力，但避免 userscript 逐页请求 NewAPI `/api/log` 在日志量大时产生大量请求并中断。
+把 NewAPI 日志导出助手的思路融合进工具的成本核算：支持从上游 NewAPI 手动或定时同步消费日志，并把上游真实成本与本站本地日志成本合并。
 
 ## 已完成
 
-- Go 后端新增 `/api/analytics/export`：支持 CSV/JSON，按时间、类型、模型、用户名、令牌名、渠道、分组、Request ID、最大行数等条件直接查询 `logs` 表并流式写出。
-- Python 后端补齐同名兼容接口和流式导出实现，保持 Go/Python API 路径一致。
-- 前端 `日志分析` 页新增“导出”按钮和导出弹窗，默认导出当天消费日志，可选择 CSV/JSON、日志类型和常用筛选项。
-- CSV 导出包含 BOM、中文表头、费用换算、tokens 汇总、倍率字段和合计行；JSON 导出追加格式化时间、USD 费用、总 tokens 和解析后的 `other` 字段。
+- Go 后端新增上游日志同步服务，持久化配置到 `api_tools_upstream_log_sync_config`，导入上游日志到 `api_tools_upstream_logs`。
+- Go `/api/cost` 新增：
+  - `GET /api/cost/upstream-sync/config`
+  - `POST /api/cost/upstream-sync/config`
+  - `POST /api/cost/upstream-sync/run`
+- Go 启动后新增后台定时同步任务；启用后按配置的 `interval_minutes`、`lookback_minutes`、`overlap_minutes` 执行。
+- 成本核算改为优先使用已匹配的上游导入成本，未匹配部分继续按本地成本规则估算。
+- 根据 `参考日志/` 的真实样本验证：本站与上游 `Request ID` 精确匹配率为 0%，因此匹配主策略改为“一对一输入 tokens + 输出 tokens + 时间窗口”，`Request ID` 仅保留为高置信兜底和诊断统计。
+- 前端成本核算页新增“上游日志同步”配置区、手动同步按钮、匹配率和导入/规则成本拆分展示。
+- Python 兼容后端补齐配置接口和成本汇总对 `api_tools_upstream_logs.local_log_id` 的兼容读取；实际上游抓取同步仍以 Go 后端为正式实现。
 
 ## 验证结果
 
 - `go test ./...`（`backend/`）通过。
-- `python -m py_compile backend-py/app/log_analytics_service.py backend-py/app/log_analytics_routes.py` 通过。
+- `python -m py_compile backend-py/app/cost_accounting_service.py backend-py/app/cost_accounting_routes.py` 通过。
 - `npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning。
 
-## 下一步
+## 注意
 
-按用户偏好准备检查 diff 后提交并 push 当前分支；上线后可用真实大日志库验证一次导出耗时和浏览器下载体验。
+- `参考日志/` 和 `NewAPI 日志导出助手-1.2.2.user.js` 是用户提供/参考文件，当前未纳入提交范围。
+- 本轮尚未提交或 push；提交前需确认只包含代码改动，不带入参考 CSV。

@@ -258,6 +258,12 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 	if err != nil {
 		return nil, err
 	}
+	upstreamJoinAvailable := false
+	if s.db.ColumnExists("logs", "id") {
+		if exists, tableErr := s.db.TableExists("api_tools_upstream_logs"); tableErr == nil && exists && s.db.ColumnExists("api_tools_upstream_logs", "local_log_id") {
+			upstreamJoinAvailable = true
+		}
+	}
 	query := `
 		SELECT COALESCE(l.channel_id, 0) as channel_id,
 			COALESCE(MAX(c.name), '') as channel_name,
@@ -265,11 +271,44 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 			COUNT(*) as request_count,
 			COALESCE(SUM(l.quota), 0) as quota_used,
 			COALESCE(SUM(l.prompt_tokens), 0) as prompt_tokens,
-			COALESCE(SUM(l.completion_tokens), 0) as completion_tokens
+			COALESCE(SUM(l.completion_tokens), 0) as completion_tokens,`
+	if upstreamJoinAvailable {
+		query += `
+			COALESCE(SUM(ul.upstream_quota), 0) as upstream_quota,
+			COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN 1 ELSE 0 END), 0) as upstream_matched_count,
+			COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN l.prompt_tokens ELSE 0 END), 0) as upstream_matched_prompt_tokens,
+			COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN l.completion_tokens ELSE 0 END), 0) as upstream_matched_completion_tokens,
+			COALESCE(SUM(ul.request_id_matches), 0) as upstream_request_id_matches,
+			COALESCE(SUM(ul.tokens_time_matches), 0) as upstream_tokens_time_matches`
+	} else {
+		query += `
+			0 as upstream_quota,
+			0 as upstream_matched_count,
+			0 as upstream_matched_prompt_tokens,
+			0 as upstream_matched_completion_tokens,
+			0 as upstream_request_id_matches,
+			0 as upstream_tokens_time_matches`
+	}
+	query += `
 		FROM logs l
-		LEFT JOIN channels c ON c.id = l.channel_id
+		LEFT JOIN channels c ON c.id = l.channel_id`
+	args := []interface{}{}
+	if upstreamJoinAvailable {
+		query += `
+		LEFT JOIN (
+			SELECT local_log_id,
+				COALESCE(SUM(quota), 0) as upstream_quota,
+				COALESCE(SUM(CASE WHEN match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
+				COALESCE(SUM(CASE WHEN match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches
+			FROM api_tools_upstream_logs
+			WHERE created_at >= ? AND created_at <= ? AND type = 2 AND local_log_id > 0
+			GROUP BY local_log_id
+		) ul ON ul.local_log_id = l.id`
+		args = append(args, startTime, endTime)
+	}
+	query += `
 		WHERE l.created_at >= ? AND l.created_at <= ? AND l.type = 2`
-	args := []interface{}{startTime, endTime}
+	args = append(args, startTime, endTime)
 	if channelID != nil && *channelID > 0 {
 		query += " AND l.channel_id = ?"
 		args = append(args, *channelID)
@@ -290,6 +329,11 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 	totalCompletion := int64(0)
 	totalBilled := 0.0
 	totalCost := 0.0
+	totalRuleCost := 0.0
+	totalUpstreamImportedCost := 0.0
+	totalUpstreamMatchedRequests := int64(0)
+	totalUpstreamRequestIDMatches := int64(0)
+	totalUpstreamTokensTimeMatches := int64(0)
 	configuredModels := 0
 	unconfiguredModels := 0
 
@@ -309,10 +353,21 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		promptTokens := toInt64(row["prompt_tokens"])
 		completionTokens := toInt64(row["completion_tokens"])
 		billedAmount := float64(quotaUsed) / costQuotaPerUSD
+		upstreamQuota := toInt64(row["upstream_quota"])
+		upstreamImportedCost := float64(upstreamQuota) / costQuotaPerUSD
+		upstreamMatchedRequests := clampMatchedCount(toInt64(row["upstream_matched_count"]), requests)
+		upstreamMatchedPrompt := clampMatchedCount(toInt64(row["upstream_matched_prompt_tokens"]), promptTokens)
+		upstreamMatchedCompletion := clampMatchedCount(toInt64(row["upstream_matched_completion_tokens"]), completionTokens)
+		upstreamRequestIDMatches := clampMatchedCount(toInt64(row["upstream_request_id_matches"]), upstreamMatchedRequests)
+		upstreamTokensTimeMatches := clampMatchedCount(toInt64(row["upstream_tokens_time_matches"]), upstreamMatchedRequests)
+		unmatchedRequests := requests - upstreamMatchedRequests
+		unmatchedPromptTokens := promptTokens - upstreamMatchedPrompt
+		unmatchedCompletionTokens := completionTokens - upstreamMatchedCompletion
 
 		upstreamModel := resolveUpstreamModel(channelModelMappings, cid, modelName)
 		rule, configured := findCostRule(ruleMap, cid, modelName, upstreamModel)
 		estimatedCost := 0.0
+		ruleEstimatedCost := 0.0
 		billingMode := "token"
 		ruleID := int64(0)
 		if configured {
@@ -322,47 +377,58 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 			}
 			billingMode = rule.BillingMode
 			ruleID = rule.ID
-			estimatedCost = calculateCost(rule, requests, promptTokens, completionTokens)
+			ruleEstimatedCost = calculateCost(rule, unmatchedRequests, unmatchedPromptTokens, unmatchedCompletionTokens)
 			configuredModels++
 		} else {
 			unconfiguredModels++
 		}
+		estimatedCost = upstreamImportedCost + ruleEstimatedCost
 		margin := billedAmount - estimatedCost
 
 		modelRow := map[string]interface{}{
-			"channel_id":        cid,
-			"channel_name":      channelName,
-			"model_name":        modelName,
-			"upstream_model":    upstreamModel,
-			"billing_mode":      billingMode,
-			"request_count":     requests,
-			"quota_used":        quotaUsed,
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"billed_amount":     roundMoney(billedAmount),
-			"estimated_cost":    roundMoney(estimatedCost),
-			"gross_margin":      roundMoney(margin),
-			"margin_rate":       marginRate(margin, billedAmount),
-			"cost_multiplier":   ruleCostMultiplier(rule, configured),
-			"configured":        configured,
-			"rule_id":           ruleID,
+			"channel_id":                   cid,
+			"channel_name":                 channelName,
+			"model_name":                   modelName,
+			"upstream_model":               upstreamModel,
+			"billing_mode":                 billingMode,
+			"request_count":                requests,
+			"quota_used":                   quotaUsed,
+			"prompt_tokens":                promptTokens,
+			"completion_tokens":            completionTokens,
+			"billed_amount":                roundMoney(billedAmount),
+			"estimated_cost":               roundMoney(estimatedCost),
+			"rule_estimated_cost":          roundMoney(ruleEstimatedCost),
+			"upstream_imported_cost":       roundMoney(upstreamImportedCost),
+			"upstream_matched_requests":    upstreamMatchedRequests,
+			"upstream_request_id_matches":  upstreamRequestIDMatches,
+			"upstream_tokens_time_matches": upstreamTokensTimeMatches,
+			"gross_margin":                 roundMoney(margin),
+			"margin_rate":                  marginRate(margin, billedAmount),
+			"cost_multiplier":              ruleCostMultiplier(rule, configured),
+			"configured":                   configured,
+			"rule_id":                      ruleID,
 		}
 
 		channel, exists := channelsByID[cid]
 		if !exists {
 			channel = map[string]interface{}{
-				"channel_id":          cid,
-				"channel_name":        channelName,
-				"request_count":       int64(0),
-				"quota_used":          int64(0),
-				"prompt_tokens":       int64(0),
-				"completion_tokens":   int64(0),
-				"billed_amount":       float64(0),
-				"estimated_cost":      float64(0),
-				"gross_margin":        float64(0),
-				"configured_models":   0,
-				"unconfigured_models": 0,
-				"models":              []map[string]interface{}{},
+				"channel_id":                   cid,
+				"channel_name":                 channelName,
+				"request_count":                int64(0),
+				"quota_used":                   int64(0),
+				"prompt_tokens":                int64(0),
+				"completion_tokens":            int64(0),
+				"billed_amount":                float64(0),
+				"estimated_cost":               float64(0),
+				"rule_estimated_cost":          float64(0),
+				"upstream_imported_cost":       float64(0),
+				"upstream_matched_requests":    int64(0),
+				"upstream_request_id_matches":  int64(0),
+				"upstream_tokens_time_matches": int64(0),
+				"gross_margin":                 float64(0),
+				"configured_models":            0,
+				"unconfigured_models":          0,
+				"models":                       []map[string]interface{}{},
 			}
 			channelsByID[cid] = channel
 		}
@@ -373,6 +439,11 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		channel["completion_tokens"] = toInt64(channel["completion_tokens"]) + completionTokens
 		channel["billed_amount"] = toFloat64(channel["billed_amount"]) + billedAmount
 		channel["estimated_cost"] = toFloat64(channel["estimated_cost"]) + estimatedCost
+		channel["rule_estimated_cost"] = toFloat64(channel["rule_estimated_cost"]) + ruleEstimatedCost
+		channel["upstream_imported_cost"] = toFloat64(channel["upstream_imported_cost"]) + upstreamImportedCost
+		channel["upstream_matched_requests"] = toInt64(channel["upstream_matched_requests"]) + upstreamMatchedRequests
+		channel["upstream_request_id_matches"] = toInt64(channel["upstream_request_id_matches"]) + upstreamRequestIDMatches
+		channel["upstream_tokens_time_matches"] = toInt64(channel["upstream_tokens_time_matches"]) + upstreamTokensTimeMatches
 		channel["gross_margin"] = toFloat64(channel["gross_margin"]) + margin
 		if configured {
 			channel["configured_models"] = toInt64(channel["configured_models"]) + 1
@@ -388,12 +459,19 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		totalCompletion += completionTokens
 		totalBilled += billedAmount
 		totalCost += estimatedCost
+		totalRuleCost += ruleEstimatedCost
+		totalUpstreamImportedCost += upstreamImportedCost
+		totalUpstreamMatchedRequests += upstreamMatchedRequests
+		totalUpstreamRequestIDMatches += upstreamRequestIDMatches
+		totalUpstreamTokensTimeMatches += upstreamTokensTimeMatches
 	}
 
 	channels := make([]map[string]interface{}, 0, len(channelsByID))
 	for _, channel := range channelsByID {
 		channel["billed_amount"] = roundMoney(toFloat64(channel["billed_amount"]))
 		channel["estimated_cost"] = roundMoney(toFloat64(channel["estimated_cost"]))
+		channel["rule_estimated_cost"] = roundMoney(toFloat64(channel["rule_estimated_cost"]))
+		channel["upstream_imported_cost"] = roundMoney(toFloat64(channel["upstream_imported_cost"]))
 		channel["gross_margin"] = roundMoney(toFloat64(channel["gross_margin"]))
 		channel["margin_rate"] = marginRate(toFloat64(channel["gross_margin"]), toFloat64(channel["billed_amount"]))
 		models := channel["models"].([]map[string]interface{})
@@ -417,25 +495,38 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		return ci > cj
 	})
 
+	upstreamImport := NewUpstreamLogSyncService().UpstreamImportSummary(startTime, endTime, channelID)
+	upstreamUnmatchedCost := toFloat64(upstreamImport["cost"]) - totalUpstreamImportedCost
+	if upstreamUnmatchedCost < 0 {
+		upstreamUnmatchedCost = 0
+	}
+
 	return map[string]interface{}{
 		"range": map[string]interface{}{
 			"start_time": startTime,
 			"end_time":   endTime,
 		},
 		"summary": map[string]interface{}{
-			"request_count":       totalRequests,
-			"quota_used":          totalQuota,
-			"prompt_tokens":       totalPrompt,
-			"completion_tokens":   totalCompletion,
-			"billed_amount":       roundMoney(totalBilled),
-			"estimated_cost":      roundMoney(totalCost),
-			"gross_margin":        roundMoney(totalBilled - totalCost),
-			"margin_rate":         marginRate(totalBilled-totalCost, totalBilled),
-			"configured_models":   configuredModels,
-			"unconfigured_models": unconfiguredModels,
+			"request_count":                totalRequests,
+			"quota_used":                   totalQuota,
+			"prompt_tokens":                totalPrompt,
+			"completion_tokens":            totalCompletion,
+			"billed_amount":                roundMoney(totalBilled),
+			"estimated_cost":               roundMoney(totalCost),
+			"rule_estimated_cost":          roundMoney(totalRuleCost),
+			"upstream_imported_cost":       roundMoney(totalUpstreamImportedCost),
+			"upstream_matched_requests":    totalUpstreamMatchedRequests,
+			"upstream_request_id_matches":  totalUpstreamRequestIDMatches,
+			"upstream_tokens_time_matches": totalUpstreamTokensTimeMatches,
+			"upstream_unmatched_cost":      roundMoney(upstreamUnmatchedCost),
+			"gross_margin":                 roundMoney(totalBilled - totalCost),
+			"margin_rate":                  marginRate(totalBilled-totalCost, totalBilled),
+			"configured_models":            configuredModels,
+			"unconfigured_models":          unconfiguredModels,
 		},
-		"channels": channels,
-		"rules":    rules,
+		"channels":        channels,
+		"rules":           rules,
+		"upstream_import": upstreamImport,
 	}, nil
 }
 
@@ -649,6 +740,16 @@ func marginRate(margin, billed float64) float64 {
 		return 0
 	}
 	return math.Round((margin/billed)*10000) / 100
+}
+
+func clampMatchedCount(value, total int64) int64 {
+	if value < 0 {
+		return 0
+	}
+	if value > total {
+		return total
+	}
+	return value
 }
 
 func toBool(v interface{}) bool {

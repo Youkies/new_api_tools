@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 
@@ -16,6 +18,9 @@ func RegisterCostAccountingRoutes(r *gin.RouterGroup) {
 		g.GET("/summary", GetCostSummary)
 		g.GET("/rules", GetCostRules)
 		g.POST("/rules", SaveCostRules)
+		g.GET("/upstream-sync/config", GetUpstreamLogSyncConfig)
+		g.POST("/upstream-sync/config", SaveUpstreamLogSyncConfig)
+		g.POST("/upstream-sync/run", RunUpstreamLogSync)
 	}
 }
 
@@ -85,6 +90,51 @@ func SaveCostRules(c *gin.Context) {
 			"channels": channels,
 		},
 	})
+}
+
+// GET /api/cost/upstream-sync/config
+func GetUpstreamLogSyncConfig(c *gin.Context) {
+	svc := service.NewUpstreamLogSyncService()
+	data, err := svc.GetConfig(false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// POST /api/cost/upstream-sync/config
+func SaveUpstreamLogSyncConfig(c *gin.Context) {
+	var req service.UpstreamLogSyncConfig
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		return
+	}
+
+	svc := service.NewUpstreamLogSyncService()
+	data, err := svc.SaveConfig(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("SAVE_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Upstream log sync config saved", "data": data})
+}
+
+// POST /api/cost/upstream-sync/run
+func RunUpstreamLogSync(c *gin.Context) {
+	var req service.UpstreamLogSyncRunOptions
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		return
+	}
+
+	svc := service.NewUpstreamLogSyncService()
+	data, err := svc.RunSync(req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("SYNC_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Upstream logs synced", "data": data})
 }
 
 func parseInt64Query(c *gin.Context, key string, defaultVal int64) int64 {

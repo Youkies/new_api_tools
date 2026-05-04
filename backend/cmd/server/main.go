@@ -121,6 +121,10 @@ func main() {
 	stopAutoGroup := make(chan struct{})
 	service.StartBackgroundAutoGroupScan(stopAutoGroup)
 
+	// Upstream NewAPI log import for cost reconciliation.
+	stopUpstreamLogSync := make(chan struct{})
+	service.StartBackgroundUpstreamLogSync(stopUpstreamLogSync)
+
 	// IP recording enforcement: check every 10 minutes, enable if any user disabled it
 	stopIPEnforce := make(chan struct{})
 	go backgroundEnforceIPRecording(stopIPEnforce)
@@ -152,6 +156,7 @@ func main() {
 	// Stop background tasks
 	close(stopSystemTasks)
 	close(stopAutoGroup)
+	close(stopUpstreamLogSync)
 	close(stopIPEnforce)
 
 	// Give the server 10 seconds to finish processing requests
