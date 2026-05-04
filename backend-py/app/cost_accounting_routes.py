@@ -4,10 +4,10 @@ Cost accounting API routes.
 import time
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel
 
-from .auth import verify_auth
+from .auth import get_api_key_info, set_runtime_api_key, verify_auth
 from .cost_accounting_service import default_cost_range, get_cost_accounting_service
 from .database import DatabaseEngine
 from .main import InvalidParamsError
@@ -17,6 +17,10 @@ router = APIRouter(prefix="/api/cost", tags=["Cost Accounting"])
 
 class CostRuleRequest(BaseModel):
     rules: List[Dict[str, Any]]
+
+
+class ToolsAccessRequest(BaseModel):
+    api_key: str
 
 
 class UpstreamSyncConfigRequest(BaseModel):
@@ -42,6 +46,14 @@ class UpstreamSyncRunRequest(BaseModel):
     start_time: int = 0
     end_time: int = 0
     type: int = 2
+
+
+def _request_base_url(request: Request) -> str:
+    forwarded_proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    if not forwarded_host:
+        return ""
+    return f"{forwarded_proto}://{forwarded_host}".rstrip("/")
 
 
 @router.get("/summary")
@@ -78,6 +90,33 @@ def save_cost_rules(request: CostRuleRequest, _: str = Depends(verify_auth)):
         "data": {
             "rules": rules,
             "channels": service.list_channels(),
+        },
+    }
+
+
+@router.get("/tools-access")
+def get_tools_access_config(request: Request, _: str = Depends(verify_auth)):
+    return {
+        "success": True,
+        "data": {
+            "tools_url": _request_base_url(request),
+            **get_api_key_info(),
+        },
+    }
+
+
+@router.post("/tools-access")
+def save_tools_access_config(request_body: ToolsAccessRequest, request: Request, _: str = Depends(verify_auth)):
+    try:
+        info = set_runtime_api_key(request_body.api_key)
+    except ValueError as exc:
+        raise InvalidParamsError(message=str(exc))
+    return {
+        "success": True,
+        "message": "Tools access config saved",
+        "data": {
+            "tools_url": _request_base_url(request),
+            **info,
         },
     }
 

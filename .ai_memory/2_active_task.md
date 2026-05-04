@@ -20,13 +20,16 @@
 - Go 后端新增 `POST /api/cost/upstream-sync/register`：脚本可显式上传当前上游 `base_url`、`source_name`、`auth_token`、`user_id` 和后台拉取间隔，后端按 `base_url` 建/更新多上游同步配置。
 - Go 后台上游同步从单配置轮询改为扫描所有已启用配置；每个上游按自己的 `interval_minutes`、`lookback_minutes`、`overlap_minutes` 拉取，并继续通过 `source_url` 指纹去重。
 - `NewAPI 日志导出助手-1.2.2.user.js` 已升级为 1.2.4：新增“保存当前上游登录态供 Tools 后台定时拉取”显式勾选项和拉取间隔输入；未勾选时不会上传上游 token。
+- 成本核算页新增“日志助手接入”面板，直接显示可填入脚本的 `NewAPI Tools 地址`、`Tools API Key` 和配置文件路径，并支持复制与保存 API Key。
+- Go 后端新增 `/api/cost/tools-access` 读写接口；脚本 API Key 会持久化到 `DATA_DIR/tools_auth.json`，容器默认对应 `/app/data/tools_auth.json`，文件 key 优先于环境变量 `API_KEY`。
 - Python 兼容后端补齐配置接口和成本汇总对 `api_tools_upstream_logs.local_log_id` 的兼容读取；实际上游抓取同步仍以 Go 后端为正式实现。
 
 ## 验证结果
 
 - `go test ./...`（`backend/`）通过。
-- `python -m py_compile backend-py/app/cost_accounting_routes.py` 通过。
+- `python -m py_compile backend-py/app/auth.py backend-py/app/cost_accounting_routes.py` 通过。
 - `node --check "NewAPI 日志导出助手-1.2.2.user.js"` 通过。
+- `npm run build`（`frontend/`）通过；仍有既有 CSS minify/chunk size warning。
 
 ## 注意
 

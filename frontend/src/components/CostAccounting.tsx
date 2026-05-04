@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState, type ElementType } from 'react'
-import { Activity, AlertTriangle, Calculator, CheckCircle2, ChevronDown, ChevronRight, Loader2, Plus, RefreshCw, Save, Settings2, Trash2 } from 'lucide-react'
+import { Activity, AlertTriangle, Calculator, CheckCircle2, ChevronDown, ChevronRight, Copy, KeyRound, Loader2, Plus, RefreshCw, Save, Settings2, Trash2 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from './Toast'
 import { Badge } from './ui/badge'
@@ -150,6 +150,14 @@ interface UpstreamSyncConfig {
   updated_at: number
 }
 
+interface ToolsAccessConfig {
+  tools_url: string
+  api_key: string
+  source: string
+  config_path: string
+  updated_at: number
+}
+
 const moneyFormatter = new Intl.NumberFormat('en-US', {
   style: 'currency',
   currency: 'USD',
@@ -223,6 +231,14 @@ const defaultUpstreamSyncConfig: UpstreamSyncConfig = {
   updated_at: 0,
 }
 
+const defaultToolsAccessConfig: ToolsAccessConfig = {
+  tools_url: '',
+  api_key: '',
+  source: 'missing',
+  config_path: '',
+  updated_at: 0,
+}
+
 function createEmptyRule(channelId: number): CostRule {
   return {
     channel_id: channelId,
@@ -255,9 +271,13 @@ export function CostAccounting() {
   const [saving, setSaving] = useState(false)
   const [rulesDirty, setRulesDirty] = useState(false)
   const [upstreamConfig, setUpstreamConfig] = useState<UpstreamSyncConfig>(defaultUpstreamSyncConfig)
+  const [toolsAccess, setToolsAccess] = useState<ToolsAccessConfig>(defaultToolsAccessConfig)
   const [savingUpstream, setSavingUpstream] = useState(false)
+  const [savingToolsAccess, setSavingToolsAccess] = useState(false)
   const [syncingUpstream, setSyncingUpstream] = useState(false)
   const rulesDirtyRef = useRef(false)
+
+  const browserToolsUrl = useMemo(() => window.location.origin.replace(/\/+$/, ''), [])
 
   const getAuthHeaders = useCallback(() => ({
     'Content-Type': 'application/json',
@@ -310,6 +330,13 @@ export function CostAccounting() {
     setUpstreamConfig({ ...defaultUpstreamSyncConfig, ...(data.data || {}), auth_token: '', clear_auth_token: false })
   }, [apiUrl, getAuthHeaders])
 
+  const fetchToolsAccess = useCallback(async () => {
+    const response = await fetch(`${apiUrl}/api/cost/tools-access`, { headers: getAuthHeaders() })
+    const data = await response.json()
+    if (!data.success) throw new Error(data.error?.message || '加载脚本接入信息失败')
+    setToolsAccess({ ...defaultToolsAccessConfig, ...(data.data || {}), tools_url: browserToolsUrl || data.data?.tools_url || '' })
+  }, [apiUrl, browserToolsUrl, getAuthHeaders])
+
   const loadAll = useCallback(async (isRefresh = false) => {
     if (isRefresh) setRefreshing(true)
     else setLoading(true)
@@ -318,6 +345,7 @@ export function CostAccounting() {
       await fetchRules()
       await fetchSummary()
       await fetchUpstreamConfig()
+      await fetchToolsAccess()
     } catch (error) {
       console.error('Failed to load cost accounting:', error)
       showToast('error', error instanceof Error ? error.message : '加载成本核算失败')
@@ -325,7 +353,7 @@ export function CostAccounting() {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [fetchRules, fetchSummary, fetchUpstreamConfig, showToast])
+  }, [fetchRules, fetchSummary, fetchToolsAccess, fetchUpstreamConfig, showToast])
 
   useEffect(() => {
     loadAll(false)
@@ -491,6 +519,46 @@ export function CostAccounting() {
     }
   }
 
+  const saveToolsAccess = async () => {
+    const apiKey = toolsAccess.api_key.trim()
+    if (apiKey.length < 8) {
+      showToast('error', 'API Key 至少需要 8 个字符')
+      return
+    }
+
+    setSavingToolsAccess(true)
+    try {
+      const response = await fetch(`${apiUrl}/api/cost/tools-access`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ api_key: apiKey }),
+      })
+      const data = await response.json()
+      if (!data.success) throw new Error(data.error?.message || '保存脚本 API Key 失败')
+
+      setToolsAccess({ ...defaultToolsAccessConfig, ...(data.data || {}), tools_url: browserToolsUrl || data.data?.tools_url || '' })
+      showToast('success', '脚本 API Key 已保存')
+    } catch (error) {
+      console.error('Failed to save tools access config:', error)
+      showToast('error', error instanceof Error ? error.message : '保存脚本 API Key 失败')
+    } finally {
+      setSavingToolsAccess(false)
+    }
+  }
+
+  const copyText = async (text: string, label: string) => {
+    if (!text) {
+      showToast('error', `${label} 为空`)
+      return
+    }
+    try {
+      await navigator.clipboard.writeText(text)
+      showToast('success', `${label} 已复制`)
+    } catch {
+      showToast('error', `${label} 复制失败`)
+    }
+  }
+
   const resetDraftRules = () => {
     setDraftRules(rules)
     setRulesDirty(false)
@@ -514,6 +582,11 @@ export function CostAccounting() {
   const upstreamMatchRate = upstreamImport?.request_count
     ? (Number(upstreamImport.matched_request_count || 0) / Number(upstreamImport.request_count || 1)) * 100
     : 0
+  const toolsAccessSourceLabel = toolsAccess.source === 'file'
+    ? '持久化配置'
+    : toolsAccess.source === 'env'
+      ? '环境变量'
+      : '未配置'
 
   return (
     <div className="space-y-6">
@@ -585,6 +658,64 @@ export function CostAccounting() {
           </div>
         </div>
       )}
+
+      <Card>
+        <CardHeader className="pb-3">
+          <div className="flex flex-col gap-3 lg:flex-row lg:items-center lg:justify-between">
+            <CardTitle className="text-lg flex items-center gap-2">
+              <KeyRound className="h-5 w-5 text-primary" />
+              日志助手接入
+            </CardTitle>
+            <Button size="sm" onClick={saveToolsAccess} disabled={savingToolsAccess}>
+              {savingToolsAccess ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Save className="h-4 w-4 mr-2" />}
+              保存 API Key
+            </Button>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
+            <div>
+              <label className="text-xs text-muted-foreground">NewAPI Tools 地址</label>
+              <div className="mt-1 flex gap-2">
+                <Input value={toolsAccess.tools_url || browserToolsUrl} readOnly />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => copyText(toolsAccess.tools_url || browserToolsUrl, 'Tools 地址')}
+                  title="复制 Tools 地址"
+                >
+                  <Copy className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground">Tools API Key</label>
+              <div className="mt-1 flex gap-2">
+                <Input
+                  value={toolsAccess.api_key}
+                  onChange={e => setToolsAccess(prev => ({ ...prev, api_key: e.target.value }))}
+                  placeholder="填写脚本使用的 X-API-Key"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="icon"
+                  onClick={() => copyText(toolsAccess.api_key, 'API Key')}
+                  title="复制 API Key"
+                >
+                  <Copy className="h-4 w-4" />
+                </Button>
+              </div>
+            </div>
+          </div>
+          <div className="flex flex-wrap gap-x-6 gap-y-1 text-xs text-muted-foreground">
+            <span>来源：{toolsAccessSourceLabel}</span>
+            <span>配置文件：{toolsAccess.config_path || '/app/data/tools_auth.json'}</span>
+            {toolsAccess.updated_at > 0 && <span>更新时间：{formatUnixTime(toolsAccess.updated_at)}</span>}
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader className="pb-3">

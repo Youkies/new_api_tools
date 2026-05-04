@@ -5,8 +5,10 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/models"
 	"github.com/new-api-tools/backend/internal/service"
 )
@@ -18,6 +20,8 @@ func RegisterCostAccountingRoutes(r *gin.RouterGroup) {
 		g.GET("/summary", GetCostSummary)
 		g.GET("/rules", GetCostRules)
 		g.POST("/rules", SaveCostRules)
+		g.GET("/tools-access", GetToolsAccessConfig)
+		g.POST("/tools-access", SaveToolsAccessConfig)
 		g.GET("/upstream-sync/config", GetUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/config", SaveUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/register", RegisterUpstreamLogSyncConfig)
@@ -53,6 +57,50 @@ func GetCostSummary(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// GET /api/cost/tools-access
+func GetToolsAccessConfig(c *gin.Context) {
+	info := config.GetAPIKeyInfo()
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"data": gin.H{
+			"tools_url":   inferRequestBaseURL(c),
+			"api_key":     info.APIKey,
+			"source":      info.Source,
+			"config_path": info.ConfigPath,
+			"updated_at":  info.UpdatedAt,
+		},
+	})
+}
+
+// POST /api/cost/tools-access
+func SaveToolsAccessConfig(c *gin.Context) {
+	var req struct {
+		APIKey string `json:"api_key"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		return
+	}
+
+	info, err := config.SetRuntimeAPIKey(req.APIKey)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_API_KEY", err.Error(), ""))
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": "Tools access config saved",
+		"data": gin.H{
+			"tools_url":   inferRequestBaseURL(c),
+			"api_key":     info.APIKey,
+			"source":      info.Source,
+			"config_path": info.ConfigPath,
+			"updated_at":  info.UpdatedAt,
+		},
+	})
 }
 
 // GET /api/cost/rules
@@ -183,4 +231,22 @@ func parseInt64Query(c *gin.Context, key string, defaultVal int64) int64 {
 		return defaultVal
 	}
 	return value
+}
+
+func inferRequestBaseURL(c *gin.Context) string {
+	proto := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto"))
+	if proto == "" {
+		proto = "http"
+		if c.Request.TLS != nil {
+			proto = "https"
+		}
+	}
+	host := strings.TrimSpace(c.GetHeader("X-Forwarded-Host"))
+	if host == "" {
+		host = c.Request.Host
+	}
+	if host == "" {
+		return ""
+	}
+	return strings.TrimRight(proto+"://"+host, "/")
 }
