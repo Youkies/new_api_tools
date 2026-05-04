@@ -14,6 +14,8 @@ from .main import InvalidParamsError
 
 router = APIRouter(prefix="/api/cost", tags=["Cost Accounting"])
 
+UPSTREAM_MIN_SYNC_START_TIME = 1777564800  # 2026-05-01 00:00:00 Asia/Shanghai
+
 
 class CostRuleRequest(BaseModel):
     rules: List[Dict[str, Any]]
@@ -38,6 +40,8 @@ class UpstreamSyncConfigRequest(BaseModel):
     lookback_minutes: int = 60
     overlap_minutes: int = 10
     match_tolerance_seconds: int = 60
+    recharge_multiplier: float = 1.0
+    min_sync_start_time: int = UPSTREAM_MIN_SYNC_START_TIME
     log_type: int = 2
     max_pages_per_run: int = 1000
 
@@ -127,6 +131,12 @@ def get_upstream_sync_config(_: str = Depends(verify_auth)):
     return {"success": True, "data": _get_upstream_sync_config(service)}
 
 
+@router.get("/upstream-sync/configs")
+def list_upstream_sync_configs(_: str = Depends(verify_auth)):
+    service = get_cost_accounting_service()
+    return {"success": True, "data": [_get_upstream_sync_config(service)]}
+
+
 @router.post("/upstream-sync/config")
 def save_upstream_sync_config(request: UpstreamSyncConfigRequest, _: str = Depends(verify_auth)):
     service = get_cost_accounting_service()
@@ -192,6 +202,8 @@ def _default_upstream_config() -> Dict[str, Any]:
         "lookback_minutes": 60,
         "overlap_minutes": 10,
         "match_tolerance_seconds": 60,
+        "recharge_multiplier": 1.0,
+        "min_sync_start_time": UPSTREAM_MIN_SYNC_START_TIME,
         "log_type": 2,
         "max_pages_per_run": 1000,
         "last_sync_at": 0,
@@ -220,6 +232,8 @@ def _ensure_upstream_config_table(service) -> None:
                 lookback_minutes INTEGER NOT NULL DEFAULT 60,
                 overlap_minutes INTEGER NOT NULL DEFAULT 10,
                 match_tolerance_seconds INTEGER NOT NULL DEFAULT 60,
+                recharge_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1,
+                min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800,
                 log_type INTEGER NOT NULL DEFAULT 2,
                 max_pages_per_run INTEGER NOT NULL DEFAULT 1000,
                 last_sync_at BIGINT NOT NULL DEFAULT 0,
@@ -245,6 +259,8 @@ def _ensure_upstream_config_table(service) -> None:
                 lookback_minutes INT NOT NULL DEFAULT 60,
                 overlap_minutes INT NOT NULL DEFAULT 10,
                 match_tolerance_seconds INT NOT NULL DEFAULT 60,
+                recharge_multiplier DOUBLE NOT NULL DEFAULT 1,
+                min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800,
                 log_type INT NOT NULL DEFAULT 2,
                 max_pages_per_run INT NOT NULL DEFAULT 1000,
                 last_sync_at BIGINT NOT NULL DEFAULT 0,
@@ -265,13 +281,20 @@ def _ensure_upstream_config_table(service) -> None:
             db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INTEGER NOT NULL DEFAULT 60")
         else:
             db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INT NOT NULL DEFAULT 60")
+    if not service._column_exists("api_tools_upstream_log_sync_config", "recharge_multiplier"):
+        if db.config.engine == DatabaseEngine.POSTGRESQL:
+            db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN recharge_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1")
+        else:
+            db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN recharge_multiplier DOUBLE NOT NULL DEFAULT 1")
+    if not service._column_exists("api_tools_upstream_log_sync_config", "min_sync_start_time"):
+        db.execute("ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800")
 
 
 def _get_upstream_sync_config(service, include_secret: bool = False) -> Dict[str, Any]:
     _ensure_upstream_config_table(service)
     rows = service.db.execute("""
         SELECT enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
-            interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
+            interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, recharge_multiplier, min_sync_start_time, log_type, max_pages_per_run,
             last_sync_at, last_success_at, last_error, total_imported, updated_at
         FROM api_tools_upstream_log_sync_config
         WHERE id = 1
@@ -292,6 +315,8 @@ def _get_upstream_sync_config(service, include_secret: bool = False) -> Dict[str
             "lookback_minutes": int(row.get("lookback_minutes") or 60),
             "overlap_minutes": int(row.get("overlap_minutes") or 10),
             "match_tolerance_seconds": int(row.get("match_tolerance_seconds") or 60),
+            "recharge_multiplier": float(row.get("recharge_multiplier") or 1),
+            "min_sync_start_time": int(row.get("min_sync_start_time") or UPSTREAM_MIN_SYNC_START_TIME),
             "log_type": int(row.get("log_type") or 2),
             "max_pages_per_run": int(row.get("max_pages_per_run") or 1000),
             "last_sync_at": int(row.get("last_sync_at") or 0),
@@ -313,11 +338,11 @@ def _save_upstream_sync_config(service, config: Dict[str, Any]) -> Dict[str, Any
     sql = """
         INSERT INTO api_tools_upstream_log_sync_config
             (id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
-             interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
+             interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, recharge_multiplier, min_sync_start_time, log_type, max_pages_per_run,
              last_sync_at, last_success_at, last_error, total_imported, updated_at)
         VALUES
             (:id, :enabled, :source_name, :base_url, :endpoint, :auth_token, :user_id, :page_size, :request_delay_ms,
-             :interval_minutes, :lookback_minutes, :overlap_minutes, :match_tolerance_seconds, :log_type, :max_pages_per_run,
+             :interval_minutes, :lookback_minutes, :overlap_minutes, :match_tolerance_seconds, :recharge_multiplier, :min_sync_start_time, :log_type, :max_pages_per_run,
              :last_sync_at, :last_success_at, :last_error, :total_imported, :updated_at)
     """
     if db.config.engine == DatabaseEngine.POSTGRESQL:
@@ -335,6 +360,8 @@ def _save_upstream_sync_config(service, config: Dict[str, Any]) -> Dict[str, Any
                 lookback_minutes = EXCLUDED.lookback_minutes,
                 overlap_minutes = EXCLUDED.overlap_minutes,
                 match_tolerance_seconds = EXCLUDED.match_tolerance_seconds,
+                recharge_multiplier = EXCLUDED.recharge_multiplier,
+                min_sync_start_time = EXCLUDED.min_sync_start_time,
                 log_type = EXCLUDED.log_type,
                 max_pages_per_run = EXCLUDED.max_pages_per_run,
                 last_sync_at = EXCLUDED.last_sync_at,
@@ -358,6 +385,8 @@ def _save_upstream_sync_config(service, config: Dict[str, Any]) -> Dict[str, Any
                 lookback_minutes = VALUES(lookback_minutes),
                 overlap_minutes = VALUES(overlap_minutes),
                 match_tolerance_seconds = VALUES(match_tolerance_seconds),
+                recharge_multiplier = VALUES(recharge_multiplier),
+                min_sync_start_time = VALUES(min_sync_start_time),
                 log_type = VALUES(log_type),
                 max_pages_per_run = VALUES(max_pages_per_run),
                 last_sync_at = VALUES(last_sync_at),
@@ -380,6 +409,15 @@ def _normalize_upstream_config(config: Dict[str, Any]) -> Dict[str, Any]:
             parsed = fallback
         return max(min_value, min(max_value, parsed))
 
+    def clamp_float(value: Any, min_value: float, max_value: float, fallback: float) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = fallback
+        if parsed <= 0:
+            parsed = fallback
+        return max(min_value, min(max_value, parsed))
+
     endpoint = str(config.get("endpoint") or "auto").strip() or "auto"
     if endpoint != "auto" and not endpoint.startswith("/"):
         endpoint = "/" + endpoint
@@ -395,6 +433,8 @@ def _normalize_upstream_config(config: Dict[str, Any]) -> Dict[str, Any]:
         "lookback_minutes": clamp(config.get("lookback_minutes"), 1, 525600, 60),
         "overlap_minutes": clamp(config.get("overlap_minutes"), 0, 1440, 10),
         "match_tolerance_seconds": clamp(config.get("match_tolerance_seconds"), 1, 3600, 60),
+        "recharge_multiplier": clamp_float(config.get("recharge_multiplier"), 0.000001, 1000000, 1.0),
+        "min_sync_start_time": max(int(config.get("min_sync_start_time") or UPSTREAM_MIN_SYNC_START_TIME), UPSTREAM_MIN_SYNC_START_TIME),
         "log_type": clamp(config.get("log_type"), 0, 9, 2),
         "max_pages_per_run": clamp(config.get("max_pages_per_run"), 1, 100000, 1000),
     }

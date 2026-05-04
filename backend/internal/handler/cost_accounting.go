@@ -23,6 +23,7 @@ func RegisterCostAccountingRoutes(r *gin.RouterGroup) {
 		g.GET("/tools-access", GetToolsAccessConfig)
 		g.POST("/tools-access", SaveToolsAccessConfig)
 		g.GET("/upstream-sync/config", GetUpstreamLogSyncConfig)
+		g.GET("/upstream-sync/configs", ListUpstreamLogSyncConfigs)
 		g.POST("/upstream-sync/config", SaveUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/register", RegisterUpstreamLogSyncConfig)
 		g.POST("/upstream-sync/run", RunUpstreamLogSync)
@@ -146,6 +147,17 @@ func SaveCostRules(c *gin.Context) {
 func GetUpstreamLogSyncConfig(c *gin.Context) {
 	svc := service.NewUpstreamLogSyncService()
 	data, err := svc.GetConfig(false)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// GET /api/cost/upstream-sync/configs
+func ListUpstreamLogSyncConfigs(c *gin.Context) {
+	svc := service.NewUpstreamLogSyncService()
+	data, err := svc.ListConfigs(false)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
 		return

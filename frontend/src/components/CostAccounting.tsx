@@ -128,7 +128,9 @@ interface CostSummaryPayload {
 }
 
 interface UpstreamSyncConfig {
+  id: number
   enabled: boolean
+  source_name: string
   base_url: string
   endpoint: string
   auth_token: string
@@ -141,6 +143,8 @@ interface UpstreamSyncConfig {
   lookback_minutes: number
   overlap_minutes: number
   match_tolerance_seconds: number
+  recharge_multiplier: number
+  min_sync_start_time: number
   log_type: number
   max_pages_per_run: number
   last_sync_at: number
@@ -209,7 +213,9 @@ function formatUnixTime(value: number) {
 }
 
 const defaultUpstreamSyncConfig: UpstreamSyncConfig = {
+  id: 1,
   enabled: false,
+  source_name: '',
   base_url: '',
   endpoint: 'auto',
   auth_token: '',
@@ -222,6 +228,8 @@ const defaultUpstreamSyncConfig: UpstreamSyncConfig = {
   lookback_minutes: 60,
   overlap_minutes: 10,
   match_tolerance_seconds: 60,
+  recharge_multiplier: 1,
+  min_sync_start_time: 1777564800,
   log_type: 2,
   max_pages_per_run: 1000,
   last_sync_at: 0,
@@ -271,6 +279,7 @@ export function CostAccounting() {
   const [saving, setSaving] = useState(false)
   const [rulesDirty, setRulesDirty] = useState(false)
   const [upstreamConfig, setUpstreamConfig] = useState<UpstreamSyncConfig>(defaultUpstreamSyncConfig)
+  const [upstreamConfigs, setUpstreamConfigs] = useState<UpstreamSyncConfig[]>([])
   const [toolsAccess, setToolsAccess] = useState<ToolsAccessConfig>(defaultToolsAccessConfig)
   const [savingUpstream, setSavingUpstream] = useState(false)
   const [savingToolsAccess, setSavingToolsAccess] = useState(false)
@@ -330,6 +339,18 @@ export function CostAccounting() {
     setUpstreamConfig({ ...defaultUpstreamSyncConfig, ...(data.data || {}), auth_token: '', clear_auth_token: false })
   }, [apiUrl, getAuthHeaders])
 
+  const fetchUpstreamConfigs = useCallback(async () => {
+    const response = await fetch(`${apiUrl}/api/cost/upstream-sync/configs`, { headers: getAuthHeaders() })
+    const data = await response.json()
+    if (!data.success) throw new Error(data.error?.message || '加载上游列表失败')
+    setUpstreamConfigs((data.data || []).map((item: Partial<UpstreamSyncConfig>) => ({
+      ...defaultUpstreamSyncConfig,
+      ...item,
+      auth_token: '',
+      clear_auth_token: false,
+    })))
+  }, [apiUrl, getAuthHeaders])
+
   const fetchToolsAccess = useCallback(async () => {
     const response = await fetch(`${apiUrl}/api/cost/tools-access`, { headers: getAuthHeaders() })
     const data = await response.json()
@@ -345,6 +366,7 @@ export function CostAccounting() {
       await fetchRules()
       await fetchSummary()
       await fetchUpstreamConfig()
+      await fetchUpstreamConfigs()
       await fetchToolsAccess()
     } catch (error) {
       console.error('Failed to load cost accounting:', error)
@@ -353,7 +375,7 @@ export function CostAccounting() {
       setLoading(false)
       setRefreshing(false)
     }
-  }, [fetchRules, fetchSummary, fetchToolsAccess, fetchUpstreamConfig, showToast])
+  }, [fetchRules, fetchSummary, fetchToolsAccess, fetchUpstreamConfig, fetchUpstreamConfigs, showToast])
 
   useEffect(() => {
     loadAll(false)
@@ -466,6 +488,8 @@ export function CostAccounting() {
         lookback_minutes: Number(upstreamConfig.lookback_minutes || 60),
         overlap_minutes: Number(upstreamConfig.overlap_minutes || 0),
         match_tolerance_seconds: Number(upstreamConfig.match_tolerance_seconds || 60),
+        recharge_multiplier: Number(upstreamConfig.recharge_multiplier || 1),
+        min_sync_start_time: Number(upstreamConfig.min_sync_start_time || 1777564800),
         log_type: Number(upstreamConfig.log_type || 2),
         max_pages_per_run: Number(upstreamConfig.max_pages_per_run || 1000),
       }
@@ -479,10 +503,52 @@ export function CostAccounting() {
       if (!data.success) throw new Error(data.error?.message || '保存上游同步配置失败')
 
       setUpstreamConfig({ ...defaultUpstreamSyncConfig, ...(data.data || {}), auth_token: '', clear_auth_token: false })
+      await fetchUpstreamConfigs()
       showToast('success', '上游同步配置已保存')
     } catch (error) {
       console.error('Failed to save upstream sync config:', error)
       showToast('error', error instanceof Error ? error.message : '保存上游同步配置失败')
+    } finally {
+      setSavingUpstream(false)
+    }
+  }
+
+  const updateUpstreamListConfig = (id: number, patch: Partial<UpstreamSyncConfig>) => {
+    setUpstreamConfigs(prev => prev.map(item => Number(item.id) === Number(id) ? { ...item, ...patch } : item))
+  }
+
+  const saveUpstreamListConfig = async (config: UpstreamSyncConfig) => {
+    setSavingUpstream(true)
+    try {
+      const payload = {
+        ...config,
+        id: Number(config.id || 0),
+        page_size: Number(config.page_size || 100),
+        request_delay_ms: Number(config.request_delay_ms || 0),
+        interval_minutes: Number(config.interval_minutes || 0),
+        lookback_minutes: Number(config.lookback_minutes || 60),
+        overlap_minutes: Number(config.overlap_minutes || 0),
+        match_tolerance_seconds: Number(config.match_tolerance_seconds || 60),
+        recharge_multiplier: Number(config.recharge_multiplier || 1),
+        min_sync_start_time: Number(config.min_sync_start_time || 1777564800),
+        log_type: Number(config.log_type || 2),
+        max_pages_per_run: Number(config.max_pages_per_run || 1000),
+      }
+
+      const response = await fetch(`${apiUrl}/api/cost/upstream-sync/config`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify(payload),
+      })
+      const data = await response.json()
+      if (!data.success) throw new Error(data.error?.message || '保存上游配置失败')
+
+      await fetchUpstreamConfigs()
+      await fetchSummary()
+      showToast('success', '上游配置已保存')
+    } catch (error) {
+      console.error('Failed to save upstream config:', error)
+      showToast('error', error instanceof Error ? error.message : '保存上游配置失败')
     } finally {
       setSavingUpstream(false)
     }
@@ -509,6 +575,7 @@ export function CostAccounting() {
       const match = data.data?.match || {}
       showToast('success', `上游日志已同步，匹配 ${formatNumber(Number(match.matched_count || 0))} 条`)
       await fetchUpstreamConfig()
+      await fetchUpstreamConfigs()
       await fetchSummary()
     } catch (error) {
       console.error('Failed to sync upstream logs:', error)
@@ -829,6 +896,26 @@ export function CostAccounting() {
               />
             </div>
             <div>
+              <label className="text-xs text-muted-foreground">充值倍率</label>
+              <Input
+                type="number"
+                min="0.000001"
+                step="0.01"
+                value={upstreamConfig.recharge_multiplier}
+                onChange={e => updateUpstreamConfig({ recharge_multiplier: Number(e.target.value) })}
+                className="mt-1"
+              />
+            </div>
+            <div>
+              <label className="text-xs text-muted-foreground">最早同步时间</label>
+              <Input
+                type="datetime-local"
+                value={toLocalInputValue(new Date(Number(upstreamConfig.min_sync_start_time || 1777564800) * 1000))}
+                onChange={e => updateUpstreamConfig({ min_sync_start_time: toUnixSeconds(e.target.value) || 1777564800 })}
+                className="mt-1"
+              />
+            </div>
+            <div>
               <label className="text-xs text-muted-foreground">Page Size</label>
               <Input
                 type="number"
@@ -866,6 +953,64 @@ export function CostAccounting() {
             <span>累计导入：{formatNumber(upstreamConfig.total_imported)}</span>
             {upstreamConfig.last_error && <span className="text-destructive">错误：{upstreamConfig.last_error}</span>}
           </div>
+
+          {upstreamConfigs.length > 0 && (
+            <div className="space-y-3 border-t pt-4">
+              <div className="text-sm font-medium">已注册上游</div>
+              <div className="space-y-2">
+                {upstreamConfigs.map(config => (
+                  <div key={config.id} className="grid gap-3 rounded-md border p-3 lg:grid-cols-[minmax(0,1.5fr)_130px_210px_120px_96px] lg:items-end">
+                    <div className="min-w-0">
+                      <div className="truncate text-sm font-medium" title={config.source_name || config.base_url}>
+                        {config.source_name || config.base_url || `上游 #${config.id}`}
+                      </div>
+                      <div className="truncate text-xs text-muted-foreground" title={config.base_url}>
+                        {config.base_url || '未配置地址'}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">充值倍率</label>
+                      <Input
+                        type="number"
+                        min="0.000001"
+                        step="0.01"
+                        value={config.recharge_multiplier}
+                        onChange={e => updateUpstreamListConfig(config.id, { recharge_multiplier: Number(e.target.value) })}
+                        className="mt-1"
+                      />
+                    </div>
+                    <div>
+                      <label className="text-xs text-muted-foreground">最早同步</label>
+                      <Input
+                        type="datetime-local"
+                        value={toLocalInputValue(new Date(Number(config.min_sync_start_time || 1777564800) * 1000))}
+                        onChange={e => updateUpstreamListConfig(config.id, { min_sync_start_time: toUnixSeconds(e.target.value) || 1777564800 })}
+                        className="mt-1"
+                      />
+                    </div>
+                    <label className="flex h-10 items-center gap-2 rounded-md border px-3 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={config.enabled}
+                        onChange={e => updateUpstreamListConfig(config.id, { enabled: e.target.checked })}
+                        className="h-4 w-4 accent-primary"
+                      />
+                      启用
+                    </label>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => saveUpstreamListConfig(config)}
+                      disabled={savingUpstream || syncingUpstream}
+                    >
+                      <Save className="h-4 w-4 mr-2" />
+                      保存
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </CardContent>
       </Card>
 

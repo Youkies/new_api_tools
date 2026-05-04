@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NewAPI 日志导出助手
 // @namespace    https://newapi.youkies.space/
-// @version      1.2.4
+// @version      1.2.5
 // @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出、上传和注册 NewAPI Tools 后台同步
 // @author       Youkies
 // @match        *://*/*
@@ -129,6 +129,7 @@
         registerEnabled: false,
         matchToleranceSeconds: 60,
         syncIntervalMinutes: 1,
+        rechargeMultiplier: 1,
         ...(JSON.parse(localStorage.getItem(CONFIG.TOOLS_CONFIG_KEY) || "{}") || {}),
       };
     } catch (_) {
@@ -139,6 +140,7 @@
         registerEnabled: false,
         matchToleranceSeconds: 60,
         syncIntervalMinutes: 1,
+        rechargeMultiplier: 1,
       };
     }
   }
@@ -168,6 +170,8 @@
       Number.parseInt($id("lex-match-window").value, 10) || 60;
     const syncIntervalMinutes =
       Number.parseInt($id("lex-sync-interval").value, 10) || 1;
+    const rechargeMultiplier =
+      Number.parseFloat($id("lex-recharge-multiplier").value) || 1;
 
     return {
       toolsUrl,
@@ -176,6 +180,7 @@
       registerEnabled,
       matchToleranceSeconds,
       syncIntervalMinutes,
+      rechargeMultiplier,
     };
   }
 
@@ -223,6 +228,8 @@
         lookback_minutes: 60,
         overlap_minutes: 10,
         match_tolerance_seconds: toolsOptions.matchToleranceSeconds || 60,
+        recharge_multiplier: Math.max(0.000001, toolsOptions.rechargeMultiplier || 1),
+        min_sync_start_time: 1777564800,
         log_type: Number.parseInt($id("lex-type").value, 10) || 2,
         max_pages_per_run: 1000,
       }),
@@ -998,7 +1005,13 @@
               <input type="number" id="lex-sync-interval" min="1" max="1440" value="${Number(tools.syncIntervalMinutes || 1)}">
             </div>
           </div>
-          <div class="lex-hint">勾选后台拉取会把当前上游网址和登录 token 保存到 Tools：${escapeAttr(location.origin)}。</div>
+          <div class="lex-row full">
+            <div class="lex-field">
+              <label for="lex-recharge-multiplier">上游充值倍率</label>
+              <input type="number" id="lex-recharge-multiplier" min="0.000001" step="0.01" value="${Number(tools.rechargeMultiplier || 1)}">
+            </div>
+          </div>
+          <div class="lex-hint">勾选后台拉取会把当前上游网址和登录 token 保存到 Tools：${escapeAttr(location.origin)}。1:10 的上游充值倍率填 10，后台只拉取 2026-05-01 之后的日志。</div>
 
           <div class="lex-actions">
             <button class="lex-btn lex-btn-secondary" id="lex-btn-sync" type="button" title="从页面当前筛选条件同步">同步页面筛选</button>

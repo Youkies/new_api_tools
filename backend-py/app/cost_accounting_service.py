@@ -13,6 +13,7 @@ from sqlalchemy import text
 from .database import DatabaseEngine, DatabaseManager, get_db_manager
 
 QUOTA_PER_USD = 500000.0
+UPSTREAM_MIN_SYNC_START_TIME = 1777564800  # 2026-05-01 00:00:00 Asia/Shanghai
 
 
 @dataclass
@@ -227,7 +228,12 @@ class CostAccountingService:
             and self._column_exists("api_tools_upstream_logs", "local_log_id")
         )
 
-        params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
+        upstream_start_time = max(start_time, UPSTREAM_MIN_SYNC_START_TIME)
+        params: Dict[str, Any] = {
+            "start_time": start_time,
+            "end_time": end_time,
+            "upstream_start_time": upstream_start_time,
+        }
         channel_clause = ""
         if channel_id and channel_id > 0:
             channel_clause = " AND l.channel_id = :channel_id"
@@ -235,6 +241,7 @@ class CostAccountingService:
 
         upstream_select = """
                 COALESCE(SUM(ul.upstream_quota), 0) as upstream_quota,
+                COALESCE(SUM(ul.upstream_adjusted_quota), 0) as upstream_adjusted_quota,
                 COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN 1 ELSE 0 END), 0) as upstream_matched_count,
                 COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN l.prompt_tokens ELSE 0 END), 0) as upstream_matched_prompt_tokens,
                 COALESCE(SUM(CASE WHEN ul.local_log_id IS NOT NULL THEN l.completion_tokens ELSE 0 END), 0) as upstream_matched_completion_tokens,
@@ -242,6 +249,7 @@ class CostAccountingService:
                 COALESCE(SUM(ul.tokens_time_matches), 0) as upstream_tokens_time_matches
         """ if upstream_join_available else """
                 0 as upstream_quota,
+                0 as upstream_adjusted_quota,
                 0 as upstream_matched_count,
                 0 as upstream_matched_prompt_tokens,
                 0 as upstream_matched_completion_tokens,
@@ -251,11 +259,13 @@ class CostAccountingService:
         upstream_join = """
             LEFT JOIN (
                 SELECT local_log_id,
-                    COALESCE(SUM(quota), 0) as upstream_quota,
-                    COALESCE(SUM(CASE WHEN match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
-                    COALESCE(SUM(CASE WHEN match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches
-                FROM api_tools_upstream_logs
-                WHERE created_at >= :start_time AND created_at <= :end_time AND type = 2 AND local_log_id > 0
+                    COALESCE(SUM(u.quota), 0) as upstream_quota,
+                    COALESCE(SUM(CASE WHEN cfg.recharge_multiplier > 0 THEN u.quota / cfg.recharge_multiplier ELSE u.quota END), 0) as upstream_adjusted_quota,
+                    COALESCE(SUM(CASE WHEN u.match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
+                    COALESCE(SUM(CASE WHEN u.match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches
+                FROM api_tools_upstream_logs u
+                LEFT JOIN api_tools_upstream_log_sync_config cfg ON cfg.base_url = u.source_url
+                WHERE u.created_at >= :upstream_start_time AND u.created_at <= :end_time AND u.type = 2 AND u.local_log_id > 0
                 GROUP BY local_log_id
             ) ul ON ul.local_log_id = l.id
         """ if upstream_join_available else ""
@@ -308,7 +318,8 @@ class CostAccountingService:
             completion_tokens = int(row.get("completion_tokens") or 0)
             billed_amount = quota_used / QUOTA_PER_USD
             upstream_quota = int(row.get("upstream_quota") or 0)
-            upstream_imported_cost = upstream_quota / QUOTA_PER_USD
+            upstream_adjusted_quota = float(row.get("upstream_adjusted_quota") or 0)
+            upstream_imported_cost = upstream_adjusted_quota / QUOTA_PER_USD
             upstream_matched_requests = self._clamp_matched_count(int(row.get("upstream_matched_count") or 0), requests)
             upstream_matched_prompt = self._clamp_matched_count(int(row.get("upstream_matched_prompt_tokens") or 0), prompt_tokens)
             upstream_matched_completion = self._clamp_matched_count(
@@ -474,24 +485,28 @@ class CostAccountingService:
         if not self._table_exists("api_tools_upstream_logs"):
             return result
 
+        start_time = max(start_time, UPSTREAM_MIN_SYNC_START_TIME)
         params: Dict[str, Any] = {"start_time": start_time, "end_time": end_time}
         channel_clause = ""
         if channel_id and channel_id > 0:
-            channel_clause = " AND channel_id = :channel_id"
+            channel_clause = " AND u.channel_id = :channel_id"
             params["channel_id"] = channel_id
         rows = self.db.execute(f"""
             SELECT COUNT(*) as request_count,
-                COALESCE(SUM(CASE WHEN local_log_id > 0 THEN 1 ELSE 0 END), 0) as matched_request_count,
-                COALESCE(SUM(CASE WHEN match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
-                COALESCE(SUM(CASE WHEN match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches,
-                COALESCE(SUM(quota), 0) as quota_used
-            FROM api_tools_upstream_logs
-            WHERE created_at >= :start_time AND created_at <= :end_time AND type = 2
+                COALESCE(SUM(CASE WHEN u.local_log_id > 0 THEN 1 ELSE 0 END), 0) as matched_request_count,
+                COALESCE(SUM(CASE WHEN u.match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
+                COALESCE(SUM(CASE WHEN u.match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches,
+                COALESCE(SUM(u.quota), 0) as quota_used,
+                COALESCE(SUM(CASE WHEN cfg.recharge_multiplier > 0 THEN u.quota / cfg.recharge_multiplier ELSE u.quota END), 0) as adjusted_quota
+            FROM api_tools_upstream_logs u
+            LEFT JOIN api_tools_upstream_log_sync_config cfg ON cfg.base_url = u.source_url
+            WHERE u.created_at >= :start_time AND u.created_at <= :end_time AND u.type = 2
                 {channel_clause}
         """, params)
         if not rows:
             return result
         quota = int(rows[0].get("quota_used") or 0)
+        adjusted_quota = float(rows[0].get("adjusted_quota") or 0)
         request_count = int(rows[0].get("request_count") or 0)
         matched_count = int(rows[0].get("matched_request_count") or 0)
         result.update({
@@ -502,7 +517,7 @@ class CostAccountingService:
             "request_id_matches": int(rows[0].get("request_id_matches") or 0),
             "tokens_time_matches": int(rows[0].get("tokens_time_matches") or 0),
             "quota_used": quota,
-            "cost": self._round_money(quota / QUOTA_PER_USD),
+            "cost": self._round_money(adjusted_quota / QUOTA_PER_USD),
         })
         return result
 

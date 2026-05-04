@@ -20,34 +20,38 @@ import (
 )
 
 const (
-	upstreamSyncConfigID = 1
-	upstreamSyncTimeout  = 60 * time.Second
+	upstreamSyncConfigID              = 1
+	upstreamSyncTimeout               = 60 * time.Second
+	upstreamSyncDefaultMinStartTime   = int64(1777564800) // 2026-05-01 00:00:00 Asia/Shanghai
+	upstreamSyncDefaultRechargeFactor = 1.0
 )
 
 // UpstreamLogSyncConfig stores upstream NewAPI log import settings.
 type UpstreamLogSyncConfig struct {
-	ID                    int64  `json:"id"`
-	Enabled               bool   `json:"enabled"`
-	SourceName            string `json:"source_name"`
-	BaseURL               string `json:"base_url"`
-	Endpoint              string `json:"endpoint"`
-	AuthToken             string `json:"auth_token,omitempty"`
-	AuthTokenSet          bool   `json:"auth_token_set"`
-	ClearAuthToken        bool   `json:"clear_auth_token,omitempty"`
-	UserID                string `json:"user_id"`
-	PageSize              int    `json:"page_size"`
-	RequestDelayMS        int    `json:"request_delay_ms"`
-	IntervalMinutes       int    `json:"interval_minutes"`
-	LookbackMinutes       int    `json:"lookback_minutes"`
-	OverlapMinutes        int    `json:"overlap_minutes"`
-	MatchToleranceSeconds int    `json:"match_tolerance_seconds"`
-	LogType               int    `json:"log_type"`
-	MaxPagesPerRun        int    `json:"max_pages_per_run"`
-	LastSyncAt            int64  `json:"last_sync_at"`
-	LastSuccessAt         int64  `json:"last_success_at"`
-	LastError             string `json:"last_error"`
-	TotalImported         int64  `json:"total_imported"`
-	UpdatedAt             int64  `json:"updated_at"`
+	ID                    int64   `json:"id"`
+	Enabled               bool    `json:"enabled"`
+	SourceName            string  `json:"source_name"`
+	BaseURL               string  `json:"base_url"`
+	Endpoint              string  `json:"endpoint"`
+	AuthToken             string  `json:"auth_token,omitempty"`
+	AuthTokenSet          bool    `json:"auth_token_set"`
+	ClearAuthToken        bool    `json:"clear_auth_token,omitempty"`
+	UserID                string  `json:"user_id"`
+	PageSize              int     `json:"page_size"`
+	RequestDelayMS        int     `json:"request_delay_ms"`
+	IntervalMinutes       int     `json:"interval_minutes"`
+	LookbackMinutes       int     `json:"lookback_minutes"`
+	OverlapMinutes        int     `json:"overlap_minutes"`
+	MatchToleranceSeconds int     `json:"match_tolerance_seconds"`
+	RechargeMultiplier    float64 `json:"recharge_multiplier"`
+	MinSyncStartTime      int64   `json:"min_sync_start_time"`
+	LogType               int     `json:"log_type"`
+	MaxPagesPerRun        int     `json:"max_pages_per_run"`
+	LastSyncAt            int64   `json:"last_sync_at"`
+	LastSuccessAt         int64   `json:"last_success_at"`
+	LastError             string  `json:"last_error"`
+	TotalImported         int64   `json:"total_imported"`
+	UpdatedAt             int64   `json:"updated_at"`
 }
 
 // UpstreamLogSyncRunOptions overrides config for a single manual/scheduled run.
@@ -155,6 +159,8 @@ func (s *UpstreamLogSyncService) EnsureTables() error {
 				lookback_minutes INTEGER NOT NULL DEFAULT 60,
 				overlap_minutes INTEGER NOT NULL DEFAULT 10,
 				match_tolerance_seconds INTEGER NOT NULL DEFAULT 60,
+				recharge_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1,
+				min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800,
 				log_type INTEGER NOT NULL DEFAULT 2,
 				max_pages_per_run INTEGER NOT NULL DEFAULT 1000,
 				last_sync_at BIGINT NOT NULL DEFAULT 0,
@@ -229,6 +235,8 @@ func (s *UpstreamLogSyncService) EnsureTables() error {
 			lookback_minutes INT NOT NULL DEFAULT 60,
 			overlap_minutes INT NOT NULL DEFAULT 10,
 			match_tolerance_seconds INT NOT NULL DEFAULT 60,
+			recharge_multiplier DOUBLE NOT NULL DEFAULT 1,
+			min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800,
 			log_type INT NOT NULL DEFAULT 2,
 			max_pages_per_run INT NOT NULL DEFAULT 1000,
 			last_sync_at BIGINT NOT NULL DEFAULT 0,
@@ -301,6 +309,18 @@ func (s *UpstreamLogSyncService) ensureSchemaColumns() error {
 			name:  "match_tolerance_seconds",
 			pgDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INTEGER NOT NULL DEFAULT 60",
 			myDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN match_tolerance_seconds INT NOT NULL DEFAULT 60",
+		},
+		{
+			table: "api_tools_upstream_log_sync_config",
+			name:  "recharge_multiplier",
+			pgDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN recharge_multiplier DOUBLE PRECISION NOT NULL DEFAULT 1",
+			myDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN recharge_multiplier DOUBLE NOT NULL DEFAULT 1",
+		},
+		{
+			table: "api_tools_upstream_log_sync_config",
+			name:  "min_sync_start_time",
+			pgDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800",
+			myDDL: "ALTER TABLE api_tools_upstream_log_sync_config ADD COLUMN min_sync_start_time BIGINT NOT NULL DEFAULT 1777564800",
 		},
 		{
 			table: "api_tools_upstream_logs",
@@ -403,6 +423,8 @@ func defaultUpstreamLogSyncConfig() UpstreamLogSyncConfig {
 		LookbackMinutes:       60,
 		OverlapMinutes:        10,
 		MatchToleranceSeconds: 60,
+		RechargeMultiplier:    upstreamSyncDefaultRechargeFactor,
+		MinSyncStartTime:      upstreamSyncDefaultMinStartTime,
 		LogType:               2,
 		MaxPagesPerRun:        1000,
 	}
@@ -424,7 +446,7 @@ func (s *UpstreamLogSyncService) GetConfigByID(id int64, includeSecret bool) (Up
 
 	row, err := s.db.QueryOne(s.db.RebindQuery(`
 		SELECT id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
-			interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
+			interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, recharge_multiplier, min_sync_start_time, log_type, max_pages_per_run,
 			last_sync_at, last_success_at, last_error, total_imported, updated_at
 		FROM api_tools_upstream_log_sync_config
 		WHERE id = ?`), id)
@@ -449,7 +471,7 @@ func (s *UpstreamLogSyncService) ListConfigs(includeSecret bool) ([]UpstreamLogS
 
 	rows, err := s.db.Query(s.db.RebindQuery(`
 		SELECT id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
-			interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
+			interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, recharge_multiplier, min_sync_start_time, log_type, max_pages_per_run,
 			last_sync_at, last_success_at, last_error, total_imported, updated_at
 		FROM api_tools_upstream_log_sync_config
 		ORDER BY id ASC`))
@@ -485,6 +507,8 @@ func upstreamSyncConfigFromRow(row map[string]interface{}) UpstreamLogSyncConfig
 	cfg.LookbackMinutes = int(toInt64(row["lookback_minutes"]))
 	cfg.OverlapMinutes = int(toInt64(row["overlap_minutes"]))
 	cfg.MatchToleranceSeconds = int(toInt64(row["match_tolerance_seconds"]))
+	cfg.RechargeMultiplier = toFloat64(row["recharge_multiplier"])
+	cfg.MinSyncStartTime = toInt64(row["min_sync_start_time"])
 	cfg.LogType = int(toInt64(row["log_type"]))
 	cfg.MaxPagesPerRun = int(toInt64(row["max_pages_per_run"]))
 	cfg.LastSyncAt = toInt64(row["last_sync_at"])
@@ -541,6 +565,12 @@ func (s *UpstreamLogSyncService) RegisterConfig(next UpstreamLogSyncConfig) (Ups
 	}
 	if next.MatchToleranceSeconds <= 0 {
 		next.MatchToleranceSeconds = 60
+	}
+	if next.RechargeMultiplier <= 0 {
+		next.RechargeMultiplier = upstreamSyncDefaultRechargeFactor
+	}
+	if next.MinSyncStartTime <= 0 {
+		next.MinSyncStartTime = upstreamSyncDefaultMinStartTime
 	}
 	if next.PageSize <= 0 {
 		next.PageSize = 100
@@ -603,13 +633,13 @@ func (s *UpstreamLogSyncService) saveConfigRecord(next, current UpstreamLogSyncC
 	query := `
 		INSERT INTO api_tools_upstream_log_sync_config
 			(id, enabled, source_name, base_url, endpoint, auth_token, user_id, page_size, request_delay_ms,
-			 interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, log_type, max_pages_per_run,
+			 interval_minutes, lookback_minutes, overlap_minutes, match_tolerance_seconds, recharge_multiplier, min_sync_start_time, log_type, max_pages_per_run,
 			 last_sync_at, last_success_at, last_error, total_imported, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 	args := []interface{}{
 		next.ID, next.Enabled, next.SourceName, next.BaseURL, next.Endpoint, next.AuthToken, next.UserID,
 		next.PageSize, next.RequestDelayMS, next.IntervalMinutes, next.LookbackMinutes,
-		next.OverlapMinutes, next.MatchToleranceSeconds, next.LogType, next.MaxPagesPerRun, next.LastSyncAt, next.LastSuccessAt,
+		next.OverlapMinutes, next.MatchToleranceSeconds, next.RechargeMultiplier, next.MinSyncStartTime, next.LogType, next.MaxPagesPerRun, next.LastSyncAt, next.LastSuccessAt,
 		next.LastError, next.TotalImported, next.UpdatedAt,
 	}
 	if s.db.IsPG {
@@ -627,6 +657,8 @@ func (s *UpstreamLogSyncService) saveConfigRecord(next, current UpstreamLogSyncC
 				lookback_minutes = EXCLUDED.lookback_minutes,
 				overlap_minutes = EXCLUDED.overlap_minutes,
 				match_tolerance_seconds = EXCLUDED.match_tolerance_seconds,
+				recharge_multiplier = EXCLUDED.recharge_multiplier,
+				min_sync_start_time = EXCLUDED.min_sync_start_time,
 				log_type = EXCLUDED.log_type,
 				max_pages_per_run = EXCLUDED.max_pages_per_run,
 				last_sync_at = EXCLUDED.last_sync_at,
@@ -649,6 +681,8 @@ func (s *UpstreamLogSyncService) saveConfigRecord(next, current UpstreamLogSyncC
 				lookback_minutes = VALUES(lookback_minutes),
 				overlap_minutes = VALUES(overlap_minutes),
 				match_tolerance_seconds = VALUES(match_tolerance_seconds),
+				recharge_multiplier = VALUES(recharge_multiplier),
+				min_sync_start_time = VALUES(min_sync_start_time),
 				log_type = VALUES(log_type),
 				max_pages_per_run = VALUES(max_pages_per_run),
 				last_sync_at = VALUES(last_sync_at),
@@ -751,6 +785,10 @@ func normalizeUpstreamSyncConfig(cfg UpstreamLogSyncConfig) UpstreamLogSyncConfi
 	cfg.LookbackMinutes = clampIntValue(cfg.LookbackMinutes, 1, 525600, 60)
 	cfg.OverlapMinutes = clampIntValue(cfg.OverlapMinutes, 0, 1440, 10)
 	cfg.MatchToleranceSeconds = clampIntValue(cfg.MatchToleranceSeconds, 1, 3600, 60)
+	cfg.RechargeMultiplier = clampFloatValue(cfg.RechargeMultiplier, 0.000001, 1000000, upstreamSyncDefaultRechargeFactor)
+	if cfg.MinSyncStartTime <= 0 {
+		cfg.MinSyncStartTime = upstreamSyncDefaultMinStartTime
+	}
 	cfg.LogType = clampIntValue(cfg.LogType, 0, 9, 2)
 	cfg.MaxPagesPerRun = clampIntValue(cfg.MaxPagesPerRun, 1, 100000, 1000)
 	cfg.UserID = strings.TrimSpace(cfg.UserID)
@@ -760,6 +798,19 @@ func normalizeUpstreamSyncConfig(cfg UpstreamLogSyncConfig) UpstreamLogSyncConfi
 
 func clampIntValue(value, minVal, maxVal, fallback int) int {
 	if value <= 0 && minVal > 0 {
+		return fallback
+	}
+	if value < minVal {
+		return minVal
+	}
+	if value > maxVal {
+		return maxVal
+	}
+	return value
+}
+
+func clampFloatValue(value, minVal, maxVal, fallback float64) float64 {
+	if value <= 0 {
 		return fallback
 	}
 	if value < minVal {
@@ -913,6 +964,9 @@ func (s *UpstreamLogSyncService) syncWindow(cfg UpstreamLogSyncConfig, opts Upst
 	if startTime < 0 {
 		startTime = 0
 	}
+	if cfg.MinSyncStartTime > 0 && startTime < cfg.MinSyncStartTime {
+		startTime = cfg.MinSyncStartTime
+	}
 	return startTime, endTime
 }
 
@@ -931,6 +985,14 @@ func (s *UpstreamLogSyncService) UploadLogs(req UpstreamLogUploadRequest) (map[s
 	}
 	if len(req.Logs) > 200000 {
 		return nil, fmt.Errorf("too many logs: %d", len(req.Logs))
+	}
+	minStart := s.minSyncStartForSource(sourceURL)
+	req.Logs = filterUpstreamLogsFrom(req.Logs, minStart)
+	if len(req.Logs) == 0 {
+		return nil, fmt.Errorf("no logs at or after %s", time.Unix(minStart, 0).Format(time.RFC3339))
+	}
+	if req.StartTime > 0 && req.StartTime < minStart {
+		req.StartTime = minStart
 	}
 
 	imported, err := s.upsertImportedLogs(req.Logs, sourceURL, sourceName)
@@ -972,6 +1034,28 @@ func (s *UpstreamLogSyncService) UploadLogs(req UpstreamLogUploadRequest) (map[s
 		"imported":    imported,
 		"match":       matchResult,
 	}, nil
+}
+
+func (s *UpstreamLogSyncService) minSyncStartForSource(sourceURL string) int64 {
+	cfg, found, err := s.findConfigByBaseURL(sourceURL)
+	if err == nil && found && cfg.MinSyncStartTime > 0 {
+		return cfg.MinSyncStartTime
+	}
+	return upstreamSyncDefaultMinStartTime
+}
+
+func filterUpstreamLogsFrom(logs []map[string]interface{}, minStart int64) []map[string]interface{} {
+	if minStart <= 0 {
+		return logs
+	}
+	filtered := make([]map[string]interface{}, 0, len(logs))
+	for _, item := range logs {
+		createdAt := firstInt64Value(item, "created_at", "createdAt", "timestamp")
+		if createdAt <= 0 || createdAt >= minStart {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
 }
 
 // ReconcileMatches links imported upstream logs to local logs one-to-one.
@@ -1582,17 +1666,25 @@ func (s *UpstreamLogSyncService) UpstreamImportSummary(startTime, endTime int64,
 	if exists, err := s.db.TableExists("api_tools_upstream_logs"); err != nil || !exists {
 		return result
 	}
+	if err := s.EnsureTables(); err != nil {
+		return result
+	}
+	if startTime < upstreamSyncDefaultMinStartTime {
+		startTime = upstreamSyncDefaultMinStartTime
+	}
 	query := `
 		SELECT COUNT(*) as request_count,
 			COALESCE(SUM(CASE WHEN local_log_id > 0 THEN 1 ELSE 0 END), 0) as matched_request_count,
 			COALESCE(SUM(CASE WHEN match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
 			COALESCE(SUM(CASE WHEN match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches,
-			COALESCE(SUM(quota), 0) as quota_used
-		FROM api_tools_upstream_logs
-		WHERE created_at >= ? AND created_at <= ? AND type = 2`
+			COALESCE(SUM(u.quota), 0) as quota_used,
+			COALESCE(SUM(CASE WHEN cfg.recharge_multiplier > 0 THEN u.quota / cfg.recharge_multiplier ELSE u.quota END), 0) as adjusted_quota
+		FROM api_tools_upstream_logs u
+		LEFT JOIN api_tools_upstream_log_sync_config cfg ON cfg.base_url = u.source_url
+		WHERE u.created_at >= ? AND u.created_at <= ? AND u.type = 2`
 	args := []interface{}{startTime, endTime}
 	if channelID != nil && *channelID > 0 {
-		query += ` AND channel_id = ?`
+		query += ` AND u.channel_id = ?`
 		args = append(args, *channelID)
 	}
 	row, err := s.db.QueryOneWithTimeout(20*time.Second, s.db.RebindQuery(query), args...)
@@ -1600,6 +1692,7 @@ func (s *UpstreamLogSyncService) UpstreamImportSummary(startTime, endTime int64,
 		return result
 	}
 	quota := toInt64(row["quota_used"])
+	adjustedQuota := toFloat64(row["adjusted_quota"])
 	result["available"] = true
 	requestCount := toInt64(row["request_count"])
 	matchedCount := toInt64(row["matched_request_count"])
@@ -1609,6 +1702,6 @@ func (s *UpstreamLogSyncService) UpstreamImportSummary(startTime, endTime int64,
 	result["request_id_matches"] = toInt64(row["request_id_matches"])
 	result["tokens_time_matches"] = toInt64(row["tokens_time_matches"])
 	result["quota_used"] = quota
-	result["cost"] = roundMoney(float64(quota) / costQuotaPerUSD)
+	result["cost"] = roundMoney(adjustedQuota / costQuotaPerUSD)
 	return result
 }

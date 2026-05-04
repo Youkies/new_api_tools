@@ -22,6 +22,8 @@
 - `NewAPI 日志导出助手-1.2.2.user.js` 已升级为 1.2.4：新增“保存当前上游登录态供 Tools 后台定时拉取”显式勾选项和拉取间隔输入；未勾选时不会上传上游 token。
 - 成本核算页新增“日志助手接入”面板，直接显示可填入脚本的 `NewAPI Tools 地址`、`Tools API Key` 和配置文件路径，并支持复制与保存 API Key。
 - Go 后端新增 `/api/cost/tools-access` 读写接口；脚本 API Key 会持久化到 `DATA_DIR/tools_auth.json`，容器默认对应 `/app/data/tools_auth.json`，文件 key 优先于环境变量 `API_KEY`。
+- 上游同步配置新增 `recharge_multiplier` 和 `min_sync_start_time`：成本按 `账面 quota / 500000 / 充值倍率` 折算，默认只获取/上传 `2026-05-01 00:00:00` 之后的上游日志。
+- 成本核算页“已注册上游”列表支持分别调整每个上游的充值倍率、最早同步时间和启用状态；userscript 升级为 1.2.5，注册时可带上充值倍率。
 - Python 兼容后端补齐配置接口和成本汇总对 `api_tools_upstream_logs.local_log_id` 的兼容读取；实际上游抓取同步仍以 Go 后端为正式实现。
 
 ## 验证结果

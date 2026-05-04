@@ -261,8 +261,13 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 	upstreamJoinAvailable := false
 	if s.db.ColumnExists("logs", "id") {
 		if exists, tableErr := s.db.TableExists("api_tools_upstream_logs"); tableErr == nil && exists && s.db.ColumnExists("api_tools_upstream_logs", "local_log_id") {
+			_ = NewUpstreamLogSyncService().EnsureTables()
 			upstreamJoinAvailable = true
 		}
+	}
+	upstreamStartTime := startTime
+	if upstreamStartTime < upstreamSyncDefaultMinStartTime {
+		upstreamStartTime = upstreamSyncDefaultMinStartTime
 	}
 	query := `
 		SELECT COALESCE(l.channel_id, 0) as channel_id,
@@ -283,6 +288,7 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 	} else {
 		query += `
 			0 as upstream_quota,
+			0 as upstream_adjusted_quota,
 			0 as upstream_matched_count,
 			0 as upstream_matched_prompt_tokens,
 			0 as upstream_matched_completion_tokens,
@@ -298,13 +304,15 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		LEFT JOIN (
 			SELECT local_log_id,
 				COALESCE(SUM(quota), 0) as upstream_quota,
+				COALESCE(SUM(CASE WHEN cfg.recharge_multiplier > 0 THEN u.quota / cfg.recharge_multiplier ELSE u.quota END), 0) as upstream_adjusted_quota,
 				COALESCE(SUM(CASE WHEN match_method = 'request_id' THEN 1 ELSE 0 END), 0) as request_id_matches,
 				COALESCE(SUM(CASE WHEN match_method = 'tokens_time' THEN 1 ELSE 0 END), 0) as tokens_time_matches
-			FROM api_tools_upstream_logs
-			WHERE created_at >= ? AND created_at <= ? AND type = 2 AND local_log_id > 0
+			FROM api_tools_upstream_logs u
+			LEFT JOIN api_tools_upstream_log_sync_config cfg ON cfg.base_url = u.source_url
+			WHERE u.created_at >= ? AND u.created_at <= ? AND u.type = 2 AND u.local_log_id > 0
 			GROUP BY local_log_id
 		) ul ON ul.local_log_id = l.id`
-		args = append(args, startTime, endTime)
+		args = append(args, upstreamStartTime, endTime)
 	}
 	query += `
 		WHERE l.created_at >= ? AND l.created_at <= ? AND l.type = 2`
@@ -353,8 +361,8 @@ func (s *CostAccountingService) GetSummary(startTime, endTime int64, channelID *
 		promptTokens := toInt64(row["prompt_tokens"])
 		completionTokens := toInt64(row["completion_tokens"])
 		billedAmount := float64(quotaUsed) / costQuotaPerUSD
-		upstreamQuota := toInt64(row["upstream_quota"])
-		upstreamImportedCost := float64(upstreamQuota) / costQuotaPerUSD
+		upstreamAdjustedQuota := toFloat64(row["upstream_adjusted_quota"])
+		upstreamImportedCost := upstreamAdjustedQuota / costQuotaPerUSD
 		upstreamMatchedRequests := clampMatchedCount(toInt64(row["upstream_matched_count"]), requests)
 		upstreamMatchedPrompt := clampMatchedCount(toInt64(row["upstream_matched_prompt_tokens"]), promptTokens)
 		upstreamMatchedCompletion := clampMatchedCount(toInt64(row["upstream_matched_completion_tokens"]), completionTokens)
