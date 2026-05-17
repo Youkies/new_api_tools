@@ -92,6 +92,7 @@ func main() {
 		handler.RegisterDashboardRoutes(api)
 		handler.RegisterUserManagementRoutes(api)
 		handler.RegisterLogAnalyticsRoutes(api)
+		handler.RegisterOperationsRoutes(api)
 		handler.RegisterCostAccountingRoutes(api)
 		handler.RegisterLogMatcherRoutes(api)
 

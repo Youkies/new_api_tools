@@ -1,10 +1,10 @@
 import { ReactNode, useEffect, useState, useRef } from 'react'
-import { LayoutDashboard, Plus, Ticket, Clock, DollarSign, BarChart3, Users, LogOut, Activity, Globe, Monitor, UserPlus, Key, Calculator, FileSearch } from 'lucide-react'
+import { LayoutDashboard, Plus, Ticket, Clock, DollarSign, BarChart3, Users, LogOut, Activity, Globe, Monitor, UserPlus, Key, Calculator, FileSearch, Bell } from 'lucide-react'
 import { Button } from './ui/button'
 import { Badge } from './ui/badge'
 import { cn } from '../lib/utils'
 
-export type TabType = 'dashboard' | 'risk' | 'ip-analysis' | 'generator' | 'redemptions' | 'history' | 'topups' | 'analytics' | 'model-status' | 'users' | 'auto-group' | 'tokens' | 'costs' | 'log-match'
+export type TabType = 'dashboard' | 'risk' | 'ip-analysis' | 'generator' | 'redemptions' | 'history' | 'topups' | 'analytics' | 'operations' | 'model-status' | 'users' | 'auto-group' | 'tokens' | 'costs' | 'log-match'
 
 interface DbStatus {
   connected: boolean
@@ -26,6 +26,7 @@ const tabs: { id: TabType; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'risk', label: '风控中心', icon: Activity },
   { id: 'ip-analysis', label: 'IP分析', icon: Globe },
   { id: 'analytics', label: '日志分析', icon: BarChart3 },
+  { id: 'operations', label: '运营预警', icon: Bell },
   { id: 'costs', label: '成本核算', icon: Calculator },
   { id: 'log-match', label: '日志对账', icon: FileSearch },
   { id: 'model-status', label: '模型监控', icon: Monitor },

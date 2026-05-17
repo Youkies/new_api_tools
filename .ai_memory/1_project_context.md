@@ -20,6 +20,7 @@
 - 2026-05-17 共享 IP 小号场景新增案件级 AI 研判：Go/Python `/api/ai-ban/assess-shared-ip` 使用 prompt 版本 `shared-ip-alt-account-v1`，按同 IP 多用户、未充值、低调用、首次出现集中、误报风险等证据输出 `monitor/review/ban`；模型输出会在后端归一化，策略仍是 `pending_review_first`。
 - 2026-05-17 小号风险案件 v1 已落地：Go/Python 提供 `/api/risk/alt-account/cases`、`/api/risk/alt-account/cases/{case_id}`、`/api/risk/alt-account/cases/{case_id}/assess`；规则层实时生成 `shared_ip`、`rotating_pool`、`invite_chain`、`token_rotation` 四类案件，前端新增 `AltAccountCasesPanel`。
 - 2026-05-17 真实库 + AI 验证通过：30d 小号案件实时生成返回 127 个候选；24h 共享 IP 高风险样本为 15 用户、15 未充值、18 请求，使用 `「按量」gpt-5.5` 返回 86 分、`review`、耗时约 73 秒。注意带中文前缀的模型 ID 必须以 UTF-8 JSON 发送；用户明确要求管理员风控场景不需要对发送给 AI 的 IP 脱敏，AI 小号案件可发送完整 IP/网段。
+- 2026-05-17 运营预警 v1 已新增独立页面：Go/Python 提供 `/api/operations/alerts`、`/api/operations/users/{user_id}/detail`，前端新增 `运营预警` 导航页；覆盖高价值用户停用、充值断档、新充值未激活、付费用户体验异常和支付状态异常。收入/毛利异常暂不纳入，因为尚未接入上游真实价格系统；用户详情直接展示注册邮箱便于管理员联系，邮箱不发送给外部 AI，也不作为默认导出字段扩散。
 - 2026-05-17 仍未落地真正日志 rollup 表：`api_tools_usage_rollup_hourly/daily` 仍是后续任务；当前 snapshot 主要通过缓存和单入口聚合降低前端多请求及统计时间点不一致问题。
 - 根目录 `功能优化方案.md` 是当前功能优化路线和落地状态入口；涉及仪表盘、风控中心、日志分析的大改动应同步更新该文档。
 - `docs/ai-risk-alt-account-requirements.md` 是 AI 小号风控产品化需求文档，记录共享 IP 小号、24h 轮换账号池、邀请链、token/IP 轮换、定时 AI 复核、隐私边界、接口、存储和验收标准；后续实现相关功能时优先对照该文档拆任务。

@@ -12,6 +12,7 @@ const TopUps = lazy(() => import('./components/TopUps').then((module) => ({ defa
 const RealtimeRanking = lazy(() => import('./components/RealtimeRanking').then((module) => ({ default: module.RealtimeRanking })))
 const IPAnalysis = lazy(() => import('./components/IPAnalysis').then((module) => ({ default: module.IPAnalysis })))
 const Analytics = lazy(() => import('./components/Analytics').then((module) => ({ default: module.Analytics })))
+const OperationsAlerts = lazy(() => import('./components/OperationsAlerts').then((module) => ({ default: module.OperationsAlerts })))
 const CostAccounting = lazy(() => import('./components/CostAccounting').then((module) => ({ default: module.CostAccounting })))
 const LogMatcher = lazy(() => import('./components/LogMatcher').then((module) => ({ default: module.LogMatcher })))
 const ModelStatusMonitor = lazy(() => import('./components/ModelStatusMonitor').then((module) => ({ default: module.ModelStatusMonitor })))
@@ -20,7 +21,7 @@ const Tokens = lazy(() => import('./components/Tokens').then((module) => ({ defa
 const AutoGroup = lazy(() => import('./components/AutoGroup').then((module) => ({ default: module.AutoGroup })))
 
 // Valid tabs
-const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'ip-analysis', 'analytics', 'costs', 'log-match', 'model-status', 'users', 'tokens', 'auto-group', 'generator', 'redemptions', 'history']
+const validTabs: TabType[] = ['dashboard', 'topups', 'risk', 'ip-analysis', 'analytics', 'operations', 'costs', 'log-match', 'model-status', 'users', 'tokens', 'auto-group', 'generator', 'redemptions', 'history']
 
 function PageFallback() {
   return (
@@ -170,6 +171,8 @@ function App() {
         return <IPAnalysis />
       case 'analytics':
         return <Analytics />
+      case 'operations':
+        return <OperationsAlerts />
       case 'costs':
         return <CostAccounting />
       case 'log-match':
