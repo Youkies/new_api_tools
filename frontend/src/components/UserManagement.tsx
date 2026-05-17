@@ -56,6 +56,7 @@ interface ActivityStats {
   inactive_users: number
   very_inactive_users: number
   never_requested: number
+  never_unpaid?: number
 }
 
 // 分组信息
@@ -137,7 +138,6 @@ export function UserManagement() {
   const [orderBy, setOrderBy] = useState<UserSortField>('request_count')
   const [orderDir, setOrderDir] = useState<SortDirection>('DESC')
   const [deleting, setDeleting] = useState(false)
-  const [deletingVeryInactive, setDeletingVeryInactive] = useState(false)
   const [deletingNever, setDeletingNever] = useState(false)
   const [refreshing, setRefreshing] = useState(false)
 
@@ -535,8 +535,8 @@ export function UserManagement() {
     // 重置确认输入
     setHardDeleteConfirmText('')
 
-    const levelLabel = level === 'never' ? '从未请求' : level === 'inactive' ? '不活跃' : '非常不活跃'
-    const actionLabel = hardDelete ? '彻底删除' : '删除'
+    const levelLabel = level === 'never' ? '未充值且从未调用' : level === 'inactive' ? '不活跃' : '非常不活跃'
+    const actionLabel = hardDelete ? '彻底删除' : '注销'
 
     // 先立即显示弹窗，带加载状态
     setConfirmDialog({
@@ -589,7 +589,7 @@ export function UserManagement() {
 
   const executeBatchDelete = async (level: string, hardDelete: boolean = false) => {
     setConfirmDialog(prev => ({ ...prev, isOpen: false }))
-    const setLoading = level === 'very_inactive' ? setDeletingVeryInactive : setDeletingNever
+    const setLoading = setDeletingNever
     setLoading(true)
     try {
       const response = await fetch(`${apiUrl}/api/users/batch-delete`, {
@@ -839,30 +839,20 @@ export function UserManagement() {
                   <AlertTriangle className="h-5 w-5 text-orange-600 dark:text-orange-400" />
                 </div>
                 <div>
-                  <h3 className="font-medium text-orange-800 dark:text-orange-200">批量注销不活跃用户</h3>
-                  <p className="text-sm text-orange-600 dark:text-orange-400">注销：数据保留可恢复 | 彻底删除：永久移除不可恢复</p>
+                  <h3 className="font-medium text-orange-800 dark:text-orange-200">批量注销未充值且从未调用用户</h3>
+                  <p className="text-sm text-orange-600 dark:text-orange-400">仅处理未成功充值且从未调用过的用户；注销后数据保留可恢复</p>
                 </div>
               </div>
               <div className="flex flex-wrap gap-2">
                 <Button
                   variant="outline"
                   size="sm"
-                  className="border-orange-300 text-orange-700 hover:bg-orange-100 hover:text-orange-800 dark:border-orange-800 dark:text-orange-300 dark:hover:bg-orange-900"
-                  onClick={() => previewBatchDelete('very_inactive', false)}
-                  disabled={deletingVeryInactive || !stats?.very_inactive_users}
-                >
-                  {deletingVeryInactive ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                  注销非常不活跃 ({stats?.very_inactive_users || 0})
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
                   className="border-gray-300 text-gray-700 hover:bg-gray-100 hover:text-gray-900 dark:border-gray-700 dark:text-gray-300 dark:hover:bg-gray-800"
                   onClick={() => previewBatchDelete('never', false)}
-                  disabled={deletingNever || !stats?.never_requested}
+                  disabled={deletingNever || !(stats?.never_unpaid ?? 0)}
                 >
                   {deletingNever ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                  注销从未请求 ({stats?.never_requested || 0})
+                  注销未充值且从未调用 ({stats?.never_unpaid ?? 0})
                 </Button>
               </div>
             </div>
@@ -875,7 +865,7 @@ export function UserManagement() {
                   </div>
                   <div>
                     <h3 className="font-medium text-red-800 dark:text-red-200">彻底删除（危险操作）</h3>
-                    <p className="text-sm text-red-600 dark:text-red-400">永久删除用户及所有关联数据，包括令牌、配额、任务等</p>
+                    <p className="text-sm text-red-600 dark:text-red-400">仅处理未成功充值且从未调用过的用户，永久删除用户及所有关联数据</p>
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-2">
@@ -883,21 +873,11 @@ export function UserManagement() {
                     variant="outline"
                     size="sm"
                     className="border-red-300 text-red-700 hover:bg-red-100 hover:text-red-800 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900"
-                    onClick={() => previewBatchDelete('very_inactive', true)}
-                    disabled={deletingVeryInactive || !stats?.very_inactive_users}
-                  >
-                    {deletingVeryInactive ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                    彻底删除非常不活跃
-                  </Button>
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="border-red-300 text-red-700 hover:bg-red-100 hover:text-red-800 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900"
                     onClick={() => previewBatchDelete('never', true)}
-                    disabled={deletingNever || !stats?.never_requested}
+                    disabled={deletingNever || !(stats?.never_unpaid ?? 0)}
                   >
                     {deletingNever ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Trash2 className="h-4 w-4 mr-2" />}
-                    彻底删除从未请求
+                    彻底删除未充值且从未调用
                   </Button>
                 </div>
               </div>

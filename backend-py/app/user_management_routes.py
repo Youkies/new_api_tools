@@ -42,7 +42,7 @@ class DeleteResponse(BaseModel):
 
 class BatchDeleteRequest(BaseModel):
     """批量删除请求"""
-    activity_level: str = "very_inactive"  # very_inactive, inactive 或 never
+    activity_level: str = "never"  # very_inactive, inactive 或 never
     dry_run: bool = True  # 预演模式
     hard_delete: bool = False  # 彻底删除模式（物理删除）
 
@@ -95,6 +95,7 @@ async def get_activity_stats(
     - inactive: 7-30 天内有请求
     - very_inactive: 超过 30 天没有请求
     - never_requested: 从未请求
+    - never_unpaid: 未充值且从未请求
     
     参数:
     - quick: 快速模式，只返回总用户数和从未请求数（毫秒级响应）
@@ -111,6 +112,7 @@ async def get_activity_stats(
             "inactive_users": stats.inactive_users,
             "very_inactive_users": stats.very_inactive_users,
             "never_requested": stats.never_requested,
+            "never_unpaid": stats.never_unpaid,
         }
     )
 
@@ -237,6 +239,7 @@ async def batch_delete_inactive_users(
     批量删除不活跃用户
 
     - **activity_level**: 要删除的活跃度级别 (very_inactive, inactive 或 never)
+      - never 会额外限制为“未成功充值且从未请求”
     - **dry_run**: 预演模式，为 true 时只返回将被删除的用户数量，不实际删除
     - **hard_delete**: 彻底删除模式，为 true 时物理删除用户及所有关联数据
 

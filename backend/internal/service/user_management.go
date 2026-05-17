@@ -78,12 +78,14 @@ func (s *UserManagementService) GetActivityStats(quick bool) (map[string]interfa
 		if neverRow != nil {
 			neverCount = toInt64(neverRow["count"])
 		}
+		neverUnpaidCount := s.countNeverUnpaidUsers()
 		return map[string]interface{}{
 			"total_users":         totalUsers,
 			"active_users":        0,
 			"inactive_users":      0,
 			"very_inactive_users": 0,
 			"never_requested":     neverCount,
+			"never_unpaid":        neverUnpaidCount,
 			"quick_mode":          true,
 		}, nil
 	}
@@ -119,6 +121,7 @@ func (s *UserManagementService) GetActivityStats(quick bool) (map[string]interfa
 	if neverRow != nil {
 		neverCount = toInt64(neverRow["count"])
 	}
+	neverUnpaidCount := s.countNeverUnpaidUsers()
 
 	total := toInt64(totalUsers)
 	veryInactive := total - activeCount - inactiveCount - neverCount
@@ -129,7 +132,35 @@ func (s *UserManagementService) GetActivityStats(quick bool) (map[string]interfa
 		"inactive_users":      inactiveCount,
 		"very_inactive_users": veryInactive,
 		"never_requested":     neverCount,
+		"never_unpaid":        neverUnpaidCount,
 	}, nil
+}
+
+func (s *UserManagementService) noSuccessfulTopUpCondition(userIDRef string) string {
+	exists, err := s.db.TableExists("top_ups")
+	if err != nil || !exists {
+		return "1 = 0"
+	}
+	return fmt.Sprintf(`NOT EXISTS (
+		SELECT 1 FROM top_ups tu
+		WHERE tu.user_id = %s
+		AND (LOWER(tu.status) IN ('success', 'completed') OR tu.status = '1')
+	)`, userIDRef)
+}
+
+func (s *UserManagementService) countNeverUnpaidUsers() int64 {
+	row, err := s.db.QueryOne(fmt.Sprintf(
+		`SELECT COUNT(*) as count
+		 FROM users u
+		 WHERE u.deleted_at IS NULL
+		   AND u.role != 100
+		   AND u.request_count = 0
+		   AND %s`,
+		s.noSuccessfulTopUpCondition("u.id")))
+	if err != nil || row == nil {
+		return 0
+	}
+	return toInt64(row["count"])
 }
 
 // ListUsersParams defines parameters for listing users
@@ -595,7 +626,7 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 
 	switch activityLevel {
 	case ActivityNever:
-		condition = "request_count = 0"
+		condition = fmt.Sprintf("request_count = 0 AND %s", s.noSuccessfulTopUpCondition("users.id"))
 	case ActivityVeryInactive:
 		threshold := nowUnix - InactiveThreshold
 		condition = fmt.Sprintf("request_count > 0 AND id NOT IN (SELECT DISTINCT user_id FROM logs WHERE type IN (2,5) AND created_at >= %d)", threshold)
@@ -615,10 +646,27 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 	affected := toInt64(countRow["count"])
 
 	if dryRun {
+		userRows, err := s.db.Query(fmt.Sprintf(
+			"SELECT username FROM users WHERE deleted_at IS NULL AND role != 100 AND %s ORDER BY id DESC LIMIT 20",
+			condition))
+		if err != nil {
+			return nil, err
+		}
+		usernames := make([]string, 0, len(userRows))
+		for _, row := range userRows {
+			usernames = append(usernames, fmt.Sprint(row["username"]))
+		}
+		action := "注销"
+		if hardDelete {
+			action = "彻底删除"
+		}
 		return map[string]interface{}{
 			"dry_run":        true,
+			"count":          affected,
 			"affected_count": affected,
 			"activity_level": activityLevel,
+			"users":          usernames,
+			"message":        fmt.Sprintf("预览：将%s %d 个用户", action, affected),
 		}, nil
 	}
 
@@ -638,11 +686,17 @@ func (s *UserManagementService) BatchDeleteInactiveUsers(activityLevel string, d
 
 	logger.L.Business(fmt.Sprintf("批量删除 %s 用户: %d 个", activityLevel, affected))
 
+	action := "注销"
+	if hardDelete {
+		action = "彻底删除"
+	}
 	return map[string]interface{}{
 		"dry_run":        false,
+		"count":          affected,
 		"affected_count": affected,
 		"activity_level": activityLevel,
 		"hard_delete":    hardDelete,
+		"message":        fmt.Sprintf("已%s %d 个用户", action, affected),
 	}, nil
 }
 

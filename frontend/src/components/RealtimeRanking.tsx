@@ -13,7 +13,15 @@ import { cn, isCloudflareIp } from '../lib/utils'
 import { UserAnalysisDialog, BAN_REASONS, UNBAN_REASONS, RISK_FLAG_LABELS } from './UserAnalysisDialog'
 
 type WindowKey = '1h' | '3h' | '6h' | '12h' | '24h' | '3d' | '7d'
-type SortKey = 'requests' | 'quota' | 'failure_rate'
+type SortKey = 'risk_score' | 'requests' | 'quota' | 'failure_rate'
+
+interface RiskReason {
+  code: string
+  label: string
+  severity: 'low' | 'medium' | 'high' | string
+  evidence: string
+  suggestion: string
+}
 
 interface LeaderboardItem {
   user_id: number
@@ -26,10 +34,15 @@ interface LeaderboardItem {
   prompt_tokens: number
   completion_tokens: number
   unique_ips: number
+  risk_score?: number
+  risk_level?: 'low' | 'medium' | 'high' | string
+  risk_reasons?: RiskReason[]
+  reasons?: RiskReason[]
+  suggested_action?: string
 }
 
 const WINDOW_LABELS: Record<WindowKey, string> = { '1h': '1小时内', '3h': '3小时内', '6h': '6小时内', '12h': '12小时内', '24h': '24小时内', '3d': '3天内', '7d': '7天内' }
-const SORT_LABELS: Record<SortKey, string> = { requests: '请求次数', quota: '额度消耗', failure_rate: '失败率' }
+const SORT_LABELS: Record<SortKey, string> = { risk_score: '风险评分', requests: '请求次数', quota: '额度消耗', failure_rate: '失败率' }
 
 const REASON_STYLES: Record<string, string> = {
   '请求频率过高': 'bg-red-50 text-red-700 border-red-100 dark:bg-red-900/20 dark:text-red-400',
@@ -166,6 +179,10 @@ interface AIPendingReviewItem {
   confidence: number
   reason: string
   action: string
+  evidence_summary?: string[]
+  false_positive_risk?: 'low' | 'medium' | 'high' | string
+  questions_for_admin?: string[]
+  prompt_version?: string
   risk_flags: string[]
   total_requests: number
   unique_ips: number
@@ -325,7 +342,7 @@ export function RealtimeRanking() {
   const tabsRef = useRef<(HTMLButtonElement | null)[]>([])
   const [tabIndicatorStyle, setTabIndicatorStyle] = useState({ left: 0, width: 0, opacity: 0 })
 
-  const [sortBy, setSortBy] = useState<SortKey>('requests')
+  const [sortBy, setSortBy] = useState<SortKey>('risk_score')
   const [data, setData] = useState<Record<WindowKey, LeaderboardItem[]>>({ '1h': [], '3h': [], '6h': [], '12h': [], '24h': [], '3d': [], '7d': [] })
   const [generatedAt, setGeneratedAt] = useState<number>(0)
   const [loading, setLoading] = useState(true)
@@ -525,6 +542,10 @@ export function RealtimeRanking() {
       confidence: number
       reason: string
       action: string
+      evidence_summary?: string[]
+      false_positive_risk?: 'low' | 'medium' | 'high' | string
+      questions_for_admin?: string[]
+      prompt_version?: string
     }
   } | null>(null)
 
@@ -685,6 +706,47 @@ export function RealtimeRanking() {
     try {
       const windowsParam = singleWindow ? singleWindow : allWindows.join(',')
       const noCache = forceRefresh ? '&no_cache=true' : ''
+      if (sortBy === 'risk_score') {
+        const queueWindows = singleWindow ? [singleWindow] : allWindows
+        const queueResults = await Promise.all(queueWindows.map(async (windowKey) => {
+          const response = await fetch(
+            `${apiUrl}/api/risk/queue?window=${windowKey}&page=1&page_size=10&sort_by=risk_score${noCache}`,
+            { headers: getAuthHeaders() },
+          )
+          const res = await response.json()
+          if (!res.success) {
+            throw new Error(res.message || `获取 ${windowKey} 风险队列失败`)
+          }
+          return { windowKey, data: res.data }
+        }))
+
+        if (singleWindow) {
+          setData(prev => ({
+            ...prev,
+            [singleWindow]: (queueResults[0]?.data?.items || []) as LeaderboardItem[],
+          }))
+        } else {
+          const nextData: Record<WindowKey, LeaderboardItem[]> = {
+            '1h': [],
+            '3h': [],
+            '6h': [],
+            '12h': [],
+            '24h': [],
+            '3d': [],
+            '7d': [],
+          }
+          queueResults.forEach(({ windowKey, data: queueData }) => {
+            nextData[windowKey] = (queueData?.items || []) as LeaderboardItem[]
+          })
+          setData(nextData)
+        }
+
+        setGeneratedAt(Math.max(0, ...queueResults.map(({ data: queueData }) => Number(queueData?.snapshot_time || 0))))
+        setCountdown(refreshIntervalRef.current)
+        if (showSuccessToast) showToast('success', '已刷新')
+        return
+      }
+
       const response = await fetch(`${apiUrl}/api/risk/leaderboards?windows=${windowsParam}&limit=10&sort_by=${sortBy}${noCache}`, { headers: getAuthHeaders() })
       const res = await response.json()
       if (res.success) {
@@ -889,48 +951,42 @@ export function RealtimeRanking() {
       return
     }
 
-    const batchId = `shared-ip-${sourceItem.ip}-${Date.now()}`
     const reason = '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)'
-    const succeeded: BulkBanRecord['users'] = []
-    let failed = 0
 
     setBulkBanLoadingIp(sourceItem.ip)
     try {
-      for (const user of targets) {
-        const displayName = user.display_name || user.username || `User#${user.user_id}`
-        try {
-          const response = await fetch(`${apiUrl}/api/users/${user.user_id}/ban`, {
-            method: 'POST',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({
-              reason,
-              disable_tokens: true,
-              context: {
-                source: 'ip_monitoring_bulk',
-                batch_id: batchId,
-                ip: sourceItem.ip,
-                window: ipWindow,
-                user_count: sourceItem.user_count,
-                token_count: sourceItem.token_count,
-                request_count: sourceItem.request_count,
-              },
-            }),
-          })
-          const res = await response.json()
-          if (res.success) {
-            succeeded.push({
-              user_id: user.user_id,
-              username: user.username || displayName,
-              display_name: displayName,
-            })
-          } else {
-            failed += 1
-          }
-        } catch (e) {
-          console.error('Failed to bulk ban user:', e)
-          failed += 1
-        }
+      const response = await fetch(`${apiUrl}/api/risk/actions/batches`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({
+          action: 'ban',
+          dry_run: false,
+          reason,
+          disable_tokens: true,
+          source: 'ip_monitoring_bulk',
+          condition: {
+            type: 'shared_ip',
+            ip: sourceItem.ip,
+            window: ipWindow,
+            user_count: sourceItem.user_count,
+            token_count: sourceItem.token_count,
+            request_count: sourceItem.request_count,
+          },
+          exclude_protected_roles: true,
+        }),
+      })
+      const res = await response.json()
+      if (!res.success) {
+        throw new Error(res.message || res.error?.message || '批量封禁失败')
       }
+
+      const batchId = res.data?.batch_id || `shared-ip-${sourceItem.ip}-${Date.now()}`
+      const succeeded = ((res.data?.users || []) as Array<any>).map((user) => ({
+        user_id: Number(user.user_id),
+        username: user.username || `User#${user.user_id}`,
+        display_name: user.display_name || user.username || `User#${user.user_id}`,
+      }))
+      const failed = Number(res.data?.failed_count || 0)
 
       if (succeeded.length > 0) {
         syncSharedIpUserStatuses(succeeded.map((user) => user.user_id), 2)
@@ -958,6 +1014,9 @@ export function RealtimeRanking() {
       }
 
       refreshAfterBulkBanChange()
+    } catch (e) {
+      console.error('Failed to bulk ban shared IP users:', e)
+      showToast('error', e instanceof Error ? e.message : '批量封禁失败')
     } finally {
       setBulkBanLoadingIp(null)
     }
@@ -991,31 +1050,45 @@ export function RealtimeRanking() {
     const succeededIds: number[] = []
     setUndoBulkBanLoading(record.id)
     try {
-      for (const user of record.users) {
-        try {
-          const response = await fetch(`${apiUrl}/api/users/${user.user_id}/unban`, {
-            method: 'POST',
-            headers: getAuthHeaders(),
-            body: JSON.stringify({
-              reason: '撤销批量封禁',
-              enable_tokens: true,
-              context: {
-                source: 'ip_monitoring_bulk_undo',
-                undo_batch_id: record.id,
-                ip: record.ip,
-              },
-            }),
-          })
-          const res = await response.json()
-          if (res.success) {
-            succeeded += 1
-            succeededIds.push(user.user_id)
-          } else {
+      if (record.id.startsWith('risk-ban-')) {
+        const response = await fetch(`${apiUrl}/api/risk/actions/batches/${encodeURIComponent(record.id)}/revert`, {
+          method: 'POST',
+          headers: getAuthHeaders(),
+        })
+        const res = await response.json()
+        if (!res.success) {
+          throw new Error(res.message || res.error?.message || '撤销批量封禁失败')
+        }
+        succeeded = Number(res.data?.success_count || 0)
+        failed = Number(res.data?.failed_count || 0)
+        succeededIds.push(...record.users.slice(0, succeeded).map((user) => user.user_id))
+      } else {
+        for (const user of record.users) {
+          try {
+            const response = await fetch(`${apiUrl}/api/users/${user.user_id}/unban`, {
+              method: 'POST',
+              headers: getAuthHeaders(),
+              body: JSON.stringify({
+                reason: '撤销批量封禁',
+                enable_tokens: true,
+                context: {
+                  source: 'ip_monitoring_bulk_undo',
+                  undo_batch_id: record.id,
+                  ip: record.ip,
+                },
+              }),
+            })
+            const res = await response.json()
+            if (res.success) {
+              succeeded += 1
+              succeededIds.push(user.user_id)
+            } else {
+              failed += 1
+            }
+          } catch (e) {
+            console.error('Failed to undo bulk ban user:', e)
             failed += 1
           }
-        } catch (e) {
-          console.error('Failed to undo bulk ban user:', e)
-          failed += 1
         }
       }
 
@@ -1040,6 +1113,9 @@ export function RealtimeRanking() {
       }
 
       refreshAfterBulkBanChange()
+    } catch (e) {
+      console.error('Failed to undo bulk ban:', e)
+      showToast('error', e instanceof Error ? e.message : '撤销失败')
     } finally {
       setUndoBulkBanLoading(null)
     }
@@ -1892,9 +1968,21 @@ export function RealtimeRanking() {
   const metricLabel = SORT_LABELS[sortBy]
 
   const renderMetric = (item: LeaderboardItem) => {
+    if (sortBy === 'risk_score') return `${item.risk_score ?? 0}`
     if (sortBy === 'quota') return formatQuota(item.quota_used)
     if (sortBy === 'failure_rate') return `${(item.failure_rate * 100).toFixed(2)}%`
     return formatNumber(item.request_count)
+  }
+
+  const getTopRiskReason = (item: LeaderboardItem) => {
+    const reasons = item.risk_reasons || item.reasons || []
+    return reasons.find((reason) => reason.code !== 'NORMAL_TRAFFIC') || reasons[0]
+  }
+
+  const riskScoreClass = (score = 0) => {
+    if (score >= 80) return 'bg-red-50 text-red-700 border-red-200 dark:bg-red-900/20 dark:text-red-300 dark:border-red-800'
+    if (score >= 50) return 'bg-amber-50 text-amber-700 border-amber-200 dark:bg-amber-900/20 dark:text-amber-300 dark:border-amber-800'
+    return 'bg-emerald-50 text-emerald-700 border-emerald-200 dark:bg-emerald-900/20 dark:text-emerald-300 dark:border-emerald-800'
   }
 
   return (
@@ -1963,6 +2051,7 @@ export function RealtimeRanking() {
               </div>
               <div className="w-40">
                 <Select value={sortBy} onChange={(e) => setSortBy(e.target.value as SortKey)}>
+                  <option value="risk_score">按风险评分</option>
                   <option value="requests">按请求次数</option>
                   <option value="quota">按额度消耗</option>
                   <option value="failure_rate">按失败率</option>
@@ -2051,6 +2140,7 @@ export function RealtimeRanking() {
                       {data[w].slice(0, 10).map((item, idx) => {
                         const name = item.username || item.user_id
                         const isBanned = item.user_status === 2
+                        const topReason = getTopRiskReason(item)
                         return (
                           <div
                             key={`${w}-${item.user_id}`}
@@ -2084,6 +2174,16 @@ export function RealtimeRanking() {
                                 <span>ID: {item.user_id}</span>
                                 <span className="w-1 h-1 rounded-full bg-muted-foreground/30" />
                                 <span>IP: {item.unique_ips}</span>
+                              </div>
+                              <div className="mt-1 flex flex-wrap items-center gap-1">
+                                <Badge variant="outline" className={cn("h-5 px-1.5 text-[10px]", riskScoreClass(item.risk_score || 0))}>
+                                  风险 {item.risk_score ?? 0}
+                                </Badge>
+                                {topReason && (
+                                  <span className="max-w-[220px] truncate text-[10px] text-muted-foreground" title={`${topReason.evidence || ''} ${topReason.suggestion || ''}`}>
+                                    {topReason.label}
+                                  </span>
+                                )}
                               </div>
                             </div>
 
@@ -2165,6 +2265,7 @@ export function RealtimeRanking() {
                   {data[selectedWindow].slice(0, 10).map((item, idx) => {
                     const name = item.username || item.user_id
                     const isBanned = item.user_status === 2
+                    const topReason = getTopRiskReason(item)
                     return (
                       <div
                         key={`selected-${item.user_id}`}
@@ -2200,6 +2301,16 @@ export function RealtimeRanking() {
                             <span>IP: {item.unique_ips}</span>
                             <span className="w-1 h-1 rounded-full bg-muted-foreground/30" />
                             <span>失败: {(item.failure_rate * 100).toFixed(1)}%</span>
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-1">
+                            <Badge variant="outline" className={cn("h-5 px-1.5 text-[10px]", riskScoreClass(item.risk_score || 0))}>
+                              风险 {item.risk_score ?? 0}
+                            </Badge>
+                            {topReason && (
+                              <span className="max-w-[260px] truncate text-[10px] text-muted-foreground" title={`${topReason.evidence || ''} ${topReason.suggestion || ''}`}>
+                                {topReason.label}
+                              </span>
+                            )}
                           </div>
                         </div>
 
@@ -3951,9 +4062,19 @@ export function RealtimeRanking() {
                             ))}
                           </div>
                           <div className="text-xs text-slate-600 line-clamp-2">{item.reason}</div>
+                          {(item.evidence_summary || []).length > 0 && (
+                            <div className="mt-1.5 space-y-0.5">
+                              {(item.evidence_summary || []).slice(0, 3).map((evidence, idx) => (
+                                <div key={`${item.id}-evidence-${idx}`} className="text-[10px] text-slate-500 truncate">
+                                  - {evidence}
+                                </div>
+                              ))}
+                            </div>
+                          )}
                           <div className="text-[10px] text-muted-foreground mt-1">
                             请求 {formatNumber(item.total_requests || 0)} · IP {item.unique_ips || 0}
                             {(item.shared_user_ips || 0) > 0 && ` · 共用 IP ${item.shared_user_ips}`}
+                            {item.false_positive_risk && ` · 误报风险 ${item.false_positive_risk}`}
                           </div>
                         </TableCell>
                         <TableCell className="py-4 text-right">
@@ -4218,6 +4339,50 @@ export function RealtimeRanking() {
                 <div className="rounded-lg border p-3 bg-muted/30">
                   <div className="text-xs text-muted-foreground mb-1">AI 分析理由:</div>
                   <div className="text-sm">{aiAssessResult.assessment.reason}</div>
+                </div>
+
+                {((aiAssessResult.assessment.evidence_summary || []).length > 0 ||
+                  (aiAssessResult.assessment.questions_for_admin || []).length > 0) && (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      {(aiAssessResult.assessment.evidence_summary || []).length > 0 && (
+                        <div className="rounded-lg border p-3 bg-white">
+                          <div className="text-xs font-medium text-muted-foreground mb-2">证据摘要</div>
+                          <div className="space-y-1">
+                            {(aiAssessResult.assessment.evidence_summary || []).slice(0, 5).map((evidence, idx) => (
+                              <div key={`assess-evidence-${idx}`} className="text-xs text-slate-600">
+                                - {evidence}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {(aiAssessResult.assessment.questions_for_admin || []).length > 0 && (
+                        <div className="rounded-lg border p-3 bg-white">
+                          <div className="text-xs font-medium text-muted-foreground mb-2">复核问题</div>
+                          <div className="space-y-1">
+                            {(aiAssessResult.assessment.questions_for_admin || []).slice(0, 4).map((question, idx) => (
+                              <div key={`assess-question-${idx}`} className="text-xs text-slate-600">
+                                - {question}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                  {aiAssessResult.assessment.false_positive_risk && (
+                    <Badge variant="outline" className="rounded">
+                      误报风险：{aiAssessResult.assessment.false_positive_risk}
+                    </Badge>
+                  )}
+                  {aiAssessResult.assessment.prompt_version && (
+                    <Badge variant="outline" className="rounded">
+                      Prompt：{aiAssessResult.assessment.prompt_version}
+                    </Badge>
+                  )}
                 </div>
 
                 {aiAssessResult.assessment.should_ban && (

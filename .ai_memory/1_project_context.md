@@ -13,6 +13,10 @@
 - Go 正式后端已补齐性能基础设施：前端使用路由级懒加载；Go `/api/system/scale` 基于用户数、日志估算和 24h 请求量返回刷新建议；`/api/system/warmup-status` 反映后台热缓存预热状态；模型状态使用批量 SQL 按 `model_name + slot` 聚合；风控排行榜、模型状态和 IP 列表支持 `no_cache=true` 真刷新。
 - Go 正式后端已支持自动分组后台定时扫描：启动后按 `enabled`、`auto_scan_enabled`、`scan_interval_minutes` 静默执行 `RunScan(false)`，与前端“自动扫描”开关语义一致。
 - 日志分析页已支持 `/api/analytics/export` 原始日志导出；Go/Python 后端都提供同名接口，按时间、类型、模型、用户、令牌、渠道、分组、Request ID 等条件从 `logs` 表直接流式导出 CSV/JSON，避免前端逐页请求 NewAPI `/api/log` 导致大量请求中断。
+- 2026-05-17 功能优化首轮已落地：Go/Python 均提供 `/api/dashboard/snapshot`、`/api/risk/queue`、`/api/risk/actions/batches`、`/api/analytics/export-jobs`；仪表盘前端优先用 snapshot 并展示 `snapshot_time/cache_hit/data_freshness`，日志分析“处理日志”语义已改为“刷新统计缓存”，日志导出改为任务化轮询下载，风控默认按风险队列和 `risk_score/risk_reasons` 展示。
+- 2026-05-17 AI 风控复核输出已标准化：启发式评估返回 `evidence_summary`、`false_positive_risk`、`questions_for_admin`、`prompt_version=heuristic-risk-v2`，前端待复核列表和单次评估结果均展示这些证据字段；策略仍为 `pending_review_first`。
+- 2026-05-17 仍未落地真正日志 rollup 表：`api_tools_usage_rollup_hourly/daily` 仍是后续任务；当前 snapshot 主要通过缓存和单入口聚合降低前端多请求及统计时间点不一致问题。
+- 根目录 `功能优化方案.md` 是当前功能优化路线和落地状态入口；涉及仪表盘、风控中心、日志分析的大改动应同步更新该文档。
 - 2026-05-04 已按用户要求回退“上游 NewAPI 日志同步/成本统计”集成：移除 Go/Python `/api/cost/upstream-sync/*`、`/api/cost/tools-access`、后台上游同步任务、前端成本核算页的日志助手接入/上游同步面板，以及 `api_tools_upstream_logs` 匹配汇总逻辑；保留更早的基础 `成本核算` 页和 `/api/analytics/export` 日志导出能力。
 - 2026-05-04 先以本地 CLI 方式重启上游日志对账方向：`scripts/newapi_log_matcher.py` 读取导出的 `newapi_logs_{host}_{date}.csv`，通过渠道 alias 映射上游、标准化模型名，并按 `输入Tokens + 输出Tokens + 总Tokens + 时间窗口` 做一对一高置信匹配；默认规则在 `scripts/newapi_log_rules.example.json`，其中 `api.opusclaw.me` 按 1:10 充值比例配置 `cost_multiplier=0.1`。工具输出 `report.html` 静态 UI，可按本站模型、本站渠道、状态、上游筛选查看每条本地日志；该工具不接数据库和后台，后续稳定后再迁入 NewAPI Tools。
 - 2026-05-04 已将日志对账迁入 Go 版 NewAPI Tools：新增 `/api/log-match/analyze`，Youkies/本站日志直接从 `logs` 数据库按时间范围读取消费日志，上游日志由用户上传 CSV；匹配口径沿用本地工具（渠道 alias -> 上游、标准化模型、tokens + 时间窗口），前端新增 `日志对账` 页面，支持勾选本站渠道和本站模型筛选每条匹配状态。

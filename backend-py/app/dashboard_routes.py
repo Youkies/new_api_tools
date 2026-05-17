@@ -3,12 +3,14 @@ Dashboard API Routes for NewAPI Middleware Tool.
 Implements dashboard statistics and analytics endpoints with caching.
 """
 import logging
+import time
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 
 from .auth import verify_auth
+from .database import get_db_manager
 from .main import InvalidParamsError
 from .cached_dashboard import get_cached_dashboard_service
 
@@ -89,6 +91,63 @@ def get_system_overview(
     data = service.get_system_overview(period=period, use_cache=not no_cache)
 
     return SystemOverviewResponse(success=True, data=data)
+
+
+@router.get("/snapshot")
+def get_dashboard_snapshot(
+    period: str = Query(default="24h", description="时间周期 (24h/3d/7d/14d)"),
+    trend_days: int = Query(default=7, ge=1, le=30, description="趋势天数"),
+    top_limit: int = Query(default=10, ge=1, le=50, description="Top 用户数量"),
+    no_cache: bool = Query(default=False, description="跳过缓存"),
+    _: str = Depends(verify_auth),
+):
+    """
+    获取仪表盘首屏快照。
+
+    聚合现有缓存接口，确保前端首屏使用同一个 snapshot_time。
+    """
+    valid_periods = ["24h", "3d", "7d", "14d"]
+    if period not in valid_periods:
+        raise InvalidParamsError(message=f"Invalid period: {period}")
+
+    service = get_cached_dashboard_service()
+    snapshot_time = int(time.time())
+    use_cache = not no_cache
+
+    overview = service.get_system_overview(period=period, use_cache=use_cache)
+    usage = service.get_usage_statistics(period=period, use_cache=use_cache)
+    models = service.get_model_usage(period=period, limit=8, use_cache=use_cache)
+    top_users = service.get_top_users(period=period, limit=top_limit, use_cache=use_cache)
+    if period == "24h":
+        trends_kind = "hourly"
+        trends = service.get_hourly_trends(hours=24, use_cache=use_cache)
+    else:
+        trends_kind = "daily"
+        trends = service.get_daily_trends(days=trend_days, use_cache=use_cache)
+
+    freshness = _get_data_freshness(snapshot_time)
+
+    return {
+        "success": True,
+        "data": {
+            "period": period,
+            "snapshot_time": snapshot_time,
+            "cache_hit": use_cache,
+            "overview": overview,
+            "usage": usage,
+            "models": models,
+            "trends": trends,
+            "trends_kind": trends_kind,
+            "top_users": top_users,
+            "data_freshness": freshness,
+            "refresh_hint": _get_refresh_hint(period, freshness),
+            "data_source": "snapshot",
+            "rollup_enabled": False,
+            "rollup_note": "Python 后端复用 dashboard cache 与 slot cache 聚合",
+            "generated_at": snapshot_time,
+            "top_users_limit": top_limit,
+        },
+    }
 
 
 @router.get("/usage", response_model=UsageStatisticsResponse)
@@ -294,6 +353,67 @@ def get_dashboard_system_info(
             },
             "tips": _get_system_tips(scale, metrics) if is_large_system else None,
         },
+    }
+
+
+def _get_data_freshness(snapshot_time: int) -> dict:
+    """Return lightweight metadata for logs-derived dashboard data."""
+    try:
+        db = get_db_manager()
+        db.connect()
+        rows = db.execute("""
+            SELECT COALESCE(MAX(created_at), 0) as logs_max_created_at,
+                   COUNT(*) as total_logs
+            FROM logs
+        """)
+        row = rows[0] if rows else {}
+    except Exception as exc:
+        logger.warning(f"Dashboard freshness query failed: {exc}")
+        return {
+            "source": "live_query",
+            "logs_max_created_at": 0,
+            "lag_seconds": 0,
+            "total_logs": 0,
+            "status": "unknown",
+        }
+
+    logs_max_created_at = int(row.get("logs_max_created_at") or 0)
+    lag_seconds = max(0, snapshot_time - logs_max_created_at) if logs_max_created_at else 0
+    status = "fresh"
+    if logs_max_created_at == 0:
+        status = "empty"
+    elif lag_seconds > 3600:
+        status = "stale"
+    elif lag_seconds > 300:
+        status = "delayed"
+
+    return {
+        "source": "live_query",
+        "logs_max_created_at": logs_max_created_at,
+        "lag_seconds": lag_seconds,
+        "total_logs": int(row.get("total_logs") or 0),
+        "status": status,
+    }
+
+
+def _get_refresh_hint(period: str, freshness: dict) -> dict:
+    """Return a simple refresh recommendation for the dashboard."""
+    total_logs = int(freshness.get("total_logs") or 0)
+    recommended = 60
+    reason = "normal"
+    if total_logs >= 1_000_000:
+        recommended = 300
+        reason = "large_logs_table"
+    elif total_logs >= 300_000:
+        recommended = 120
+        reason = "medium_logs_table"
+    elif period != "24h":
+        recommended = 120
+
+    return {
+        "recommended_interval_seconds": recommended,
+        "reason": reason,
+        "force_refresh_requires_confirm": total_logs >= 300_000,
     }
 
 

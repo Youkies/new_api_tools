@@ -833,6 +833,7 @@ class CacheManager:
             "prompt_tokens": 0,
             "completion_tokens": 0,
             "unique_ips": 0,  # 注意：跨槽的 unique_ips 可能有重复，这里简单累加
+            "unique_tokens": 0,  # 注意：跨槽的 unique_tokens 可能有重复，这里简单累加
         })
 
         for slot_data in cached_slots.values():
@@ -856,6 +857,7 @@ class CacheManager:
                 totals["prompt_tokens"] += user.get("prompt_tokens", 0)
                 totals["completion_tokens"] += user.get("completion_tokens", 0)
                 totals["unique_ips"] += user.get("unique_ips", 0)
+                totals["unique_tokens"] += user.get("unique_tokens", 0)
 
         # 计算 failure_rate
         for totals in user_totals.values():
