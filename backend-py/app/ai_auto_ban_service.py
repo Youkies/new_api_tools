@@ -1425,11 +1425,6 @@ class AIAutoBanService:
 
     def _build_alt_account_case_prompt(self, case_data: Dict[str, Any]) -> str:
         safe_case = dict(case_data)
-        if safe_case.get("primary_ip"):
-            safe_case["primary_ip_masked"] = self._mask_ip(str(safe_case.get("primary_ip")))
-            safe_case.pop("primary_ip", None)
-        if safe_case.get("case_type") in {"shared_ip", "rotating_pool"} and safe_case.get("case_key"):
-            safe_case["case_key"] = self._mask_ip(str(safe_case.get("case_key")))
         return f"""你是 NewAPI Tools 的首席风控分析师。请基于聚合后的案件证据，判断这是否是批量小号/轮换账号池/邀请链小号/Token 轮换滥用。
 
 重要要求：

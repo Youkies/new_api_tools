@@ -15,11 +15,11 @@
 - 日志分析页已支持 `/api/analytics/export` 原始日志导出；Go/Python 后端都提供同名接口，按时间、类型、模型、用户、令牌、渠道、分组、Request ID 等条件从 `logs` 表直接流式导出 CSV/JSON，避免前端逐页请求 NewAPI `/api/log` 导致大量请求中断。
 - 2026-05-17 功能优化首轮已落地：Go/Python 均提供 `/api/dashboard/snapshot`、`/api/risk/queue`、`/api/risk/actions/batches`、`/api/analytics/export-jobs`；仪表盘前端优先用 snapshot 并展示 `snapshot_time/cache_hit/data_freshness`，日志分析“处理日志”语义已改为“刷新统计缓存”，日志导出改为任务化轮询下载，风控默认按风险队列和 `risk_score/risk_reasons` 展示。
 - 2026-05-17 AI 风控复核输出已标准化：启发式评估返回 `evidence_summary`、`false_positive_risk`、`questions_for_admin`、`prompt_version=heuristic-risk-v2`，前端待复核列表和单次评估结果均展示这些证据字段；策略仍为 `pending_review_first`。
-- 2026-05-17 风控中心组件拆分已启动：共享 IP 区块拆为 `frontend/src/components/risk/SharedIPAltAccountPanel.tsx`，IP 风控类型沉到 `frontend/src/components/risk/types.ts`；该组件专门按多用户共享 IP 识别“小号”风险，展示风险等级、触发原因、未封禁数量、首次出现跨度和充值线索。
+- 2026-05-17 风控中心小号工作台已收敛：共享 IP 不再保留第二套 `SharedIPAltAccountPanel` 前端入口，而是作为 `shared_ip` 案件进入 `AltAccountCasesPanel`；该工作台展示完整 IP、可展开用户、AI 行内研判、封禁全部、撤销上一次和单用户分析/封禁。
 - 2026-05-17 `/api/ip/shared-users` Go/Python 兼容接口已为共享 IP 小号研判补充 `unbanned_count`，用户明细补充 `used_quota`、`total_request_count`、`topup_count`，Python 端额外返回 `has_successful_topup`；前端可据此标注未充值账号。
 - 2026-05-17 共享 IP 小号场景新增案件级 AI 研判：Go/Python `/api/ai-ban/assess-shared-ip` 使用 prompt 版本 `shared-ip-alt-account-v1`，按同 IP 多用户、未充值、低调用、首次出现集中、误报风险等证据输出 `monitor/review/ban`；模型输出会在后端归一化，策略仍是 `pending_review_first`。
 - 2026-05-17 小号风险案件 v1 已落地：Go/Python 提供 `/api/risk/alt-account/cases`、`/api/risk/alt-account/cases/{case_id}`、`/api/risk/alt-account/cases/{case_id}/assess`；规则层实时生成 `shared_ip`、`rotating_pool`、`invite_chain`、`token_rotation` 四类案件，前端新增 `AltAccountCasesPanel`。
-- 2026-05-17 真实库 + AI 验证通过：30d 小号案件实时生成返回 127 个候选；24h 共享 IP 高风险样本为 15 用户、15 未充值、18 请求，使用 `「按量」gpt-5.5` 返回 86 分、`review`、耗时约 73 秒。注意带中文前缀的模型 ID 必须以 UTF-8 JSON 发送。
+- 2026-05-17 真实库 + AI 验证通过：30d 小号案件实时生成返回 127 个候选；24h 共享 IP 高风险样本为 15 用户、15 未充值、18 请求，使用 `「按量」gpt-5.5` 返回 86 分、`review`、耗时约 73 秒。注意带中文前缀的模型 ID 必须以 UTF-8 JSON 发送；用户明确要求管理员风控场景不需要对发送给 AI 的 IP 脱敏，AI 小号案件可发送完整 IP/网段。
 - 2026-05-17 仍未落地真正日志 rollup 表：`api_tools_usage_rollup_hourly/daily` 仍是后续任务；当前 snapshot 主要通过缓存和单入口聚合降低前端多请求及统计时间点不一致问题。
 - 根目录 `功能优化方案.md` 是当前功能优化路线和落地状态入口；涉及仪表盘、风控中心、日志分析的大改动应同步更新该文档。
 - `docs/ai-risk-alt-account-requirements.md` 是 AI 小号风控产品化需求文档，记录共享 IP 小号、24h 轮换账号池、邀请链、token/IP 轮换、定时 AI 复核、隐私边界、接口、存储和验收标准；后续实现相关功能时优先对照该文档拆任务。
