@@ -8,6 +8,7 @@
 
 - 数据库只读校验：已确认当前 MySQL 库包含 `logs/users/tokens/top_ups/channels/abilities/options` 等核心表，`logs` 约 38.98 万行；本地 `数据库地址*` 已加入 `.gitignore`，避免误提交连接信息。
 - 用户管理：保留前一轮“批量注销不活跃用户”口径，已收紧为“未成功充值且从未调用过”，Go/Python/前端均已同步。
+  - 2026-05-17 修复 Go `/api/users` 未应用 `inactive/very_inactive` 活跃度筛选的问题；列表现在按 7d/30d 请求窗口筛选，并返回准确 `activity_level` 与 `last_request_time`。
 - 仪表盘：
   - Go/Python 新增 `/api/dashboard/snapshot`。
   - 前端首屏优先使用 snapshot，展示 `snapshot_time`、`cache_hit`、最新日志时间和滞后秒数。
@@ -33,6 +34,7 @@
 - `python -m py_compile backend-py\app\dashboard_routes.py backend-py\app\risk_monitoring_routes.py backend-py\app\risk_monitoring_service.py backend-py\app\log_analytics_routes.py backend-py\app\cache_manager.py backend-py\app\user_management_service.py backend-py\app\user_management_routes.py`
 - `go test ./...`（`backend/`）
 - `npm run build`（`frontend/`）
+- 2026-05-17 用户管理筛选修复验证：`go test ./...`、`python -m py_compile backend-py\app\user_management_service.py backend-py\app\user_management_routes.py`、`npm run build` 均通过；真实库只读计数验证 `active/inactive/very_inactive/never` 均可按 SQL 条件区分。
 - 2026-05-17 共享 IP AI 研判真实效果检验：只读读取真实 MySQL 24h 共享 IP 样本，使用 `https://newapi.youkies.space/` 可见模型 `「按量」gpt-5.5` 调用成功；选中高风险 IP 样本 15 用户/15 未充值/首次跨度约 4171 秒，AI 给出高风险但建议先复核，验证出 schema 归一化需求并已加固；当前管理员风控口径为完整 IP 可见且可发送给 AI。
 - 2026-05-17 小号风险案件 v1 真实效果检验：30d live rules 生成 127 个候选案件；24h 共享 IP 样本为 15 用户/15 未充值/15 token/18 请求，通用案件 AI 研判返回 86 分、`review`、置信度 0.78，耗时约 73 秒。验证时发现 PowerShell 非 UTF-8 请求体会把中文模型 ID 传成问号，浏览器和 Go 后端应保持 UTF-8 JSON。
 

@@ -190,6 +190,10 @@ func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]int
 		params.OrderDir = "DESC"
 	}
 
+	now := time.Now().Unix()
+	activeThreshold := now - ActiveThreshold
+	inactiveThreshold := now - InactiveThreshold
+
 	// Validate order_by
 	allowedOrderBy := map[string]bool{
 		"id": true, "username": true, "request_count": true,
@@ -272,7 +276,36 @@ func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]int
 		}
 		args = append(args, params.GroupFilter)
 	}
-	if params.ActivityFilter == ActivityNever {
+	switch params.ActivityFilter {
+	case ActivityActive:
+		where = append(where, fmt.Sprintf(
+			`u.request_count > 0 AND EXISTS (
+				SELECT 1 FROM logs l
+				WHERE l.user_id = u.id AND l.type IN (2,5) AND l.created_at >= %d
+			)`,
+			activeThreshold,
+		))
+	case ActivityInactive:
+		where = append(where, fmt.Sprintf(
+			`u.request_count > 0 AND EXISTS (
+				SELECT 1 FROM logs l
+				WHERE l.user_id = u.id AND l.type IN (2,5)
+				  AND l.created_at >= %d AND l.created_at < %d
+			) AND NOT EXISTS (
+				SELECT 1 FROM logs l
+				WHERE l.user_id = u.id AND l.type IN (2,5) AND l.created_at >= %d
+			)`,
+			inactiveThreshold, activeThreshold, activeThreshold,
+		))
+	case ActivityVeryInactive:
+		where = append(where, fmt.Sprintf(
+			`u.request_count > 0 AND NOT EXISTS (
+				SELECT 1 FROM logs l
+				WHERE l.user_id = u.id AND l.type IN (2,5) AND l.created_at >= %d
+			)`,
+			inactiveThreshold,
+		))
+	case ActivityNever:
 		where = append(where, "u.request_count = 0")
 	}
 
@@ -319,7 +352,8 @@ func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]int
 
 	// Build SELECT columns dynamically based on available OAuth columns
 	// NOTE: users table does NOT have created_at — do not select it
-	selectCols := fmt.Sprintf("u.id, u.username, u.display_name, u.email, u.role, u.status, u.quota, u.used_quota, u.request_count, u.%s, u.aff_code, u.remark", groupCol)
+	lastRequestExpr := "(SELECT MAX(l.created_at) FROM logs l WHERE l.user_id = u.id AND l.type IN (2,5))"
+	selectCols := fmt.Sprintf("u.id, u.username, u.display_name, u.email, u.role, u.status, u.quota, u.used_quota, u.request_count, %s as last_request_time, u.%s, u.aff_code, u.remark", lastRequestExpr, groupCol)
 	for _, col := range oauthCols {
 		selectCols += fmt.Sprintf(", u.%s", col)
 	}
@@ -350,12 +384,24 @@ func (s *UserManagementService) GetUsers(params ListUsersParams) (map[string]int
 	// Enrich rows with computed fields (activity_level, source, linux_do_id)
 	for _, row := range rows {
 		reqCount := toInt64(row["request_count"])
+		lastRequestTime := toInt64(row["last_request_time"])
 		if reqCount == 0 {
 			row["activity_level"] = ActivityNever
-		} else {
+			row["last_request_time"] = nil
+		} else if lastRequestTime >= activeThreshold {
 			row["activity_level"] = ActivityActive
+			row["last_request_time"] = lastRequestTime
+		} else if lastRequestTime >= inactiveThreshold {
+			row["activity_level"] = ActivityInactive
+			row["last_request_time"] = lastRequestTime
+		} else {
+			row["activity_level"] = ActivityVeryInactive
+			if lastRequestTime > 0 {
+				row["last_request_time"] = lastRequestTime
+			} else {
+				row["last_request_time"] = nil
+			}
 		}
-		row["last_request_time"] = nil
 
 		// Preserve linux_do_id for frontend display
 		linuxDoID := ""
