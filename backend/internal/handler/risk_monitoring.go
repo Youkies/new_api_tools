@@ -16,6 +16,9 @@ func RegisterRiskMonitoringRoutes(r *gin.RouterGroup) {
 	{
 		g.GET("/leaderboards", GetLeaderboards)
 		g.GET("/queue", GetRiskQueue)
+		g.GET("/alt-account/cases", GetAltAccountCases)
+		g.GET("/alt-account/cases/:case_id", GetAltAccountCase)
+		g.POST("/alt-account/cases/:case_id/assess", AssessAltAccountCase)
 		g.POST("/actions/batches", ExecuteRiskActionBatch)
 		g.POST("/actions/batches/:batch_id/revert", RevertRiskActionBatch)
 		g.GET("/users/:user_id/analysis", GetUserRiskAnalysis)
@@ -24,6 +27,77 @@ func RegisterRiskMonitoringRoutes(r *gin.RouterGroup) {
 		g.GET("/affiliated-accounts", GetAffiliatedAccounts)
 		g.GET("/same-ip-registrations", GetSameIPRegistrations)
 	}
+}
+
+// GET /api/risk/alt-account/cases
+func GetAltAccountCases(c *gin.Context) {
+	caseType := c.DefaultQuery("case_type", "all")
+	window := c.DefaultQuery("window", "30d")
+	if !validWindow(window) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid window value", ""))
+		return
+	}
+	limit := parseLimit(c, 50, 200)
+	offset, _ := strconv.Atoi(c.DefaultQuery("offset", "0"))
+	if offset < 0 {
+		offset = 0
+	}
+	useCache := c.DefaultQuery("no_cache", "false") != "true"
+
+	svc := service.NewAltAccountRiskService()
+	data, err := svc.GetAltAccountCases(caseType, window, limit, offset, useCache)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// GET /api/risk/alt-account/cases/:case_id
+func GetAltAccountCase(c *gin.Context) {
+	caseID := c.Param("case_id")
+	window := c.DefaultQuery("window", "30d")
+	if !validWindow(window) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid window value", ""))
+		return
+	}
+	svc := service.NewAltAccountRiskService()
+	data, err := svc.GetAltAccountCase(caseID, window)
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.ErrorResp("NOT_FOUND", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// POST /api/risk/alt-account/cases/:case_id/assess
+func AssessAltAccountCase(c *gin.Context) {
+	caseID := c.Param("case_id")
+	var req struct {
+		Window  string `json:"window"`
+		BaseURL string `json:"base_url"`
+		APIKey  string `json:"api_key"`
+		Model   string `json:"model"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
+		return
+	}
+	if req.Window == "" {
+		req.Window = c.DefaultQuery("window", "30d")
+	}
+	if !validWindow(req.Window) {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid window value", ""))
+		return
+	}
+
+	svc := service.NewAltAccountRiskService()
+	data := svc.AssessAltAccountCase(caseID, req.Window, req.BaseURL, req.APIKey, req.Model)
+	if success, _ := data["success"].(bool); !success {
+		c.JSON(http.StatusBadRequest, gin.H{"success": false, "data": data, "message": data["message"]})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
 // GET /api/risk/leaderboards

@@ -1156,6 +1156,386 @@ class AIAutoBanService:
             "requires_human_review": not self._is_extreme_auto_ban(assessment),
         }
 
+    def _summarize_shared_ip_case(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        users = item.get("users") or []
+        unbanned_count = 0
+        active_count = 0
+        low_request_count = 0
+        topup_known_count = 0
+        no_topup_count = 0
+        first_seen_values = []
+        for user in users:
+            if int(user.get("status") or 0) != 2:
+                unbanned_count += 1
+            req_count = int(user.get("request_count") or 0)
+            if req_count > 0:
+                active_count += 1
+            if req_count <= 3 and int(user.get("token_count") or 0) <= 1:
+                low_request_count += 1
+            if "topup_count" in user or "has_successful_topup" in user:
+                topup_known_count += 1
+                if not bool(user.get("has_successful_topup")) and int(user.get("topup_count") or 0) <= 0:
+                    no_topup_count += 1
+            first_seen = int(user.get("first_seen") or 0)
+            if first_seen > 0:
+                first_seen_values.append(first_seen)
+
+        spread = 0
+        if len(first_seen_values) >= 2:
+            spread = max(first_seen_values) - min(first_seen_values)
+        explicit_unbanned = int(item.get("unbanned_count") or 0)
+        if explicit_unbanned > 0:
+            unbanned_count = explicit_unbanned
+
+        return {
+            "user_count": int(item.get("user_count") or 0),
+            "token_count": int(item.get("token_count") or 0),
+            "request_count": int(item.get("request_count") or 0),
+            "banned_count": int(item.get("banned_count") or 0),
+            "unbanned_count": unbanned_count,
+            "active_user_count": active_count,
+            "low_request_user_count": low_request_count,
+            "topup_known_user_count": topup_known_count,
+            "no_topup_user_count": no_topup_count,
+            "first_seen_spread_seconds": spread,
+        }
+
+    def _build_shared_ip_case_prompt(self, item: Dict[str, Any], stats: Dict[str, Any], window: str) -> str:
+        users = []
+        for user in (item.get("users") or [])[:40]:
+            users.append({
+                "user_id": int(user.get("user_id") or 0),
+                "username": user.get("username") or "",
+                "display_name": user.get("display_name") or "",
+                "status": int(user.get("status") or 0),
+                "token_count": int(user.get("token_count") or 0),
+                "request_count": int(user.get("request_count") or 0),
+                "total_request_count": int(user.get("total_request_count") or 0),
+                "used_quota": int(user.get("used_quota") or 0),
+                "topup_count": int(user.get("topup_count") or 0),
+                "first_seen": int(user.get("first_seen") or 0),
+                "last_seen": int(user.get("last_seen") or 0),
+            })
+
+        payload = {
+            "ip": item.get("ip") or "",
+            "window": window,
+            "case_stats": stats,
+            "users": users,
+        }
+
+        return f"""你是 NewAPI Tools 的资深风控分析师。请专门判断“同一 IP 下多用户共享”是否更像批量注册/开小号/账号池，而不是普通企业、学校、家庭、机房出口或 Cloudflare/运营商 NAT。
+
+判断重点：
+1. 强风险：同一 IP 聚集多个未充值或低使用账号、首次出现时间高度集中、令牌数异常、已有封禁账号混入、账号之间请求量分布像批量试探。
+2. 降低风险：用户已充值、长期高正常用量、账号状态稳定、共享 IP 可能是公司/学校/家庭/可信代理出口。
+3. 单纯“共享 IP”不能直接封禁，必须给出证据和误伤风险。
+4. 默认策略是 pending_review_first：建议动作优先 review，只有证据极强时才给 ban。
+
+请只返回 JSON，不要 Markdown。字段必须包含：
+{{
+  "risk_score": 1-10,
+  "confidence": 0-1,
+  "action": "monitor" | "review" | "ban",
+  "should_ban": boolean,
+  "reason": "一句中文结论",
+  "evidence_summary": ["证据1", "证据2"],
+  "false_positive_risk": "low" | "medium" | "high",
+  "questions_for_admin": ["需要管理员确认的问题"],
+  "likely_alt_account_users": [{{"user_id": 123, "reason": "为什么像小号", "confidence": 0.8}}],
+  "recommended_admin_action": "建议管理员下一步怎么做"
+}}
+
+共享 IP 案件数据如下：
+{json.dumps(payload, ensure_ascii=False)}"""
+
+    def _normalize_shared_ip_assessment(self, assessment: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            score = float(assessment.get("risk_score") or 1)
+        except Exception:
+            score = 1.0
+        score = min(10.0, max(1.0, score))
+        try:
+            confidence = float(assessment.get("confidence") or 0)
+        except Exception:
+            confidence = 0.0
+        if confidence > 1:
+            confidence = confidence / 100
+        confidence = min(1.0, max(0.0, confidence))
+        action = assessment.get("action") or ("review" if score >= 8 else "monitor")
+        if action not in {"monitor", "review", "ban"}:
+            action = "review" if score >= 8 else "monitor"
+        assessment["risk_score"] = round(score, 1)
+        assessment["confidence"] = round(confidence, 2)
+        assessment["action"] = action
+        assessment["should_ban"] = bool(action == "ban" and score >= 9 and confidence >= 0.9)
+        assessment.setdefault("reason", "AI 未返回明确原因，建议人工复核共享 IP 证据")
+        if not isinstance(assessment.get("evidence_summary"), list):
+            assessment["evidence_summary"] = []
+        if not isinstance(assessment.get("questions_for_admin"), list):
+            assessment["questions_for_admin"] = []
+        if not isinstance(assessment.get("likely_alt_account_users"), list):
+            assessment["likely_alt_account_users"] = []
+        false_positive_risk = assessment.get("false_positive_risk")
+        if isinstance(false_positive_risk, dict):
+            false_positive_risk = false_positive_risk.get("level")
+        if false_positive_risk not in {"low", "medium", "high"}:
+            false_positive_risk = "medium"
+        assessment["false_positive_risk"] = false_positive_risk
+        assessment["prompt_version"] = "shared-ip-alt-account-v1"
+        assessment["policy"] = "pending_review_first"
+        assessment["case_type"] = "multi_user_shared_ip"
+        return assessment
+
+    async def assess_shared_ip_case(
+        self,
+        item: Dict[str, Any],
+        window: str,
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run a case-level AI assessment for multi-user shared IP abuse."""
+        stats = self._summarize_shared_ip_case(item)
+        prompt = self._build_shared_ip_case_prompt(item, stats, window)
+
+        old_base_url = self._openai_base_url
+        old_api_key = self._openai_api_key
+        old_model = self._ai_model
+        if base_url:
+            self._openai_base_url = base_url.rstrip("/")
+        if api_key:
+            self._openai_api_key = api_key
+        if model:
+            self._ai_model = model
+        try:
+            api_result = await self._call_openai_api(prompt)
+        finally:
+            self._openai_base_url = old_base_url
+            self._openai_api_key = old_api_key
+            self._ai_model = old_model
+
+        if not api_result:
+            raise RuntimeError(self._last_error_message or "AI 评估失败")
+
+        content = api_result.get("content") or "{}"
+        try:
+            assessment = json.loads(content)
+        except Exception:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                assessment = json.loads(content[start:end + 1])
+            else:
+                raise
+
+        assessment = self._normalize_shared_ip_assessment(assessment)
+        assessment.update({
+            "model": api_result.get("model") or model or self._ai_model,
+            "prompt_tokens": int(api_result.get("prompt_tokens") or 0),
+            "completion_tokens": int(api_result.get("completion_tokens") or 0),
+            "total_tokens": int(api_result.get("total_tokens") or 0),
+            "api_duration_ms": int(api_result.get("duration_ms") or 0),
+        })
+
+        return {
+            "success": True,
+            "ip": item.get("ip") or "",
+            "window": window,
+            "case": item,
+            "case_stats": stats,
+            "assessment": assessment,
+            "model": assessment.get("model"),
+            "usage": {
+                "model": assessment.get("model"),
+                "prompt_tokens": assessment.get("prompt_tokens", 0),
+                "completion_tokens": assessment.get("completion_tokens", 0),
+                "total_tokens": assessment.get("total_tokens", 0),
+                "api_duration_ms": assessment.get("api_duration_ms", 0),
+            },
+            "assessed_at": int(time.time()),
+        }
+
+    async def assess_alt_account_case(
+        self,
+        case_data: Dict[str, Any],
+        base_url: Optional[str] = None,
+        api_key: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run a generic AI assessment for an alt-account risk case."""
+        prompt = self._build_alt_account_case_prompt(case_data)
+        old_base_url = self._openai_base_url
+        old_api_key = self._openai_api_key
+        old_model = self._ai_model
+        if base_url:
+            self._openai_base_url = base_url.rstrip("/")
+        if api_key:
+            self._openai_api_key = api_key
+        if model:
+            self._ai_model = model
+        try:
+            api_result = await self._call_openai_case_api(prompt)
+        finally:
+            self._openai_base_url = old_base_url
+            self._openai_api_key = old_api_key
+            self._ai_model = old_model
+
+        if not api_result:
+            raise RuntimeError(self._last_error_message or "AI 评估失败")
+
+        content = api_result.get("content") or "{}"
+        try:
+            assessment = json.loads(content)
+        except Exception:
+            start = content.find("{")
+            end = content.rfind("}")
+            if start >= 0 and end > start:
+                assessment = json.loads(content[start:end + 1])
+            else:
+                raise
+
+        assessment = self._normalize_alt_account_assessment(assessment)
+        assessment.update({
+            "prompt_version": case_data.get("prompt_version") or "alt-account-case-v1",
+            "policy": "pending_review_first",
+            "case_type": case_data.get("case_type"),
+            "model": api_result.get("model") or model or self._ai_model,
+            "prompt_tokens": int(api_result.get("prompt_tokens") or 0),
+            "completion_tokens": int(api_result.get("completion_tokens") or 0),
+            "total_tokens": int(api_result.get("total_tokens") or 0),
+            "api_duration_ms": int(api_result.get("duration_ms") or 0),
+        })
+        return {
+            "success": True,
+            "case_id": case_data.get("case_id"),
+            "window": case_data.get("window"),
+            "case": case_data,
+            "assessment": assessment,
+            "model": assessment.get("model"),
+            "usage": {
+                "model": assessment.get("model"),
+                "prompt_tokens": assessment.get("prompt_tokens", 0),
+                "completion_tokens": assessment.get("completion_tokens", 0),
+                "total_tokens": assessment.get("total_tokens", 0),
+                "api_duration_ms": assessment.get("api_duration_ms", 0),
+            },
+            "assessed_at": int(time.time()),
+        }
+
+    def _build_alt_account_case_prompt(self, case_data: Dict[str, Any]) -> str:
+        safe_case = dict(case_data)
+        if safe_case.get("primary_ip"):
+            safe_case["primary_ip_masked"] = self._mask_ip(str(safe_case.get("primary_ip")))
+            safe_case.pop("primary_ip", None)
+        if safe_case.get("case_type") in {"shared_ip", "rotating_pool"} and safe_case.get("case_key"):
+            safe_case["case_key"] = self._mask_ip(str(safe_case.get("case_key")))
+        return f"""你是 NewAPI Tools 的首席风控分析师。请基于聚合后的案件证据，判断这是否是批量小号/轮换账号池/邀请链小号/Token 轮换滥用。
+
+重要要求：
+1. 只基于证据判断，不要因为单一共享 IP 直接建议封禁。
+2. 必须考虑误报：公司 NAT、校园网、家庭宽带、运营商 CGNAT、Cloudflare/代理出口、真实团队共用网络。
+3. 对“每隔 24 小时使用一个账号”的轮换账号池，要重点看 7d/30d 时间线、单账号活跃日、未充值占比、接力顺序。
+4. 默认策略是 pending_review_first：除非证据极强，否则 action 给 review 或 monitor。
+
+请只返回 JSON，不要 Markdown。字段必须包含：
+{{
+  "risk_score": 0-100,
+  "confidence": 0-1,
+  "action": "monitor" | "review" | "ban",
+  "risk_labels": ["ROTATING_ALT_ACCOUNT_POOL"],
+  "reason": "一句中文结论",
+  "evidence_summary": ["证据1", "证据2"],
+  "false_positive_risk": "low" | "medium" | "high",
+  "false_positive_reasons": ["可能误报原因"],
+  "questions_for_admin": ["需要管理员确认的问题"],
+  "likely_user_ids": [123],
+  "recommended_actions": ["进入待复核", "移动观察分组"],
+  "recommended_admin_action": "建议管理员下一步怎么做"
+}}
+
+案件数据如下：
+{json.dumps(safe_case, ensure_ascii=False)}"""
+
+    async def _call_openai_case_api(self, prompt: str) -> Optional[Dict[str, Any]]:
+        """Call OpenAI-compatible API for larger case-level assessments."""
+        if not self._openai_api_key:
+            self._last_error_message = "OpenAI API Key 未配置"
+            return None
+        headers = {
+            "Authorization": f"Bearer {self._openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self._ai_model,
+            "messages": [
+                {"role": "system", "content": "你是专业 API 风控分析师。你只输出 JSON。"},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 2200,
+            "response_format": {"type": "json_object"},
+        }
+        url = self._get_endpoint_url(self._openai_base_url, "/chat/completions")
+        try:
+            start_time = time.time()
+            async with httpx.AsyncClient(timeout=90.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+            usage = data.get("usage", {})
+            return {
+                "content": data.get("choices", [{}])[0].get("message", {}).get("content", ""),
+                "model": data.get("model", self._ai_model),
+                "prompt_tokens": usage.get("prompt_tokens", 0),
+                "completion_tokens": usage.get("completion_tokens", 0),
+                "total_tokens": usage.get("total_tokens", 0),
+                "duration_ms": int((time.time() - start_time) * 1000),
+            }
+        except Exception as exc:
+            self._last_error_message = str(exc)
+            logger.warning(f"AI小号案件评估失败: {exc}")
+            return None
+
+    def _normalize_alt_account_assessment(self, assessment: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            score = float(assessment.get("risk_score") or 0)
+        except Exception:
+            score = 0.0
+        if 0 < score <= 10:
+            score *= 10
+        score = max(0, min(100, score))
+        try:
+            confidence = float(assessment.get("confidence") or 0)
+        except Exception:
+            confidence = 0.0
+        if confidence > 1:
+            confidence /= 100
+        confidence = max(0, min(1, confidence))
+        action = assessment.get("action") or ("review" if score >= 70 else "monitor")
+        if action not in {"monitor", "review", "ban"}:
+            action = "review" if score >= 70 else "monitor"
+        assessment["risk_score"] = round(score)
+        assessment["confidence"] = round(confidence, 2)
+        assessment["action"] = action
+        assessment.setdefault("reason", "AI 未返回明确结论，建议人工复核案件证据")
+        for key in ["risk_labels", "evidence_summary", "false_positive_reasons", "questions_for_admin", "likely_user_ids", "recommended_actions"]:
+            if not isinstance(assessment.get(key), list):
+                assessment[key] = []
+        false_positive_risk = assessment.get("false_positive_risk")
+        if isinstance(false_positive_risk, dict):
+            false_positive_risk = false_positive_risk.get("level")
+        if false_positive_risk not in {"low", "medium", "high"}:
+            false_positive_risk = "medium"
+        assessment["false_positive_risk"] = false_positive_risk
+        return assessment
+
+    def _mask_ip(self, ip: str) -> str:
+        parts = str(ip or "").split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.*.*"
+        return "iphash"
+
     def _is_extreme_auto_ban(self, assessment: AIAssessmentResult) -> bool:
         return (
             assessment.action == AIBanAction.BAN

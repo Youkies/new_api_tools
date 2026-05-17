@@ -65,6 +65,26 @@ class IPMonitoringService:
         """判断是否使用增量缓存的窗口"""
         return self.cache.is_incremental_window(window_name)
 
+    def _table_exists(self, table_name: str) -> bool:
+        """Check whether a source table exists without failing feature queries."""
+        try:
+            is_pg = self.db.config.engine == DatabaseEngine.POSTGRESQL
+            if is_pg:
+                sql = """
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_name = :table_name
+                    LIMIT 1
+                """
+            else:
+                sql = """
+                    SELECT 1 FROM information_schema.tables
+                    WHERE table_schema = DATABASE() AND table_name = :table_name
+                    LIMIT 1
+                """
+            return bool(self.db.execute(sql, {"table_name": table_name}))
+        except Exception:
+            return False
+
     def get_ip_recording_stats(self, use_cache: bool = True) -> Dict[str, Any]:
         """
         Get statistics about IP recording settings across all users.
@@ -420,6 +440,20 @@ class IPMonitoringService:
                 return {"items": cached, "total": len(cached)}
 
         self.db.connect()
+        is_pg = self.db.config.engine == DatabaseEngine.POSTGRESQL
+        topup_join = ""
+        topup_count_expr = "0"
+        if self._table_exists("top_ups"):
+            status_expr = "LOWER(CAST(status AS TEXT))" if is_pg else "LOWER(CAST(status AS CHAR))"
+            topup_join = f"""
+                    LEFT JOIN (
+                        SELECT user_id, COUNT(*) as success_count
+                        FROM top_ups
+                        WHERE {status_expr} IN ('success', 'completed', '1')
+                        GROUP BY user_id
+                    ) tu ON tu.user_id = l.user_id
+            """
+            topup_count_expr = "COALESCE(MAX(tu.success_count), 0)"
 
         sql = """
             SELECT
@@ -427,6 +461,7 @@ class IPMonitoringService:
                 COUNT(DISTINCT l.user_id) as user_count,
                 COUNT(DISTINCT l.token_id) as token_count,
                 COUNT(DISTINCT CASE WHEN u.status = 2 THEN l.user_id ELSE NULL END) as banned_count,
+                COUNT(DISTINCT CASE WHEN COALESCE(u.status, 0) <> 2 THEN l.user_id ELSE NULL END) as unbanned_count,
                 COUNT(*) as request_count
             FROM logs l
             LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
@@ -459,12 +494,16 @@ class IPMonitoringService:
                         COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), NULLIF(MAX(l.username), ''), '') as username,
                         COALESCE(NULLIF(MAX(u.display_name), ''), '') as display_name,
                         COALESCE(MAX(u.status), 0) as status,
+                        COALESCE(MAX(u.used_quota), 0) as used_quota,
+                        COALESCE(MAX(u.request_count), 0) as total_request_count,
+                        {topup_count_expr} as topup_count,
                         COUNT(DISTINCT l.token_id) as token_count,
                         COUNT(*) as request_count,
                         MIN(l.created_at) as first_seen,
                         MAX(l.created_at) as last_seen
                     FROM logs l
                     LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+                    {topup_join}
                     WHERE l.created_at >= :start_time AND l.created_at <= :end_time
                         AND l.ip IN ({placeholders})
                         AND l.user_id IS NOT NULL
@@ -477,12 +516,17 @@ class IPMonitoringService:
 
                 for user_row in self.db.execute(user_sql, params) or []:
                     ip = user_row.get("ip") or ""
+                    topup_count = int(user_row.get("topup_count") or 0)
                     users_by_ip.setdefault(ip, [])
                     users_by_ip[ip].append({
                         "user_id": int(user_row.get("user_id") or 0),
                         "username": user_row.get("username") or "",
                         "display_name": user_row.get("display_name") or "",
                         "status": int(user_row.get("status") or 0),
+                        "used_quota": int(user_row.get("used_quota") or 0),
+                        "total_request_count": int(user_row.get("total_request_count") or 0),
+                        "topup_count": topup_count,
+                        "has_successful_topup": topup_count > 0,
                         "token_count": int(user_row.get("token_count") or 0),
                         "request_count": int(user_row.get("request_count") or 0),
                         "first_seen": int(user_row.get("first_seen") or 0),
@@ -497,6 +541,7 @@ class IPMonitoringService:
                     "token_count": int(row.get("token_count") or 0),
                     "user_count": int(row.get("user_count") or 0),
                     "banned_count": int(row.get("banned_count") or 0),
+                    "unbanned_count": int(row.get("unbanned_count") or 0),
                     "request_count": int(row.get("request_count") or 0),
                     "users": users_by_ip.get(ip, []),
                 })

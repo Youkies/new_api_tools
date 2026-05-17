@@ -883,6 +883,375 @@ func (s *AIAutoBanService) RunScan(window string, limit int) map[string]interfac
 	}
 }
 
+// AssessSharedIPCase performs a case-level AI assessment for multi-user shared IP abuse.
+func (s *AIAutoBanService) AssessSharedIPCase(ip, window, baseURL, apiKey, model string) map[string]interface{} {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return map[string]interface{}{"success": false, "message": "IP 不能为空"}
+	}
+	if _, ok := WindowSeconds[window]; !ok {
+		window = "24h"
+	}
+
+	config := s.GetConfig()
+	if baseURL == "" {
+		baseURL, _ = config["base_url"].(string)
+	}
+	if apiKey == "" {
+		apiKey, _ = config["api_key"].(string)
+	}
+	if model == "" {
+		model, _ = config["model"].(string)
+	}
+	if strings.TrimSpace(baseURL) == "" || strings.TrimSpace(apiKey) == "" || strings.TrimSpace(model) == "" {
+		return map[string]interface{}{
+			"success": false,
+			"message": "AI Base URL、API Key 或模型未配置",
+		}
+	}
+
+	ipSvc := NewIPMonitoringService()
+	sharedData, err := ipSvc.GetSharedUserIPs(window, 2, 500, false)
+	if err != nil {
+		return map[string]interface{}{"success": false, "message": "读取共享 IP 数据失败: " + err.Error()}
+	}
+
+	var target map[string]interface{}
+	for _, item := range toMapSlice(sharedData["items"]) {
+		if toString(item["ip"]) == ip {
+			target = item
+			break
+		}
+	}
+	if target == nil {
+		return map[string]interface{}{
+			"success": false,
+			"message": "未找到该 IP 的多用户共享记录，请确认时间窗口或刷新 IP 数据",
+			"ip":      ip,
+			"window":  window,
+		}
+	}
+
+	stats := summarizeSharedIPCase(target)
+	prompt := buildSharedIPCasePrompt(target, stats, window)
+	assessment, usage, rawContent, err := callSharedIPAI(baseURL, apiKey, model, prompt)
+	if err != nil {
+		return map[string]interface{}{
+			"success":     false,
+			"message":     "共享 IP AI 研判失败: " + err.Error(),
+			"ip":          ip,
+			"window":      window,
+			"case":        target,
+			"case_stats":  stats,
+			"raw_content": rawContent,
+		}
+	}
+
+	assessment = normalizeSharedIPAssessment(assessment)
+	assessment["prompt_version"] = "shared-ip-alt-account-v1"
+	assessment["policy"] = "pending_review_first"
+	assessment["case_type"] = "multi_user_shared_ip"
+	assessment["model"] = usage["model"]
+	assessment["prompt_tokens"] = usage["prompt_tokens"]
+	assessment["completion_tokens"] = usage["completion_tokens"]
+	assessment["total_tokens"] = usage["total_tokens"]
+	assessment["api_duration_ms"] = usage["api_duration_ms"]
+
+	return map[string]interface{}{
+		"success":     true,
+		"ip":          ip,
+		"window":      window,
+		"case":        target,
+		"case_stats":  stats,
+		"assessment":  assessment,
+		"model":       usage["model"],
+		"usage":       usage,
+		"assessed_at": time.Now().Unix(),
+	}
+}
+
+func summarizeSharedIPCase(item map[string]interface{}) map[string]interface{} {
+	users := toMapSlice(item["users"])
+	unbannedCount := int64(0)
+	noTopupCount := int64(0)
+	topupKnownCount := int64(0)
+	lowRequestCount := int64(0)
+	activeCount := int64(0)
+	firstSeenValues := []int64{}
+	for _, user := range users {
+		if toInt64(user["status"]) != 2 {
+			unbannedCount++
+		}
+		req := toInt64(user["request_count"])
+		if req > 0 {
+			activeCount++
+		}
+		if req <= 3 && toInt64(user["token_count"]) <= 1 {
+			lowRequestCount++
+		}
+		if _, ok := user["topup_count"]; ok {
+			topupKnownCount++
+			if toInt64(user["topup_count"]) <= 0 {
+				noTopupCount++
+			}
+		}
+		if firstSeen := toInt64(user["first_seen"]); firstSeen > 0 {
+			firstSeenValues = append(firstSeenValues, firstSeen)
+		}
+	}
+	spread := int64(0)
+	if len(firstSeenValues) >= 2 {
+		sort.Slice(firstSeenValues, func(i, j int) bool { return firstSeenValues[i] < firstSeenValues[j] })
+		spread = firstSeenValues[len(firstSeenValues)-1] - firstSeenValues[0]
+	}
+	if explicit := toInt64(item["unbanned_count"]); explicit > 0 {
+		unbannedCount = explicit
+	}
+	return map[string]interface{}{
+		"user_count":                toInt64(item["user_count"]),
+		"token_count":               toInt64(item["token_count"]),
+		"request_count":             toInt64(item["request_count"]),
+		"banned_count":              toInt64(item["banned_count"]),
+		"unbanned_count":            unbannedCount,
+		"active_user_count":         activeCount,
+		"low_request_user_count":    lowRequestCount,
+		"topup_known_user_count":    topupKnownCount,
+		"no_topup_user_count":       noTopupCount,
+		"first_seen_spread_seconds": spread,
+	}
+}
+
+func buildSharedIPCasePrompt(item, stats map[string]interface{}, window string) string {
+	users := toMapSlice(item["users"])
+	promptUsers := make([]map[string]interface{}, 0, len(users))
+	for idx, user := range users {
+		if idx >= 40 {
+			break
+		}
+		promptUsers = append(promptUsers, map[string]interface{}{
+			"user_id":             toInt64(user["user_id"]),
+			"username":            toString(user["username"]),
+			"display_name":        toString(user["display_name"]),
+			"status":              toInt64(user["status"]),
+			"token_count":         toInt64(user["token_count"]),
+			"request_count":       toInt64(user["request_count"]),
+			"total_request_count": toInt64(user["total_request_count"]),
+			"used_quota":          toInt64(user["used_quota"]),
+			"topup_count":         toInt64(user["topup_count"]),
+			"first_seen":          toInt64(user["first_seen"]),
+			"last_seen":           toInt64(user["last_seen"]),
+		})
+	}
+	payload := map[string]interface{}{
+		"ip":         toString(item["ip"]),
+		"window":     window,
+		"case_stats": stats,
+		"users":      promptUsers,
+	}
+	payloadBytes, _ := json.Marshal(payload)
+	return fmt.Sprintf(`你是 NewAPI Tools 的资深风控分析师。请专门判断“同一 IP 下多用户共享”是否更像批量注册/开小号/账号池，而不是普通企业、学校、家庭、机房出口或 Cloudflare/运营商 NAT。
+
+判断重点：
+1. 强风险：同一 IP 聚集多个未充值或低使用账号、首次出现时间高度集中、令牌数异常、已有封禁账号混入、账号之间请求量分布像批量试探。
+2. 降低风险：用户已充值、长期高正常用量、账号状态稳定、共享 IP 可能是公司/学校/家庭/可信代理出口。
+3. 单纯“共享 IP”不能直接封禁，必须给出证据和误伤风险。
+4. 默认策略是 pending_review_first：建议动作优先 review，只有证据极强时才给 ban。
+
+请只返回 JSON，不要 Markdown。字段必须包含：
+{
+  "risk_score": 1-10,
+  "confidence": 0-1,
+  "action": "monitor" | "review" | "ban",
+  "should_ban": boolean,
+  "reason": "一句中文结论",
+  "evidence_summary": ["证据1", "证据2"],
+  "false_positive_risk": "low" | "medium" | "high",
+  "questions_for_admin": ["需要管理员确认的问题"],
+  "likely_alt_account_users": [{"user_id": 123, "reason": "为什么像小号", "confidence": 0.8}],
+  "recommended_admin_action": "建议管理员下一步怎么做"
+}
+
+共享 IP 案件数据如下：
+%s`, string(payloadBytes))
+}
+
+func callSharedIPAI(baseURL, apiKey, model, prompt string) (map[string]interface{}, map[string]interface{}, string, error) {
+	payload := map[string]interface{}{
+		"model": model,
+		"messages": []map[string]string{
+			{"role": "system", "content": "你是专业 API 风控分析师。你只输出 JSON。"},
+			{"role": "user", "content": prompt},
+		},
+		"temperature":     0.1,
+		"max_tokens":      1200,
+		"response_format": map[string]string{"type": "json_object"},
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	req, err := http.NewRequest("POST", getEndpointURL(baseURL, "/chat/completions"), bytes.NewReader(payloadBytes))
+	if err != nil {
+		return nil, nil, "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 60 * time.Second}
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		detail := string(body)
+		if len(detail) > 300 {
+			detail = detail[:300]
+		}
+		return nil, nil, detail, fmt.Errorf("HTTP %d: %s", resp.StatusCode, detail)
+	}
+
+	var chatResp struct {
+		Model   string `json:"model"`
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage struct {
+			PromptTokens     int `json:"prompt_tokens"`
+			CompletionTokens int `json:"completion_tokens"`
+			TotalTokens      int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &chatResp); err != nil {
+		return nil, nil, string(body), err
+	}
+	if len(chatResp.Choices) == 0 {
+		return nil, nil, "", fmt.Errorf("AI 响应缺少 choices")
+	}
+	content := strings.TrimSpace(chatResp.Choices[0].Message.Content)
+	var assessment map[string]interface{}
+	if err := json.Unmarshal([]byte(extractJSONObject(content)), &assessment); err != nil {
+		return nil, nil, content, err
+	}
+	actualModel := chatResp.Model
+	if actualModel == "" {
+		actualModel = model
+	}
+	usage := map[string]interface{}{
+		"model":             actualModel,
+		"prompt_tokens":     chatResp.Usage.PromptTokens,
+		"completion_tokens": chatResp.Usage.CompletionTokens,
+		"total_tokens":      chatResp.Usage.TotalTokens,
+		"api_duration_ms":   time.Since(start).Milliseconds(),
+	}
+	return assessment, usage, content, nil
+}
+
+func extractJSONObject(content string) string {
+	text := strings.TrimSpace(content)
+	if strings.HasPrefix(text, "```") {
+		text = strings.TrimPrefix(text, "```json")
+		text = strings.TrimPrefix(text, "```")
+		text = strings.TrimSuffix(text, "```")
+		text = strings.TrimSpace(text)
+	}
+	start := strings.Index(text, "{")
+	end := strings.LastIndex(text, "}")
+	if start >= 0 && end > start {
+		return text[start : end+1]
+	}
+	return text
+}
+
+func normalizeSharedIPAssessment(assessment map[string]interface{}) map[string]interface{} {
+	score := toFloat64(assessment["risk_score"])
+	if score <= 0 {
+		score = 1
+	}
+	if score > 10 {
+		score = 10
+	}
+	confidence := toFloat64(assessment["confidence"])
+	if confidence > 1 {
+		confidence = confidence / 100
+	}
+	if confidence < 0 {
+		confidence = 0
+	}
+	if confidence > 1 {
+		confidence = 1
+	}
+	action := toString(assessment["action"])
+	if action != "ban" && action != "review" && action != "monitor" {
+		if score >= 8 {
+			action = "review"
+		} else {
+			action = "monitor"
+		}
+	}
+	assessment["risk_score"] = math.Round(score*10) / 10
+	assessment["confidence"] = math.Round(confidence*100) / 100
+	assessment["action"] = action
+	assessment["should_ban"] = action == "ban" && score >= 9 && confidence >= 0.9
+	if toString(assessment["reason"]) == "" {
+		assessment["reason"] = "AI 未返回明确原因，建议人工复核共享 IP 证据"
+	}
+	if _, ok := assessment["evidence_summary"].([]interface{}); !ok {
+		if _, ok := assessment["evidence_summary"].([]string); !ok {
+			assessment["evidence_summary"] = []string{}
+		}
+	}
+	if _, ok := assessment["questions_for_admin"].([]interface{}); !ok {
+		if _, ok := assessment["questions_for_admin"].([]string); !ok {
+			assessment["questions_for_admin"] = []string{}
+		}
+	}
+	if _, ok := assessment["likely_alt_account_users"].([]interface{}); !ok {
+		if _, ok := assessment["likely_alt_account_users"].([]map[string]interface{}); !ok {
+			assessment["likely_alt_account_users"] = []map[string]interface{}{}
+		}
+	}
+	falsePositiveRisk := strings.ToLower(strings.TrimSpace(toString(assessment["false_positive_risk"])))
+	if riskMap, ok := assessment["false_positive_risk"].(map[string]interface{}); ok {
+		falsePositiveRisk = strings.ToLower(strings.TrimSpace(toString(riskMap["level"])))
+	}
+	if falsePositiveRisk != "low" && falsePositiveRisk != "medium" && falsePositiveRisk != "high" {
+		falsePositiveRisk = "medium"
+	}
+	assessment["false_positive_risk"] = falsePositiveRisk
+	if _, ok := assessment["evidence_summary"]; !ok {
+		assessment["evidence_summary"] = []string{}
+	}
+	if _, ok := assessment["questions_for_admin"]; !ok {
+		assessment["questions_for_admin"] = []string{}
+	}
+	return assessment
+}
+
+func toMapSlice(v interface{}) []map[string]interface{} {
+	switch value := v.(type) {
+	case []map[string]interface{}:
+		return value
+	case []interface{}:
+		result := make([]map[string]interface{}, 0, len(value))
+		for _, item := range value {
+			if m, ok := item.(map[string]interface{}); ok {
+				result = append(result, m)
+			}
+		}
+		return result
+	default:
+		return []map[string]interface{}{}
+	}
+}
+
 // TestConnection tests the configured API connection (placeholder)
 func (s *AIAutoBanService) TestConnection() map[string]interface{} {
 	config := s.GetConfig()

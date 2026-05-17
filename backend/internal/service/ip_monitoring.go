@@ -18,6 +18,7 @@ var WindowSeconds = map[string]int64{
 	"24h": 86400,
 	"3d":  259200,
 	"7d":  604800,
+	"30d": 2592000,
 }
 
 // IPMonitoringService handles IP analysis queries
@@ -229,6 +230,7 @@ func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit in
 			COUNT(DISTINCT l.user_id) as user_count,
 			COUNT(DISTINCT l.token_id) as token_count,
 			COUNT(DISTINCT CASE WHEN u.status = 2 THEN l.user_id ELSE NULL END) as banned_count,
+			COUNT(DISTINCT CASE WHEN COALESCE(u.status, 0) <> 2 THEN l.user_id ELSE NULL END) as unbanned_count,
 			COUNT(*) as request_count
 		FROM logs l
 		LEFT JOIN users u ON l.user_id = u.id AND u.deleted_at IS NULL
@@ -262,23 +264,44 @@ func (s *IPMonitoringService) GetSharedUserIPs(window string, minUsers, limit in
 			args := []interface{}{startTime}
 			args = append(args, ips...)
 
+			topupJoin := ""
+			topupCountExpr := "0"
+			if topupsExists, _ := s.db.TableExists("top_ups"); topupsExists {
+				statusExpr := "LOWER(CAST(status AS CHAR))"
+				if s.db.IsPG {
+					statusExpr = "LOWER(CAST(status AS TEXT))"
+				}
+				topupJoin = fmt.Sprintf(`
+				LEFT JOIN (
+					SELECT user_id, COUNT(*) as success_count
+					FROM top_ups
+					WHERE %s IN ('success', 'completed', '1')
+					GROUP BY user_id
+				) tu ON tu.user_id = l.user_id`, statusExpr)
+				topupCountExpr = "COALESCE(MAX(tu.success_count), 0)"
+			}
+
 			userQuery := s.db.RebindQuery(fmt.Sprintf(`
 				SELECT l.ip,
 					l.user_id,
 					COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), NULLIF(MAX(l.username), ''), '') as username,
 					COALESCE(NULLIF(MAX(u.display_name), ''), '') as display_name,
 					COALESCE(MAX(u.status), 0) as status,
+					COALESCE(MAX(u.used_quota), 0) as used_quota,
+					COALESCE(MAX(u.request_count), 0) as total_request_count,
+					%s as topup_count,
 					COUNT(DISTINCT l.token_id) as token_count,
 					COUNT(*) as request_count,
 					MIN(l.created_at) as first_seen,
 					MAX(l.created_at) as last_seen
 				FROM logs l
 				LEFT JOIN users u ON l.user_id = u.id AND u.deleted_at IS NULL
+				%s
 				WHERE l.created_at >= ? AND l.ip IN (%s)
 					AND l.ip IS NOT NULL AND l.ip <> ''
 					AND l.user_id IS NOT NULL
 				GROUP BY l.ip, l.user_id
-				ORDER BY l.ip, request_count DESC`, placeholders))
+				ORDER BY l.ip, request_count DESC`, topupCountExpr, topupJoin, placeholders))
 
 			userRows, err := s.db.Query(userQuery, args...)
 			if err == nil {

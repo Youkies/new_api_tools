@@ -128,10 +128,11 @@ func main() {
 
 	// ========== 8. Start server with graceful shutdown ==========
 	srv := &http.Server{
-		Addr:         cfg.ServerAddr(),
-		Handler:      r,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		Addr:        cfg.ServerAddr(),
+		Handler:     r,
+		ReadTimeout: 30 * time.Second,
+		// AI-assisted admin analysis can take longer than regular CRUD requests.
+		WriteTimeout: 240 * time.Second,
 		IdleTimeout:  120 * time.Second,
 	}
 

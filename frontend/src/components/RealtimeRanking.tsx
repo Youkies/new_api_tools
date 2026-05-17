@@ -11,8 +11,10 @@ import { Select } from './ui/select'
 import { Input } from './ui/input'
 import { cn, isCloudflareIp } from '../lib/utils'
 import { UserAnalysisDialog, BAN_REASONS, UNBAN_REASONS, RISK_FLAG_LABELS } from './UserAnalysisDialog'
+import { SharedIPAltAccountPanel } from './risk/SharedIPAltAccountPanel'
+import { AltAccountCasesPanel } from './risk/AltAccountCasesPanel'
+import type { AltAccountAIResult, AltAccountCase, BulkBanRecord, IPStats, MultiIPTokenItem, MultiIPUserItem, SharedIPItem, WindowKey } from './risk/types'
 
-type WindowKey = '1h' | '3h' | '6h' | '12h' | '24h' | '3d' | '7d'
 type SortKey = 'risk_score' | 'requests' | 'quota' | 'failure_rate'
 
 interface RiskReason {
@@ -85,16 +87,6 @@ const renderReasonBadge = (reason: string | null) => {
       {reason}
     </Badge>
   )
-}
-
-const renderUserStatusBadge = (status: number) => {
-  if (status === 2) {
-    return <Badge variant="destructive" className="h-5 px-2 text-[10px]">已封禁</Badge>
-  }
-  if (status === 1) {
-    return <Badge variant="success" className="h-5 px-2 text-[10px]">正常</Badge>
-  }
-  return <Badge variant="outline" className="h-5 px-2 text-[10px]">未知</Badge>
 }
 
 function formatNumber(n: number) {
@@ -192,58 +184,6 @@ interface AIPendingReviewItem {
   updated_at?: number
 }
 
-// IP Monitoring Types
-interface IPStats {
-  total_users: number
-  enabled_count: number
-  disabled_count: number
-  enabled_percentage: number
-  unique_ips_24h: number
-}
-
-interface SharedIPItem {
-  ip: string
-  token_count: number
-  user_count: number
-  banned_count?: number
-  request_count: number
-  users: Array<{
-    user_id: number
-    username: string
-    display_name?: string
-    status: number
-    token_count: number
-    request_count: number
-    first_seen: number
-    last_seen: number
-  }>
-  tokens?: Array<{
-    token_id: number
-    token_name: string
-    user_id: number
-    username: string
-    request_count: number
-  }>
-}
-
-interface BulkBanRecord {
-  id: string
-  ip: string
-  reason: string
-  created_at: number
-  user_count: number
-  success_count: number
-  failed_count: number
-  users: Array<{
-    user_id: number
-    username: string
-    display_name?: string
-  }>
-  undone?: boolean
-  undone_at?: number
-  undo_failed_count?: number
-}
-
 const BULK_BAN_RECORDS_KEY = 'risk_center_bulk_ban_records_v1'
 
 function loadBulkBanRecords(): BulkBanRecord[] {
@@ -255,24 +195,6 @@ function loadBulkBanRecords(): BulkBanRecord[] {
   } catch {
     return []
   }
-}
-
-interface MultiIPTokenItem {
-  token_id: number
-  token_name: string
-  user_id: number
-  username: string
-  ip_count: number
-  request_count: number
-  ips: Array<{ ip: string; request_count: number }>
-}
-
-interface MultiIPUserItem {
-  user_id: number
-  username: string
-  ip_count: number
-  request_count: number
-  top_ips: Array<{ ip: string; request_count: number }>
 }
 
 // URL 路径映射 (History API)
@@ -425,6 +347,11 @@ export function RealtimeRanking() {
   const [ipRefreshing, setIpRefreshing] = useState<{ all: boolean; shared: boolean; tokens: boolean; users: boolean }>({
     all: false, shared: false, tokens: false, users: false
   })
+  const [altAccountCases, setAltAccountCases] = useState<AltAccountCase[]>([])
+  const [altAccountCasesLoading, setAltAccountCasesLoading] = useState(false)
+  const [altAccountCasesRefreshing, setAltAccountCasesRefreshing] = useState(false)
+  const [altAccountAssessingCaseId, setAltAccountAssessingCaseId] = useState<string | null>(null)
+  const [altAccountAiResult, setAltAccountAiResult] = useState<AltAccountAIResult | null>(null)
 
   // User IP details dialog
   const [userIpsDialogOpen, setUserIpsDialogOpen] = useState(false)
@@ -532,6 +459,7 @@ export function RealtimeRanking() {
   const [aiLoading, setAiLoading] = useState(false)
   const [aiScanning, setAiScanning] = useState(false)
   const [aiAssessing, setAiAssessing] = useState<number | null>(null)
+  const [sharedIpAiAssessing, setSharedIpAiAssessing] = useState<string | null>(null)
   const [pendingResolveAfterBan, setPendingResolveAfterBan] = useState<string | null>(null)
   const [aiAssessResult, setAiAssessResult] = useState<{
     user_id: number
@@ -548,6 +476,7 @@ export function RealtimeRanking() {
       prompt_version?: string
     }
   } | null>(null)
+  const [sharedIpAiResult, setSharedIpAiResult] = useState<any | null>(null)
 
   // AI 配置编辑状态
   const [aiConfigEdit, setAiConfigEdit] = useState({
@@ -839,6 +768,26 @@ export function RealtimeRanking() {
     }
   }, [apiUrl, getAuthHeaders])
 
+  const fetchAltAccountCases = useCallback(async (showSuccessToast = false, forceRefresh = false) => {
+    setAltAccountCasesLoading(true)
+    const noCache = forceRefresh ? '&no_cache=true' : ''
+    try {
+      const response = await fetch(`${apiUrl}/api/risk/alt-account/cases?case_type=all&window=30d&limit=30${noCache}`, { headers: getAuthHeaders() })
+      const res = await response.json()
+      if (res.success) {
+        setAltAccountCases(res.data?.items || [])
+        if (showSuccessToast) showToast('success', '小号案件已刷新')
+      } else {
+        showToast('error', res.message || '获取小号案件失败')
+      }
+    } catch (e) {
+      console.error('Failed to fetch alt-account cases:', e)
+      showToast('error', '获取小号案件失败')
+    } finally {
+      setAltAccountCasesLoading(false)
+    }
+  }, [apiUrl, getAuthHeaders, showToast])
+
   const fetchIPData = useCallback(async (showSuccessToast = false, resetPage = false, forceRefresh = false) => {
     setIpLoading(true)
     // Only reset page when explicitly requested (e.g., window change), not on refresh
@@ -865,6 +814,7 @@ export function RealtimeRanking() {
       if (shared.success) setSharedIps(shared.data?.items || [])
       if (tokens.success) setMultiIpTokens(tokens.data?.items || [])
       if (users.success) setMultiIpUsers(users.data?.items || [])
+      fetchAltAccountCases(false, forceRefresh)
 
       if (showSuccessToast) showToast('success', '已刷新')
     } catch (e) {
@@ -873,7 +823,7 @@ export function RealtimeRanking() {
     } finally {
       setIpLoading(false)
     }
-  }, [apiUrl, getAuthHeaders, ipWindow, showToast])
+  }, [apiUrl, fetchAltAccountCases, getAuthHeaders, ipWindow, showToast])
 
   const fetchUserIps = useCallback(async (userId: number, window: WindowKey) => {
     setUserIpsLoading(true)
@@ -1425,6 +1375,54 @@ export function RealtimeRanking() {
     }
   }
 
+  const handleSharedIpAiAssess = async (item: SharedIPItem) => {
+    setSharedIpAiAssessing(item.ip)
+    setSharedIpAiResult(null)
+    try {
+      const response = await fetch(`${apiUrl}/api/ai-ban/assess-shared-ip`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ ip: item.ip, window: ipWindow }),
+      })
+      const res = await response.json()
+      if (res.success) {
+        setSharedIpAiResult(res.data)
+        showToast('success', '共享 IP AI 研判完成')
+      } else {
+        showToast('error', res.message || res.data?.message || '共享 IP AI 研判失败')
+      }
+    } catch (e) {
+      console.error('Failed to assess shared IP case:', e)
+      showToast('error', '共享 IP AI 研判失败')
+    } finally {
+      setSharedIpAiAssessing(null)
+    }
+  }
+
+  const handleAltAccountAiAssess = async (item: AltAccountCase) => {
+    setAltAccountAssessingCaseId(item.case_id)
+    setAltAccountAiResult(null)
+    try {
+      const response = await fetch(`${apiUrl}/api/risk/alt-account/cases/${encodeURIComponent(item.case_id)}/assess`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ window: item.window || '30d' }),
+      })
+      const res = await response.json()
+      if (res.success) {
+        setAltAccountAiResult(res.data)
+        showToast('success', '小号案件 AI 研判完成')
+      } else {
+        showToast('error', res.message || res.data?.message || '小号案件 AI 研判失败')
+      }
+    } catch (e) {
+      console.error('Failed to assess alt-account case:', e)
+      showToast('error', '小号案件 AI 研判失败')
+    } finally {
+      setAltAccountAssessingCaseId(null)
+    }
+  }
+
   const handleAiScan = async () => {
     setAiScanning(true)
     try {
@@ -1796,6 +1794,7 @@ export function RealtimeRanking() {
     fetchBanRecords,
     fetchBannedUsers,
     fetchIPData,
+    fetchAltAccountCases,
     fetchAiConfig,
     fetchAiSuspiciousUsers,
     fetchAiPendingReviews,
@@ -1809,6 +1808,7 @@ export function RealtimeRanking() {
       fetchBanRecords,
       fetchBannedUsers,
       fetchIPData,
+      fetchAltAccountCases,
       fetchAiConfig,
       fetchAiSuspiciousUsers,
       fetchAiPendingReviews,
@@ -1822,7 +1822,10 @@ export function RealtimeRanking() {
     if (view === 'leaderboards') fns.fetchLeaderboards()
     if (view === 'banned_list') fns.fetchBannedUsers(1)
     if (view === 'audit_logs') fns.fetchBanRecords(1)
-    if (view === 'ip_monitoring') fns.fetchIPData(false, true)  // Reset page on view change
+    if (view === 'ip_monitoring') {
+      fns.fetchIPData(false, true)  // Reset page on view change
+      fns.fetchAltAccountCases(false, false)
+    }
     if (view === 'ai_ban') {
       fns.fetchAiConfig()
       fns.fetchAiSuspiciousUsers()
@@ -1894,6 +1897,12 @@ export function RealtimeRanking() {
     setIpRefreshing(prev => ({ ...prev, all: true }))
     await fetchIPData(true, false, true)  // showToast=true, resetPage=false, forceRefresh=true
     setIpRefreshing(prev => ({ ...prev, all: false }))
+  }
+
+  const handleRefreshAltAccountCases = async () => {
+    setAltAccountCasesRefreshing(true)
+    await fetchAltAccountCases(true, true)
+    setAltAccountCasesRefreshing(false)
   }
 
   // 单独刷新共享 IP 列表
@@ -3078,233 +3087,49 @@ export function RealtimeRanking() {
               </div>
             ) : (
               <>
-                <Card className="rounded-xl border shadow-sm overflow-hidden">
-                  <CardHeader className="pb-3 border-b bg-muted/20">
-                    <div className="flex items-center justify-between">
-                      <CardTitle className="text-base flex items-center gap-2">
-                        <AlertTriangle className="h-4 w-4 text-orange-500" />
-                        多用户共用 IP
-                        <Badge variant="secondary" className="ml-2 bg-background font-mono">{sharedIps.length}</Badge>
-                      </CardTitle>
-                      <div className="flex items-center gap-2">
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          className="h-7 px-2 text-xs"
-                          onClick={() => handleUndoBulkBan(latestUndoableBulkBanRecord)}
-                          disabled={!latestUndoableBulkBanRecord || !!undoBulkBanLoading}
-                          title="撤销最近一次批量封禁"
-                        >
-                          {undoBulkBanLoading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5 mr-1.5" />}
-                          撤销上一次
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="h-7 w-7"
-                          onClick={handleRefreshSharedIps}
-                          disabled={ipRefreshing.shared}
-                          title="刷新"
-                        >
-                          <RefreshCw className={cn("h-3.5 w-3.5", ipRefreshing.shared && "animate-spin")} />
-                        </Button>
-                      </div>
-                    </div>
-                  </CardHeader>
-                  <CardContent className="p-0">
-                    {sharedIps.length > 0 ? (
-                      <>
-                        <div className="divide-y">
-                          {sharedIps.slice((ipPage.shared - 1) * ipPageSize, ipPage.shared * ipPageSize).map((item) => {
-                            const unbannedCount = (item.users || []).filter((user) => user.status !== 2).length
-                            const isBulkBanning = bulkBanLoadingIp === item.ip
-                            return (
-                              <div key={item.ip} className="px-4 py-3 transition-colors hover:bg-muted/30">
-                              <div
-                                className="flex items-center justify-between cursor-pointer"
-                                onClick={() => toggleSharedIpExpand(item.ip)}
-                              >
-                                <div className="flex items-center gap-3">
-                                  <code className="text-sm bg-muted px-2 py-1 rounded font-mono text-foreground border border-border/50">{item.ip}</code>
-                                  {isCloudflareIp(item.ip) && (
-                                    <Badge className="bg-orange-100 text-orange-700 border-orange-200 hover:bg-orange-100 px-1.5 py-0 text-[10px] font-bold">CF</Badge>
-                                  )}
-                                  <div className="flex gap-2">
-                                    <Badge variant="outline" className="font-normal bg-background">{item.user_count} 用户</Badge>
-                                    <Badge variant="outline" className="font-normal bg-background">{item.token_count} 令牌</Badge>
-                                    {(item.banned_count || 0) > 0 && (
-                                      <Badge variant="destructive" className="font-normal">{item.banned_count} 已封禁</Badge>
-                                    )}
-                                  </div>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                  <Button
-                                    variant="outline"
-                                    size="sm"
-                                    className="h-8 px-2 text-xs text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700"
-                                    disabled={unbannedCount === 0 || !!bulkBanLoadingIp}
-                                    title={unbannedCount > 0 ? `封禁该 IP 下 ${unbannedCount} 个未封禁用户` : '该 IP 下用户均已封禁'}
-                                    onClick={(e) => {
-                                      e.stopPropagation()
-                                      handleBulkBanSharedIp(item)
-                                    }}
-                                  >
-                                    {isBulkBanning ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldBan className="h-3.5 w-3.5 mr-1.5" />}
-                                    封禁全部
-                                  </Button>
-                                  <div className="flex flex-col items-end">
-                                    <span className="text-sm font-bold tabular-nums font-mono text-foreground">
-                                      {formatNumber(item.request_count)}
-                                    </span>
-                                    <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-tight opacity-50">Requests</span>
-                                  </div>
-                                  <div className={cn("transition-transform duration-200 p-1 rounded hover:bg-muted", expandedSharedIps.has(item.ip) && "rotate-180")}>
-                                    <ChevronDown className="h-4 w-4 text-muted-foreground" />
-                                  </div>
-                                </div>
-                              </div>
-                              {expandedSharedIps.has(item.ip) && (
-                                <div className="mt-3 pl-4 space-y-2 animate-in slide-in-from-top-1 duration-200">
-                                  {(item.users || []).map((user) => {
-                                    const displayName = user.display_name || user.username || `User#${user.user_id}`
-                                    const isBanned = user.status === 2
-                                    return (
-                                      <div key={`${item.ip}-${user.user_id}`} className="flex items-center justify-between text-sm bg-muted/40 rounded-lg px-3 py-2 border border-border/40 group/user-row">
-                                        <div className="flex items-center gap-2 min-w-0">
-                                          <div
-                                            className="flex items-center gap-2 px-2 py-1 rounded-full bg-muted/50 hover:bg-primary/10 hover:text-primary transition-all cursor-pointer border border-transparent hover:border-primary/20 w-fit group/user"
-                                            onClick={(e) => {
-                                              e.stopPropagation()
-                                              openUserAnalysisFromIP(user.user_id, displayName)
-                                            }}
-                                          >
-                                            <div className="w-5 h-5 rounded-full bg-blue-500/10 text-blue-600 flex items-center justify-center font-bold text-[10px] border border-blue-500/20 group-hover/user:bg-blue-500/20 shrink-0">
-                                              {displayName[0]?.toUpperCase()}
-                                            </div>
-                                            <div className="flex flex-col leading-tight min-w-0">
-                                              <span className="text-xs font-semibold truncate max-w-[150px]">{displayName}</span>
-                                              <span className="text-[9px] text-muted-foreground font-mono">ID: {user.user_id}</span>
-                                            </div>
-                                          </div>
-                                          {renderUserStatusBadge(user.status)}
-                                          <Badge variant="outline" className="h-5 px-2 text-[10px] bg-background">
-                                            {user.token_count} 令牌
-                                          </Badge>
-                                        </div>
-                                        <div className="flex items-center gap-2">
-                                          <div className="flex items-center gap-1.5 opacity-80">
-                                            <span className="text-foreground font-bold tabular-nums font-mono text-xs">{formatNumber(user.request_count)}</span>
-                                            <span className="text-[9px] text-muted-foreground uppercase font-bold tracking-tighter opacity-60">reqs</span>
-                                          </div>
-                                          {!isBanned && (
-                                            <Button
-                                              variant="ghost"
-                                              size="icon"
-                                              className="h-7 w-7 text-red-500 hover:text-red-600 hover:bg-red-500/10"
-                                              title="一键封禁"
-                                              onClick={(e) => {
-                                                e.stopPropagation()
-                                                setBanConfirmDialog({
-                                                  open: true,
-                                                  type: 'ban',
-                                                  userId: user.user_id,
-                                                  username: user.username || displayName,
-                                                  displayName,
-                                                  reason: '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)',
-                                                  disableTokens: true,
-                                                  enableTokens: false,
-                                                })
-                                              }}
-                                            >
-                                              <ShieldBan className="h-3.5 w-3.5" />
-                                            </Button>
-                                          )}
-                                        </div>
-                                      </div>
-                                    )
-                                  })}
-                                  {(!item.users || item.users.length === 0) && (
-                                    <div className="text-xs text-muted-foreground bg-muted/30 rounded-lg px-3 py-2">
-                                      暂无用户详情
-                                    </div>
-                                  )}
-                                </div>
-                              )}
-                              </div>
-                            )
-                          })}
-                        </div>
-                        {sharedIps.length > ipPageSize && (
-                          <div className="flex items-center justify-between p-3 border-t bg-muted/5">
-                            <div className="text-[11px] text-muted-foreground">
-                              显示 {Math.min(sharedIps.length, (ipPage.shared - 1) * ipPageSize + 1)} - {Math.min(sharedIps.length, ipPage.shared * ipPageSize)}，共 {sharedIps.length} 条
-                            </div>
-                            <div className="flex gap-1">
-                              <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={ipPage.shared <= 1} onClick={() => setIpPage(p => ({ ...p, shared: p.shared - 1 }))}>上一页</Button>
-                              <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={ipPage.shared * ipPageSize >= sharedIps.length} onClick={() => setIpPage(p => ({ ...p, shared: p.shared + 1 }))}>下一页</Button>
-                            </div>
-                          </div>
-                        )}
-                      </>
-                    ) : (
-                      <div className="h-40 flex flex-col items-center justify-center text-muted-foreground text-sm">
-                        <ShieldCheck className="h-8 w-8 mb-2 opacity-20" />
-                        暂无异常共用 IP
-                      </div>
-                    )}
-                    {bulkBanRecords.length > 0 && (
-                      <div className="border-t bg-muted/10 px-4 py-3">
-                        <div className="flex items-center justify-between mb-2">
-                          <div className="flex items-center gap-2">
-                            <ShieldBan className="h-4 w-4 text-red-500" />
-                            <span className="text-sm font-semibold">封禁记录</span>
-                            <Badge variant="outline" className="h-5 px-2 text-[10px]">{bulkBanRecords.length}</Badge>
-                          </div>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-7 px-2 text-xs"
-                            disabled={!latestUndoableBulkBanRecord || !!undoBulkBanLoading}
-                            onClick={() => handleUndoBulkBan(latestUndoableBulkBanRecord)}
-                          >
-                            {undoBulkBanLoading ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5 mr-1.5" />}
-                            撤销上一次封禁
-                          </Button>
-                        </div>
-                        <div className="space-y-1.5">
-                          {bulkBanRecords.slice(0, 5).map((record) => (
-                            <div key={record.id} className="flex items-center justify-between gap-3 rounded-lg border bg-background/80 px-3 py-2 text-xs">
-                              <div className="min-w-0">
-                                <div className="flex items-center gap-2 min-w-0">
-                                  <code className="font-mono text-foreground truncate">{record.ip}</code>
-                                  <Badge variant={record.undone ? "secondary" : "destructive"} className="h-5 px-2 text-[10px]">
-                                    {record.undone ? '已撤销' : '已封禁'}
-                                  </Badge>
-                                  {record.failed_count > 0 && (
-                                    <Badge variant="outline" className="h-5 px-2 text-[10px]">{record.failed_count} 失败</Badge>
-                                  )}
-                                </div>
-                                <div className="mt-1 text-muted-foreground">
-                                  {formatTime(record.created_at)} · 成功 {record.success_count}/{record.user_count} · {record.reason}
-                                </div>
-                              </div>
-                              <Button
-                                variant="outline"
-                                size="sm"
-                                className="h-7 px-2 text-xs shrink-0"
-                                disabled={record.undone || undoBulkBanLoading === record.id}
-                                onClick={() => handleUndoBulkBan(record)}
-                              >
-                                {undoBulkBanLoading === record.id ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <ShieldCheck className="h-3.5 w-3.5 mr-1.5" />}
-                                撤销
-                              </Button>
-                            </div>
-                          ))}
-                        </div>
-                      </div>
-                    )}
-                  </CardContent>
-                </Card>
+                <AltAccountCasesPanel
+                  cases={altAccountCases}
+                  loading={altAccountCasesLoading}
+                  refreshing={altAccountCasesRefreshing}
+                  assessingCaseId={altAccountAssessingCaseId}
+                  aiResult={altAccountAiResult}
+                  onRefresh={handleRefreshAltAccountCases}
+                  onAssess={handleAltAccountAiAssess}
+                  formatNumber={formatNumber}
+                  formatTime={formatTime}
+                />
+
+                <SharedIPAltAccountPanel
+                  sharedIps={sharedIps}
+                  page={ipPage.shared}
+                  pageSize={ipPageSize}
+                  expandedIps={expandedSharedIps}
+                  bulkBanRecords={bulkBanRecords}
+                  latestUndoableBulkBanRecord={latestUndoableBulkBanRecord}
+                  bulkBanLoadingIp={bulkBanLoadingIp}
+                  undoBulkBanLoading={undoBulkBanLoading}
+                  refreshing={ipRefreshing.shared}
+                  onPageChange={(nextPage) => setIpPage((prev) => ({ ...prev, shared: nextPage }))}
+                  onToggleExpand={toggleSharedIpExpand}
+                  onRefresh={handleRefreshSharedIps}
+                  onBulkBan={handleBulkBanSharedIp}
+                  aiAssessingIp={sharedIpAiAssessing}
+                  onAssessWithAI={handleSharedIpAiAssess}
+                  onUndoBulkBan={handleUndoBulkBan}
+                  onOpenUserAnalysis={openUserAnalysisFromIP}
+                  onOpenBanDialog={(user, displayName) => setBanConfirmDialog({
+                    open: true,
+                    type: 'ban',
+                    userId: user.user_id,
+                    username: user.username || displayName,
+                    displayName,
+                    reason: '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)',
+                    disableTokens: true,
+                    enableTokens: false,
+                  })}
+                  formatNumber={formatNumber}
+                  formatTime={formatTime}
+                />
 
                 {/* Multi-IP Tokens Table (Refactored) */}
                 <Card className="rounded-xl border shadow-sm overflow-hidden">
@@ -4410,6 +4235,173 @@ export function RealtimeRanking() {
               </CardContent>
             </Card>
           )}
+
+          {sharedIpAiResult && (() => {
+            const assessment = sharedIpAiResult.assessment || {}
+            const stats = sharedIpAiResult.case_stats || {}
+            const likelyUsers = Array.isArray(assessment.likely_alt_account_users)
+              ? assessment.likely_alt_account_users
+              : []
+            const evidence = Array.isArray(assessment.evidence_summary)
+              ? assessment.evidence_summary
+              : []
+            const questions = Array.isArray(assessment.questions_for_admin)
+              ? assessment.questions_for_admin
+              : []
+            const actionLabel =
+              assessment.action === 'ban' ? '建议封禁' :
+                assessment.action === 'review' ? '进入待处理' :
+                  assessment.action === 'monitor' ? '继续观察' : '正常'
+
+            return (
+              <Card className="rounded-xl shadow-lg border-2 border-blue-200/70">
+                <CardHeader className="pb-3 border-b bg-blue-50/70">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      <Activity className="h-5 w-5 text-blue-600" />
+                      共享 IP AI 研判
+                    </CardTitle>
+                    <Button variant="ghost" size="sm" onClick={() => setSharedIpAiResult(null)}>
+                      关闭
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="p-4 space-y-4">
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <Badge variant="outline" className="rounded font-mono">
+                      {sharedIpAiResult.case?.ip}
+                    </Badge>
+                    <Badge variant="secondary" className="rounded">
+                      窗口：{sharedIpAiResult.window || ipWindow}
+                    </Badge>
+                    {assessment.prompt_version && (
+                      <Badge variant="outline" className="rounded">
+                        Prompt：{assessment.prompt_version}
+                      </Badge>
+                    )}
+                    {(sharedIpAiResult.model || assessment.model) && (
+                      <Badge variant="outline" className="rounded">
+                        模型：{sharedIpAiResult.model || assessment.model}
+                      </Badge>
+                    )}
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-4">
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className={cn(
+                        "text-2xl font-bold",
+                        Number(assessment.risk_score || 0) >= 8 ? "text-red-600" :
+                          Number(assessment.risk_score || 0) >= 5 ? "text-amber-600" : "text-green-600"
+                      )}>
+                        {assessment.risk_score ?? 0}/10
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">风险评分</div>
+                    </div>
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className="text-2xl font-bold">
+                        {Math.round(Number(assessment.confidence || 0) * 100)}%
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">置信度</div>
+                    </div>
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className={cn(
+                        "text-lg font-bold",
+                        assessment.action === 'ban' ? "text-red-600" :
+                          assessment.action === 'review' ? "text-amber-600" : "text-blue-600"
+                      )}>
+                        {actionLabel}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">处置建议</div>
+                    </div>
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className="text-2xl font-bold text-slate-800">
+                        {stats.no_topup_user_count ?? 0}/{stats.user_count ?? 0}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">未充值账号</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border p-3 bg-muted/30">
+                    <div className="text-xs text-muted-foreground mb-1">AI 分析理由:</div>
+                    <div className="text-sm">{assessment.reason || '未返回理由'}</div>
+                  </div>
+
+                  {(evidence.length > 0 || questions.length > 0) && (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      {evidence.length > 0 && (
+                        <div className="rounded-lg border p-3 bg-white">
+                          <div className="text-xs font-medium text-muted-foreground mb-2">证据摘要</div>
+                          <div className="space-y-1">
+                            {evidence.slice(0, 6).map((item: string, idx: number) => (
+                              <div key={`shared-ip-evidence-${idx}`} className="text-xs text-slate-600">
+                                - {item}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {questions.length > 0 && (
+                        <div className="rounded-lg border p-3 bg-white">
+                          <div className="text-xs font-medium text-muted-foreground mb-2">复核问题</div>
+                          <div className="space-y-1">
+                            {questions.slice(0, 5).map((item: string, idx: number) => (
+                              <div key={`shared-ip-question-${idx}`} className="text-xs text-slate-600">
+                                - {item}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {likelyUsers.length > 0 && (
+                    <div className="rounded-lg border p-3 bg-white">
+                      <div className="text-xs font-medium text-muted-foreground mb-2">疑似小号账号</div>
+                      <div className="grid gap-2 md:grid-cols-2">
+                        {likelyUsers.slice(0, 8).map((user: any, idx: number) => (
+                          <div key={`shared-ip-likely-user-${idx}`} className="rounded-md border bg-slate-50 px-3 py-2 text-xs">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-semibold">User#{user.user_id ?? 'unknown'}</span>
+                              {user.confidence !== undefined && (
+                                <Badge variant="outline" className="rounded">
+                                  {Math.round(Number(user.confidence || 0) * 100)}%
+                                </Badge>
+                              )}
+                            </div>
+                            <div className="mt-1 text-slate-600">{user.reason || '未返回账号级理由'}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                    <Badge variant="outline" className="rounded">
+                      用户 {stats.user_count ?? 0}
+                    </Badge>
+                    <Badge variant="outline" className="rounded">
+                      未封禁 {stats.unbanned_count ?? 0}
+                    </Badge>
+                    <Badge variant="outline" className="rounded">
+                      首次跨度 {stats.first_seen_spread_seconds !== undefined ? `${Math.round(Number(stats.first_seen_spread_seconds || 0) / 60)} 分钟` : '未知'}
+                    </Badge>
+                    {assessment.false_positive_risk && (
+                      <Badge variant="outline" className="rounded">
+                        误报风险：{assessment.false_positive_risk}
+                      </Badge>
+                    )}
+                    {(sharedIpAiResult.usage?.total_tokens !== undefined || assessment.total_tokens !== undefined) && (
+                      <Badge variant="outline" className="rounded">
+                        Tokens：{sharedIpAiResult.usage?.total_tokens ?? assessment.total_tokens}
+                      </Badge>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            )
+          })()}
 
           {/* AI 审查记录 */}
           <Card className="rounded-xl shadow-sm border border-slate-200 overflow-hidden">

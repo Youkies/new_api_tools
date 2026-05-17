@@ -8,6 +8,7 @@ Performance Optimizations:
 - Removed JOIN with users table (fetch user info separately only for top N)
 - Recommended index: CREATE INDEX idx_logs_created_type_user ON logs(created_at, type, user_id);
 """
+import hashlib
 import time
 import threading
 from dataclasses import dataclass
@@ -25,6 +26,7 @@ WINDOW_SECONDS: dict[str, int] = {
     "24h": 24 * 3600,
     "3d": 3 * 24 * 3600,
     "7d": 7 * 24 * 3600,
+    "30d": 30 * 24 * 3600,
 }
 
 
@@ -1710,6 +1712,382 @@ class RiskMonitoringService:
         except Exception as e:
             logger.db_error(f"获取同 IP 注册账号失败: {e}")
             return {"items": [], "total": 0}
+
+    def get_alt_account_cases(
+        self,
+        case_type: str = "all",
+        window: str = "30d",
+        limit: int = 50,
+        offset: int = 0,
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """Generate live alt-account risk cases for Python compatibility."""
+        if window not in WINDOW_SECONDS:
+            window = "30d"
+        limit = max(1, min(limit, 200))
+        offset = max(0, offset)
+        cache_key = f"alt_account_cases:{case_type}:{window}:{limit}:{offset}"
+        if use_cache:
+            cached = _cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        cases: List[Dict[str, Any]] = []
+        if case_type in ("all", "shared_ip"):
+            cases.extend(self._build_shared_ip_alt_cases(window, limit=200))
+        if case_type in ("all", "rotating_pool"):
+            cases.extend(self._build_rotating_pool_cases(window if window in ("7d", "30d") else "30d", limit=200))
+        if case_type in ("all", "invite_chain"):
+            cases.extend(self._build_invite_chain_cases(limit=100))
+        if case_type in ("all", "token_rotation"):
+            token_data = self.get_token_rotation_users(window=window, min_tokens=5, max_requests_per_token=10, limit=100)
+            for row in token_data.get("items", []):
+                score = min(100, 35 + int(row.get("token_count") or 0) * 4)
+                cases.append({
+                    "case_id": self._alt_case_id("token_rotation", window, str(row.get("user_id") or "")),
+                    "case_type": "token_rotation",
+                    "case_type_label": "Token 轮换",
+                    "case_key": str(row.get("user_id") or ""),
+                    "primary_user_id": int(row.get("user_id") or 0),
+                    "window": window,
+                    "risk_score": score,
+                    "risk_level": self._risk_level(score),
+                    "risk_labels": ["TOKEN_ROTATION_ABUSE"],
+                    "risk_reasons": [f"窗口内使用 {int(row.get('token_count') or 0)} 个 token"],
+                    "prompt_version": "token-rotation-alt-account-v1",
+                    "user_count": 1,
+                    "request_count": int(row.get("total_requests") or 0),
+                    "token_count": int(row.get("token_count") or 0),
+                    "case_stats": row,
+                    "users": [row],
+                    "source": "token_rotation_rules",
+                })
+
+        cases.sort(key=lambda item: (int(item.get("risk_score") or 0), int(item.get("user_count") or 0)), reverse=True)
+        total = len(cases)
+        items = cases[offset:offset + limit]
+        result = {
+            "items": items,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "case_type": case_type,
+            "window": window,
+            "generated_at": int(time.time()),
+            "source": "live_rules",
+        }
+        if use_cache:
+            _cache.set(cache_key, result, _get_cache_ttl())
+        return result
+
+    def get_alt_account_case(self, case_id: str, window: str = "30d") -> Optional[Dict[str, Any]]:
+        """Find a single generated alt-account case."""
+        windows = [window]
+        if window != "30d":
+            windows.append("30d")
+        if window != "24h":
+            windows.append("24h")
+        for w in windows:
+            data = self.get_alt_account_cases(case_type="all", window=w, limit=200, offset=0, use_cache=False)
+            for item in data.get("items", []):
+                if item.get("case_id") == case_id:
+                    item["detail_loaded_at"] = int(time.time())
+                    return item
+        return None
+
+    def _build_shared_ip_alt_cases(self, window: str, limit: int = 200) -> List[Dict[str, Any]]:
+        seconds = WINDOW_SECONDS.get(window, WINDOW_SECONDS["24h"])
+        start_time = int(time.time()) - seconds
+        sql = """
+            SELECT l.ip,
+                   COUNT(DISTINCT l.user_id) as user_count,
+                   COUNT(DISTINCT l.token_id) as token_count,
+                   COUNT(DISTINCT CASE WHEN u.status = 2 THEN l.user_id ELSE NULL END) as banned_count,
+                   COUNT(DISTINCT CASE WHEN COALESCE(u.status, 0) <> 2 THEN l.user_id ELSE NULL END) as unbanned_count,
+                   COUNT(*) as request_count
+            FROM logs l
+            LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+            WHERE l.created_at >= :start_time
+              AND l.ip IS NOT NULL AND l.ip <> ''
+              AND l.user_id IS NOT NULL
+            GROUP BY l.ip
+            HAVING COUNT(DISTINCT l.user_id) >= 2
+            ORDER BY user_count DESC, request_count DESC
+            LIMIT :limit
+        """
+        try:
+            rows = self.db.execute(sql, {"start_time": start_time, "limit": limit})
+        except Exception:
+            return []
+
+        items: List[Dict[str, Any]] = []
+        for row in rows:
+            ip = row.get("ip") or ""
+            users = self._fetch_ip_users(ip, start_time, limit=80)
+            no_topup = sum(1 for user in users if int(user.get("topup_count") or 0) <= 0)
+            first_seen_values = [int(user.get("first_seen") or 0) for user in users if int(user.get("first_seen") or 0) > 0]
+            spread = max(first_seen_values) - min(first_seen_values) if len(first_seen_values) >= 2 else 0
+            stats = {
+                "user_count": int(row.get("user_count") or 0),
+                "token_count": int(row.get("token_count") or 0),
+                "request_count": int(row.get("request_count") or 0),
+                "banned_count": int(row.get("banned_count") or 0),
+                "unbanned_count": int(row.get("unbanned_count") or 0),
+                "no_topup_user_count": no_topup,
+                "first_seen_spread_seconds": spread,
+            }
+            score = min(100, stats["user_count"] * 8 + no_topup * 4 + (16 if spread and spread <= 3600 else 0))
+            reasons = [f"同一 IP 聚集 {stats['user_count']} 个用户"]
+            if no_topup:
+                reasons.append(f"{no_topup} 个账号未发现成功充值")
+            if spread and spread <= 86400:
+                reasons.append("多个账号首次出现时间集中")
+            items.append({
+                "case_id": self._alt_case_id("shared_ip", window, ip),
+                "case_type": "shared_ip",
+                "case_type_label": "共享 IP 小号",
+                "case_key": ip,
+                "primary_ip": ip,
+                "primary_ip_masked": self._mask_ip(ip),
+                "window": window,
+                "risk_score": score,
+                "risk_level": self._risk_level(score),
+                "risk_labels": ["MULTI_USER_SHARED_IP", "FREE_QUOTA_FARMING"],
+                "risk_reasons": reasons,
+                "prompt_version": "shared-ip-alt-account-v1",
+                "user_count": stats["user_count"],
+                "request_count": stats["request_count"],
+                "token_count": stats["token_count"],
+                "no_topup_count": no_topup,
+                "first_seen": min(first_seen_values) if first_seen_values else 0,
+                "last_seen": max(int(user.get("last_seen") or 0) for user in users) if users else 0,
+                "case_stats": stats,
+                "users": users,
+                "source": "shared_ip_rules",
+            })
+        return items
+
+    def _build_rotating_pool_cases(self, window: str, limit: int = 200) -> List[Dict[str, Any]]:
+        seconds = WINDOW_SECONDS.get(window, WINDOW_SECONDS["30d"])
+        start_time = int(time.time()) - seconds
+        sql = """
+            SELECT l.ip, l.user_id,
+                   COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), '') as username,
+                   COALESCE(MAX(u.status), 0) as status,
+                   COALESCE(MAX(u.role), 0) as role,
+                   COALESCE(MAX(u.used_quota), 0) as used_quota,
+                   COALESCE(MAX(u.request_count), 0) as total_request_count,
+                   COUNT(*) as request_count,
+                   COUNT(DISTINCT FLOOR(l.created_at / 86400)) as active_days,
+                   COUNT(DISTINCT l.token_id) as token_count,
+                   COALESCE(SUM(CASE WHEN l.type = 2 THEN l.quota ELSE 0 END), 0) as window_quota,
+                   MIN(l.created_at) as first_seen,
+                   MAX(l.created_at) as last_seen
+            FROM logs l
+            LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+            WHERE l.created_at >= :start_time
+              AND l.type IN (2, 5)
+              AND l.ip IS NOT NULL AND l.ip <> ''
+              AND l.user_id IS NOT NULL
+            GROUP BY l.ip, l.user_id
+            ORDER BY l.ip, first_seen
+        """
+        try:
+            rows = self.db.execute(sql, {"start_time": start_time})
+        except Exception:
+            return []
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            grouped.setdefault(row.get("ip") or "", []).append({k: v for k, v in row.items() if k != "ip"})
+
+        cases: List[Dict[str, Any]] = []
+        for ip, users in grouped.items():
+            if len(users) < 8:
+                continue
+            active_days = sorted(int(user.get("active_days") or 0) for user in users)
+            median = active_days[len(active_days) // 2] if active_days else 0
+            no_topup = 0
+            # Best-effort topup check; absence of table or query failure keeps value conservative.
+            for user in users:
+                user["topup_count"] = self._get_user_topup_count(int(user.get("user_id") or 0))
+                if int(user.get("topup_count") or 0) <= 0:
+                    no_topup += 1
+            sequential = self._sequential_score(users)
+            if median > 2 and sequential < 0.45:
+                continue
+            request_count = sum(int(user.get("request_count") or 0) for user in users)
+            token_count = sum(int(user.get("token_count") or 0) for user in users)
+            score = min(100, len(users) * 4 + (18 if median <= 1 else 10) + int(sequential * 20) + no_topup * 3)
+            if score < 45:
+                continue
+            reasons = [f"窗口内同一 IP 关联 {len(users)} 个候选账号", f"活跃日中位数 {median} 天"]
+            if sequential >= 0.45:
+                reasons.append("账号首次出现存在接力特征")
+            if no_topup:
+                reasons.append(f"{no_topup} 个账号无成功充值")
+            cases.append({
+                "case_id": self._alt_case_id("rotating_pool", window, ip),
+                "case_type": "rotating_pool",
+                "case_type_label": "轮换小号池",
+                "case_key": ip,
+                "primary_ip": ip,
+                "primary_ip_masked": self._mask_ip(ip),
+                "window": window,
+                "risk_score": score,
+                "risk_level": self._risk_level(score),
+                "risk_labels": ["ROTATING_ALT_ACCOUNT_POOL", "FREE_QUOTA_FARMING"],
+                "risk_reasons": reasons,
+                "prompt_version": "rotating-alt-account-pool-v1",
+                "user_count": len(users),
+                "request_count": request_count,
+                "token_count": token_count,
+                "no_topup_count": no_topup,
+                "first_seen": min(int(user.get("first_seen") or 0) for user in users),
+                "last_seen": max(int(user.get("last_seen") or 0) for user in users),
+                "case_stats": {
+                    "user_count": len(users),
+                    "request_count": request_count,
+                    "token_count": token_count,
+                    "no_topup_count": no_topup,
+                    "active_days_median": median,
+                    "sequential_activation_score": round(sequential, 2),
+                },
+                "users": users[:80],
+                "source": "rotating_pool_rules",
+            })
+        return sorted(cases, key=lambda item: item["risk_score"], reverse=True)[:limit]
+
+    def _build_invite_chain_cases(self, limit: int = 100) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT inviter_id,
+                   COUNT(*) as user_count,
+                   SUM(CASE WHEN COALESCE(request_count, 0) > 0 THEN 1 ELSE 0 END) as active_user_count,
+                   COALESCE(SUM(used_quota), 0) as used_quota,
+                   COALESCE(SUM(request_count), 0) as request_count
+            FROM users
+            WHERE deleted_at IS NULL AND inviter_id IS NOT NULL AND inviter_id > 0
+            GROUP BY inviter_id
+            HAVING COUNT(*) >= 5
+            ORDER BY user_count DESC
+            LIMIT :limit
+        """
+        try:
+            rows = self.db.execute(sql, {"limit": limit})
+        except Exception:
+            return []
+        cases: List[Dict[str, Any]] = []
+        for row in rows:
+            inviter_id = int(row.get("inviter_id") or 0)
+            users = self._fetch_invited_users(inviter_id, 80)
+            no_topup = sum(1 for user in users if int(user.get("topup_count") or 0) <= 0)
+            score = min(100, int(row.get("user_count") or 0) * 5 + no_topup * 3)
+            cases.append({
+                "case_id": self._alt_case_id("invite_chain", "30d", str(inviter_id)),
+                "case_type": "invite_chain",
+                "case_type_label": "邀请链小号",
+                "case_key": str(inviter_id),
+                "primary_inviter_id": inviter_id,
+                "window": "30d",
+                "risk_score": score,
+                "risk_level": self._risk_level(score),
+                "risk_labels": ["INVITE_CHAIN_ALT_ACCOUNTS", "FREE_QUOTA_FARMING"],
+                "risk_reasons": [f"同一邀请人关联 {int(row.get('user_count') or 0)} 个账号", f"{no_topup} 个账号无成功充值"],
+                "prompt_version": "invite-chain-alt-account-v1",
+                "user_count": int(row.get("user_count") or 0),
+                "request_count": int(row.get("request_count") or 0),
+                "no_topup_count": no_topup,
+                "case_stats": row,
+                "users": users,
+                "source": "invite_chain_rules",
+            })
+        return cases
+
+    def _fetch_ip_users(self, ip: str, start_time: int, limit: int = 80) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT l.user_id,
+                   COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), NULLIF(MAX(l.username), ''), '') as username,
+                   COALESCE(MAX(u.status), 0) as status,
+                   COALESCE(MAX(u.used_quota), 0) as used_quota,
+                   COALESCE(MAX(u.request_count), 0) as total_request_count,
+                   COUNT(DISTINCT l.token_id) as token_count,
+                   COUNT(*) as request_count,
+                   MIN(l.created_at) as first_seen,
+                   MAX(l.created_at) as last_seen
+            FROM logs l
+            LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+            WHERE l.created_at >= :start_time AND l.ip = :ip AND l.user_id IS NOT NULL
+            GROUP BY l.user_id
+            ORDER BY request_count DESC
+            LIMIT :limit
+        """
+        try:
+            rows = self.db.execute(sql, {"ip": ip, "start_time": start_time, "limit": limit})
+        except Exception:
+            return []
+        for row in rows:
+            row["topup_count"] = self._get_user_topup_count(int(row.get("user_id") or 0))
+        return rows
+
+    def _fetch_invited_users(self, inviter_id: int, limit: int = 80) -> List[Dict[str, Any]]:
+        sql = """
+            SELECT id as user_id, COALESCE(NULLIF(display_name, ''), NULLIF(username, ''), '') as username,
+                   status, role, used_quota, request_count as total_request_count
+            FROM users
+            WHERE deleted_at IS NULL AND inviter_id = :inviter_id
+            ORDER BY request_count DESC
+            LIMIT :limit
+        """
+        try:
+            rows = self.db.execute(sql, {"inviter_id": inviter_id, "limit": limit})
+        except Exception:
+            return []
+        for row in rows:
+            row["topup_count"] = self._get_user_topup_count(int(row.get("user_id") or 0))
+        return rows
+
+    def _get_user_topup_count(self, user_id: int) -> int:
+        if user_id <= 0:
+            return 0
+        try:
+            rows = self.db.execute("""
+                SELECT COUNT(*) as cnt
+                FROM top_ups
+                WHERE user_id = :user_id
+                  AND LOWER(CAST(status AS CHAR)) IN ('success', 'completed', '1')
+            """, {"user_id": user_id})
+            return int(rows[0].get("cnt") or 0) if rows else 0
+        except Exception:
+            return 0
+
+    def _sequential_score(self, users: List[Dict[str, Any]]) -> float:
+        ordered = sorted(users, key=lambda item: int(item.get("first_seen") or 0))
+        if len(ordered) < 2:
+            return 0.0
+        hits = 0
+        for idx in range(1, len(ordered)):
+            gap = int(ordered[idx].get("first_seen") or 0) - int(ordered[idx - 1].get("first_seen") or 0)
+            if 6 * 3600 <= gap <= 72 * 3600:
+                hits += 1
+        return hits / max(1, len(ordered) - 1)
+
+    def _alt_case_id(self, case_type: str, window: str, key: str) -> str:
+        digest = hashlib.sha1(f"{case_type}|{window}|{key}".encode("utf-8")).hexdigest()[:12]
+        return f"{case_type}_{window}_{digest}"
+
+    def _mask_ip(self, ip: str) -> str:
+        parts = str(ip or "").split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.*.*"
+        return "iphash:" + hashlib.sha1(str(ip).encode("utf-8")).hexdigest()[:10] if ip else ""
+
+    def _risk_level(self, score: int) -> str:
+        if score >= 85:
+            return "critical"
+        if score >= 65:
+            return "high"
+        if score >= 40:
+            return "medium"
+        return "low"
 
 
 _risk_monitoring_service: Optional[RiskMonitoringService] = None
