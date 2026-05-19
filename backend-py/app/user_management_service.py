@@ -907,6 +907,149 @@ class UserManagementService:
             logger.db_error(f"删除用户失败: {e}")
             return {"success": False, "message": f"删除失败: {str(e)}"}
 
+    def search_soft_deleted_users(self, email: str, limit: int = 20) -> Dict[str, Any]:
+        """
+        按注册邮箱检索已软删除（注销）的用户。
+        """
+        email = (email or "").strip()
+        if len(email) < 3:
+            return {"success": False, "message": "邮箱关键词至少需要 3 个字符"}
+
+        limit = max(1, min(limit, 50))
+
+        try:
+            self._db.connect()
+
+            from .database import DatabaseEngine
+            is_pg = self._db.config.engine == DatabaseEngine.POSTGRESQL
+            group_col = '"group"' if is_pg else '`group`'
+            email_clause = "COALESCE(u.email, '') ILIKE :email" if is_pg else "LOWER(COALESCE(u.email, '')) LIKE LOWER(:email)"
+
+            sql = f"""
+                SELECT
+                    u.id, u.username, u.display_name, u.email, u.status, u.role,
+                    u.quota, u.used_quota, u.request_count, {group_col} as user_group,
+                    u.deleted_at,
+                    (SELECT COUNT(*) FROM tokens t WHERE t.user_id = u.id AND t.deleted_at IS NOT NULL) as deleted_token_count
+                FROM users u
+                WHERE u.deleted_at IS NOT NULL
+                  AND COALESCE(u.email, '') != ''
+                  AND {email_clause}
+                ORDER BY u.deleted_at DESC
+                LIMIT :limit
+            """
+            rows = self._db.execute(sql, {"email": f"%{email}%", "limit": limit})
+            items = []
+            for row in rows:
+                deleted_at = row.get("deleted_at")
+                items.append({
+                    "id": int(row.get("id") or 0),
+                    "username": row.get("username") or "",
+                    "display_name": row.get("display_name"),
+                    "email": row.get("email") or "",
+                    "status": int(row.get("status") or 0),
+                    "role": int(row.get("role") or 0),
+                    "quota": int(row.get("quota") or 0),
+                    "used_quota": int(row.get("used_quota") or 0),
+                    "request_count": int(row.get("request_count") or 0),
+                    "group": row.get("user_group") or "",
+                    "deleted_at": deleted_at.isoformat() if hasattr(deleted_at, "isoformat") else str(deleted_at or ""),
+                    "deleted_token_count": int(row.get("deleted_token_count") or 0),
+                })
+
+            return {
+                "success": True,
+                "items": items,
+                "total": len(items),
+            }
+        except Exception as e:
+            logger.db_error(f"检索已注销用户失败: {e}")
+            return {"success": False, "message": f"检索失败: {str(e)}"}
+
+    def restore_soft_deleted_user(
+        self,
+        user_id: Optional[int] = None,
+        email: Optional[str] = None,
+        restore_tokens: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        恢复已软删除（注销）的用户，并可同步恢复软删除的 token。
+        """
+        email = (email or "").strip()
+        if not user_id and not email:
+            return {"success": False, "message": "需要提供用户 ID 或注册邮箱"}
+
+        try:
+            self._db.connect()
+
+            if user_id:
+                rows = self._db.execute(
+                    """
+                    SELECT id, username, display_name, email, status, deleted_at
+                    FROM users
+                    WHERE id = :user_id AND deleted_at IS NOT NULL
+                    LIMIT 1
+                    """,
+                    {"user_id": user_id},
+                )
+            else:
+                rows = self._db.execute(
+                    """
+                    SELECT id, username, display_name, email, status, deleted_at
+                    FROM users
+                    WHERE deleted_at IS NOT NULL AND LOWER(COALESCE(email, '')) = LOWER(:email)
+                    LIMIT 2
+                    """,
+                    {"email": email},
+                )
+
+            if not rows:
+                return {"success": False, "message": "未找到已注销用户"}
+            if not user_id and len(rows) > 1:
+                return {"success": False, "message": "该邮箱匹配多个已注销用户，请先选择具体用户"}
+
+            user = rows[0]
+            target_user_id = int(user.get("id") or 0)
+            result = self._db.execute(
+                "UPDATE users SET deleted_at = NULL WHERE id = :user_id AND deleted_at IS NOT NULL",
+                {"user_id": target_user_id},
+            )
+            user_affected = int(result[0].get("affected_rows", 0)) if result else 0
+            if user_affected == 0:
+                return {"success": False, "message": "用户已恢复或不存在"}
+
+            tokens_affected = 0
+            if restore_tokens:
+                token_result = self._db.execute(
+                    "UPDATE tokens SET deleted_at = NULL WHERE user_id = :user_id AND deleted_at IS NOT NULL",
+                    {"user_id": target_user_id},
+                )
+                tokens_affected = int(token_result[0].get("affected_rows", 0)) if token_result else 0
+
+            # 清除统计缓存和活跃度列表缓存
+            self._storage.cache_delete(STATS_CACHE_KEY)
+            self.invalidate_activity_list_cache()
+
+            username = user.get("username") or f"用户{target_user_id}"
+            logger.business("恢复注销用户", user_id=target_user_id, username=username, tokens_affected=tokens_affected)
+            return {
+                "success": True,
+                "message": f"用户 {username} 已恢复",
+                "user": {
+                    "id": target_user_id,
+                    "username": username,
+                    "display_name": user.get("display_name"),
+                    "email": user.get("email") or "",
+                    "status": int(user.get("status") or 0),
+                },
+                "user_affected": user_affected,
+                "tokens_affected": tokens_affected,
+                "restore_tokens": restore_tokens,
+            }
+        except Exception as e:
+            logger.db_error(f"恢复注销用户失败: {e}")
+            return {"success": False, "message": f"恢复失败: {str(e)}"}
+
     def batch_delete_inactive_users(
         self,
         activity_level: ActivityLevel = ActivityLevel.VERY_INACTIVE,

@@ -528,6 +528,133 @@ func (s *UserManagementService) DeleteUser(userID int64, hardDelete bool) (int64
 	return affected, nil
 }
 
+// SearchSoftDeletedUsers finds soft-deleted users by registration email.
+func (s *UserManagementService) SearchSoftDeletedUsers(email string, limit int) (map[string]interface{}, error) {
+	email = strings.TrimSpace(email)
+	if len(email) < 3 {
+		return nil, fmt.Errorf("email keyword must be at least 3 characters")
+	}
+	if limit < 1 || limit > 50 {
+		limit = 20
+	}
+
+	groupCol := "`group`"
+	if s.db.IsPG {
+		groupCol = `"group"`
+	}
+
+	query := s.db.RebindQuery(fmt.Sprintf(`
+		SELECT
+			u.id, u.username, u.display_name, u.email, u.status, u.role,
+			u.quota, u.used_quota, u.request_count, u.%s as user_group,
+			u.deleted_at,
+			(SELECT COUNT(*) FROM tokens t WHERE t.user_id = u.id AND t.deleted_at IS NOT NULL) as deleted_token_count
+		FROM users u
+		WHERE u.deleted_at IS NOT NULL
+		  AND COALESCE(u.email, '') <> ''
+		  AND LOWER(COALESCE(u.email, '')) LIKE LOWER(?)
+		ORDER BY u.deleted_at DESC
+		LIMIT ?`, groupCol))
+
+	rows, err := s.db.Query(query, "%"+email+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	if rows == nil {
+		rows = []map[string]interface{}{}
+	}
+	for _, row := range rows {
+		row["id"] = toInt64(row["id"])
+		row["status"] = toInt64(row["status"])
+		row["role"] = toInt64(row["role"])
+		row["quota"] = toInt64(row["quota"])
+		row["used_quota"] = toInt64(row["used_quota"])
+		row["request_count"] = toInt64(row["request_count"])
+		row["deleted_token_count"] = toInt64(row["deleted_token_count"])
+		row["username"] = toString(row["username"])
+		row["display_name"] = toString(row["display_name"])
+		row["email"] = toString(row["email"])
+		row["group"] = toString(row["user_group"])
+		row["deleted_at"] = toString(row["deleted_at"])
+		delete(row, "user_group")
+	}
+
+	return map[string]interface{}{
+		"items": rows,
+		"total": len(rows),
+	}, nil
+}
+
+// RestoreSoftDeletedUser restores a soft-deleted user and optionally soft-deleted tokens.
+func (s *UserManagementService) RestoreSoftDeletedUser(userID int64, email string, restoreTokens bool) (map[string]interface{}, error) {
+	email = strings.TrimSpace(email)
+	if userID <= 0 && email == "" {
+		return nil, fmt.Errorf("user_id or email is required")
+	}
+
+	var rows []map[string]interface{}
+	var err error
+	if userID > 0 {
+		rows, err = s.db.Query(s.db.RebindQuery(`
+			SELECT id, username, display_name, email, status, deleted_at
+			FROM users
+			WHERE id = ? AND deleted_at IS NOT NULL
+			LIMIT 1`), userID)
+	} else {
+		rows, err = s.db.Query(s.db.RebindQuery(`
+			SELECT id, username, display_name, email, status, deleted_at
+			FROM users
+			WHERE deleted_at IS NOT NULL AND LOWER(COALESCE(email, '')) = LOWER(?)
+			LIMIT 2`), email)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(rows) == 0 {
+		return nil, fmt.Errorf("未找到已注销用户")
+	}
+	if userID <= 0 && len(rows) > 1 {
+		return nil, fmt.Errorf("该邮箱匹配多个已注销用户，请先选择具体用户")
+	}
+
+	userRow := rows[0]
+	targetUserID := toInt64(userRow["id"])
+	affected, err := s.db.Execute(s.db.RebindQuery(
+		"UPDATE users SET deleted_at = NULL WHERE id = ? AND deleted_at IS NOT NULL"), targetUserID)
+	if err != nil {
+		return nil, err
+	}
+	if affected == 0 {
+		return nil, fmt.Errorf("用户已恢复或不存在")
+	}
+
+	tokensAffected := int64(0)
+	if restoreTokens {
+		tokensAffected, err = s.db.Execute(s.db.RebindQuery(
+			"UPDATE tokens SET deleted_at = NULL WHERE user_id = ? AND deleted_at IS NOT NULL"), targetUserID)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	username := toString(userRow["username"])
+	logger.L.Business(fmt.Sprintf("用户 %d 已恢复", targetUserID))
+
+	return map[string]interface{}{
+		"user": map[string]interface{}{
+			"id":           targetUserID,
+			"username":     username,
+			"display_name": toString(userRow["display_name"]),
+			"email":        toString(userRow["email"]),
+			"status":       toInt64(userRow["status"]),
+		},
+		"user_affected":   affected,
+		"tokens_affected": tokensAffected,
+		"restore_tokens":  restoreTokens,
+		"message":         fmt.Sprintf("用户 %s 已恢复", username),
+	}, nil
+}
+
 func (s *UserManagementService) addSecurityAudit(action string, userID int64, username, operator, reason string, context map[string]interface{}) {
 	if context == nil {
 		context = map[string]interface{}{}

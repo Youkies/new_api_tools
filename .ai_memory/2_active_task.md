@@ -9,6 +9,7 @@
 - 数据库只读校验：已确认当前 MySQL 库包含 `logs/users/tokens/top_ups/channels/abilities/options` 等核心表，`logs` 约 38.98 万行；本地 `数据库地址*` 已加入 `.gitignore`，避免误提交连接信息。
 - 用户管理：保留前一轮“批量注销不活跃用户”口径，已收紧为“未成功充值且从未调用过”，Go/Python/前端均已同步。
   - 2026-05-17 修复 Go `/api/users` 未应用 `inactive/very_inactive` 活跃度筛选的问题；列表现在按 7d/30d 请求窗口筛选，并返回准确 `activity_level` 与 `last_request_time`。
+  - 2026-05-19 新增已注销账号恢复入口：Go/Python 新增 `/api/users/soft-deleted/search`、`/api/users/soft-deleted/restore`，前端用户管理页支持按注册邮箱检索已注销账号并恢复，默认同步恢复该账号已软删除的 token。
 - 仪表盘：
   - Go/Python 新增 `/api/dashboard/snapshot`。
   - 前端首屏优先使用 snapshot，展示 `snapshot_time`、`cache_hit`、最新日志时间和滞后秒数。
@@ -39,6 +40,7 @@
 - `python -m py_compile backend-py\app\dashboard_routes.py backend-py\app\risk_monitoring_routes.py backend-py\app\risk_monitoring_service.py backend-py\app\log_analytics_routes.py backend-py\app\cache_manager.py backend-py\app\user_management_service.py backend-py\app\user_management_routes.py`
 - `go test ./...`（`backend/`）
 - `npm run build`（`frontend/`）
+- 2026-05-19 注销账号恢复功能验证：`go test ./...`（`backend/`）、`python -m py_compile backend-py\app\user_management_service.py backend-py\app\user_management_routes.py`、`npm run build`（`frontend/`）均通过；前端构建仍只有既有 CSS minify/chunk size 警告；Vite 本地服务 `http://127.0.0.1:5173` 已启动并返回 HTTP 200。
 - 2026-05-17 用户管理筛选修复验证：`go test ./...`、`python -m py_compile backend-py\app\user_management_service.py backend-py\app\user_management_routes.py`、`npm run build` 均通过；真实库只读计数验证 `active/inactive/very_inactive/never` 均可按 SQL 条件区分。
 - 2026-05-17 共享 IP AI 研判真实效果检验：只读读取真实 MySQL 24h 共享 IP 样本，使用 `https://newapi.youkies.space/` 可见模型 `「按量」gpt-5.5` 调用成功；选中高风险 IP 样本 15 用户/15 未充值/首次跨度约 4171 秒，AI 给出高风险但建议先复核，验证出 schema 归一化需求并已加固；当前管理员风控口径为完整 IP 可见且可发送给 AI。
 - 2026-05-17 小号风险案件 v1 真实效果检验：30d live rules 生成 127 个候选案件；24h 共享 IP 样本为 15 用户/15 未充值/15 token/18 请求，通用案件 AI 研判返回 86 分、`review`、置信度 0.78，耗时约 73 秒。验证时发现 PowerShell 非 UTF-8 请求体会把中文模型 ID 传成问号，浏览器和 Go 后端应保持 UTF-8 JSON。
@@ -52,4 +54,4 @@
 - 运营预警下一阶段可将“已处理/忽略/观察中”从前端 localStorage 升级为服务端持久化，并增加阈值配置页。
 - 真正的 `api_tools_usage_rollup_hourly/daily` 增量聚合表仍未落地。
 - 日志分析的失败率、耗时、消费突增异常视图仍未新增。
-- 本轮尚未启动本地服务做浏览器交互验收。
+- 2026-05-19 本轮已启动 Vite 本地服务并完成首页 HTTP 200 检查；尚未连接真实后端账号做恢复接口的 live 数据库操作。

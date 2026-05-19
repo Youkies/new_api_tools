@@ -93,6 +93,21 @@ interface UserInfo {
   source?: string
 }
 
+interface SoftDeletedUserInfo {
+  id: number
+  username: string
+  display_name: string | null
+  email: string
+  role: number
+  status: number
+  quota: number
+  used_quota: number
+  request_count: number
+  group: string | null
+  deleted_at: string | null
+  deleted_token_count: number
+}
+
 interface BatchMoveUserResult {
   user_id: number
   username: string
@@ -144,6 +159,11 @@ export function UserManagement() {
   // 软删除用户清理
   const [softDeletedCount, setSoftDeletedCount] = useState(0)
   const [purgingSoftDeleted, setPurgingSoftDeleted] = useState(false)
+  const [restoreEmail, setRestoreEmail] = useState('')
+  const [restoreResults, setRestoreResults] = useState<SoftDeletedUserInfo[]>([])
+  const [restoreSearching, setRestoreSearching] = useState(false)
+  const [restoreUserId, setRestoreUserId] = useState<number | null>(null)
+  const [restoreTokens, setRestoreTokens] = useState(true)
 
   const [confirmDialog, setConfirmDialog] = useState<{
     isOpen: boolean
@@ -259,6 +279,63 @@ export function UserManagement() {
       console.error('Failed to fetch soft deleted count:', error)
     }
   }, [apiUrl, getAuthHeaders])
+
+  const searchSoftDeletedUsers = async () => {
+    const email = restoreEmail.trim()
+    if (email.length < 3) {
+      showToast('error', '请输入至少 3 个字符的注册邮箱')
+      return
+    }
+    setRestoreSearching(true)
+    try {
+      const params = new URLSearchParams({ email, limit: '20' })
+      const response = await fetch(`${apiUrl}/api/users/soft-deleted/search?${params}`, { headers: getAuthHeaders() })
+      const data = await response.json()
+      if (data.success) {
+        const items = data.data?.items || []
+        setRestoreResults(items)
+        if (items.length === 0) {
+          showToast('info', '没有找到已注销账号')
+        }
+      } else {
+        setRestoreResults([])
+        showToast('error', data.message || data.error?.message || '检索失败')
+      }
+    } catch (error) {
+      console.error('Failed to search soft deleted users:', error)
+      setRestoreResults([])
+      showToast('error', '检索失败')
+    } finally {
+      setRestoreSearching(false)
+    }
+  }
+
+  const restoreSoftDeletedUser = async (user: SoftDeletedUserInfo) => {
+    setRestoreUserId(user.id)
+    try {
+      const response = await fetch(`${apiUrl}/api/users/soft-deleted/restore`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({
+          user_id: user.id,
+          restore_tokens: restoreTokens,
+        }),
+      })
+      const data = await response.json()
+      if (data.success) {
+        showToast('success', data.message || `已恢复 ${user.username}`)
+        setRestoreResults(prev => prev.filter(item => item.id !== user.id))
+        await Promise.all([fetchSoftDeletedCount(), fetchStats(false), fetchUsers()])
+      } else {
+        showToast('error', data.message || data.error?.message || '恢复失败')
+      }
+    } catch (error) {
+      console.error('Failed to restore soft deleted user:', error)
+      showToast('error', '恢复失败')
+    } finally {
+      setRestoreUserId(null)
+    }
+  }
 
   // 获取可用分组列表
   const fetchGroups = useCallback(async () => {
@@ -709,6 +786,19 @@ export function UserManagement() {
 
   const formatQuota = (quota: number) => `$${(quota / 500000).toFixed(2)}`
 
+  const formatDeletedAt = (value: string | null) => {
+    if (!value) return '-'
+    const date = new Date(value)
+    if (Number.isNaN(date.getTime())) return value
+    return date.toLocaleString('zh-CN', {
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+    })
+  }
+
   // 格式化最后请求时间
   // 快速模式下 last_request_time 为 null，根据 request_count 判断
   const formatLastRequest = (user: UserInfo) => {
@@ -906,6 +996,107 @@ export function UserManagement() {
                     彻底清理注销用户 ({softDeletedCount})
                   </Button>
                 </div>
+              </div>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Restore Soft Deleted User */}
+      <Card className="border-emerald-200 bg-emerald-50 dark:bg-emerald-950/20 dark:border-emerald-900">
+        <CardContent className="p-4">
+          <div className="flex flex-col gap-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div className="flex items-center gap-3">
+                <div className="p-2 bg-emerald-100 dark:bg-emerald-900 rounded-lg">
+                  <RotateCcw className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
+                </div>
+                <div>
+                  <h3 className="font-medium text-emerald-800 dark:text-emerald-200">恢复已注销账号</h3>
+                  <p className="text-sm text-emerald-700 dark:text-emerald-300">按注册邮箱检索，只恢复仍保留在数据库中的软删除账号</p>
+                </div>
+              </div>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <div className="relative w-full sm:w-80">
+                  <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+                  <Input
+                    value={restoreEmail}
+                    onChange={(e) => setRestoreEmail(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') searchSoftDeletedUsers()
+                    }}
+                    placeholder="注册邮箱"
+                    className="pl-9 bg-background"
+                  />
+                </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="border-emerald-300 text-emerald-700 hover:bg-emerald-100 hover:text-emerald-800 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-900"
+                  onClick={searchSoftDeletedUsers}
+                  disabled={restoreSearching}
+                >
+                  {restoreSearching ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Search className="h-4 w-4 mr-2" />}
+                  检索
+                </Button>
+              </div>
+            </div>
+
+            <label className="flex items-center gap-2 text-sm text-emerald-800 dark:text-emerald-200">
+              <input
+                type="checkbox"
+                checked={restoreTokens}
+                onChange={(e) => setRestoreTokens(e.target.checked)}
+                className="h-4 w-4 rounded border-input text-primary focus-visible:ring-2 focus-visible:ring-ring"
+              />
+              同时恢复该账号已软删除的令牌
+            </label>
+
+            {restoreResults.length > 0 && (
+              <div className="overflow-hidden rounded-md border border-emerald-200 bg-background dark:border-emerald-900">
+                <Table>
+                  <TableHeader className="bg-emerald-50 dark:bg-emerald-950/30">
+                    <TableRow>
+                      <TableHead className="w-16">ID</TableHead>
+                      <TableHead>用户</TableHead>
+                      <TableHead className="hidden md:table-cell">邮箱</TableHead>
+                      <TableHead className="hidden lg:table-cell">注销时间</TableHead>
+                      <TableHead className="hidden sm:table-cell text-right">余额</TableHead>
+                      <TableHead className="hidden md:table-cell text-right">令牌</TableHead>
+                      <TableHead className="w-24 text-right">操作</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {restoreResults.map((item) => (
+                      <TableRow key={item.id}>
+                        <TableCell className="font-mono text-xs text-muted-foreground">{item.id}</TableCell>
+                        <TableCell>
+                          <div className="flex flex-col">
+                            <span className="font-medium">{item.username}</span>
+                            <span className="text-xs text-muted-foreground">{item.display_name || item.group || 'default'}</span>
+                            <span className="text-xs text-muted-foreground md:hidden">{item.email}</span>
+                          </div>
+                        </TableCell>
+                        <TableCell className="hidden md:table-cell text-xs">{item.email}</TableCell>
+                        <TableCell className="hidden lg:table-cell text-xs text-muted-foreground">{formatDeletedAt(item.deleted_at)}</TableCell>
+                        <TableCell className="hidden sm:table-cell text-right font-mono text-xs">{formatQuota(item.quota)}</TableCell>
+                        <TableCell className="hidden md:table-cell text-right text-xs">{item.deleted_token_count}</TableCell>
+                        <TableCell className="text-right">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="h-8 border-emerald-300 text-emerald-700 hover:bg-emerald-100 hover:text-emerald-800 dark:border-emerald-800 dark:text-emerald-300 dark:hover:bg-emerald-900"
+                            onClick={() => restoreSoftDeletedUser(item)}
+                            disabled={restoreUserId === item.id}
+                          >
+                            {restoreUserId === item.id ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RotateCcw className="h-4 w-4 mr-2" />}
+                            恢复
+                          </Button>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
               </div>
             )}
           </div>

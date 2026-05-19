@@ -294,6 +294,58 @@ class PurgeSoftDeletedRequest(BaseModel):
     dry_run: bool = True  # 预览模式
 
 
+class RestoreSoftDeletedRequest(BaseModel):
+    """恢复软删除用户请求"""
+    user_id: Optional[int] = None
+    email: Optional[str] = None
+    restore_tokens: bool = True
+
+
+@router.get("/soft-deleted/search", response_model=UserListResponse)
+async def search_soft_deleted_users(
+    email: str = Query(..., description="注册邮箱关键词"),
+    limit: int = Query(default=20, ge=1, le=50, description="返回数量"),
+    _: str = Depends(verify_auth),
+):
+    """按注册邮箱检索已注销用户。"""
+    service = get_user_management_service()
+    result = service.search_soft_deleted_users(email=email, limit=limit)
+
+    return UserListResponse(
+        success=result["success"],
+        data={
+            "items": result.get("items", []),
+            "total": result.get("total", 0),
+            "message": result.get("message", ""),
+        },
+    )
+
+
+@router.post("/soft-deleted/restore", response_model=DeleteResponse)
+async def restore_soft_deleted_user(
+    request: RestoreSoftDeletedRequest,
+    _: str = Depends(verify_auth),
+):
+    """恢复已注销用户，并可同步恢复软删除的 token。"""
+    service = get_user_management_service()
+    result = service.restore_soft_deleted_user(
+        user_id=request.user_id,
+        email=request.email,
+        restore_tokens=request.restore_tokens,
+    )
+
+    return DeleteResponse(
+        success=result["success"],
+        message=result["message"],
+        data={
+            "user": result.get("user"),
+            "user_affected": result.get("user_affected", 0),
+            "tokens_affected": result.get("tokens_affected", 0),
+            "restore_tokens": result.get("restore_tokens", request.restore_tokens),
+        } if result["success"] else None,
+    )
+
+
 @router.get("/soft-deleted/count", response_model=DeleteResponse)
 async def get_soft_deleted_count(
     _: str = Depends(verify_auth),

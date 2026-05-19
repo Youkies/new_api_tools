@@ -14,6 +14,7 @@
 - Go 正式后端已支持自动分组后台定时扫描：启动后按 `enabled`、`auto_scan_enabled`、`scan_interval_minutes` 静默执行 `RunScan(false)`，与前端“自动扫描”开关语义一致。
 - 日志分析页已支持 `/api/analytics/export` 原始日志导出；Go/Python 后端都提供同名接口，按时间、类型、模型、用户、令牌、渠道、分组、Request ID 等条件从 `logs` 表直接流式导出 CSV/JSON，避免前端逐页请求 NewAPI `/api/log` 导致大量请求中断。
 - 2026-05-17 功能优化首轮已落地：Go/Python 均提供 `/api/dashboard/snapshot`、`/api/risk/queue`、`/api/risk/actions/batches`、`/api/analytics/export-jobs`；仪表盘前端优先用 snapshot 并展示 `snapshot_time/cache_hit/data_freshness`，日志分析“处理日志”语义已改为“刷新统计缓存”，日志导出改为任务化轮询下载，风控默认按风险队列和 `risk_score/risk_reasons` 展示。
+- 2026-05-19 用户管理已支持注销账号邮箱检索恢复：Go/Python 提供 `/api/users/soft-deleted/search` 和 `/api/users/soft-deleted/restore`；前端 `UserManagement.tsx` 可按注册邮箱检索 `deleted_at IS NOT NULL` 的账号并逐个恢复，默认同步恢复该账号已软删除的 `tokens.deleted_at`。
 - 2026-05-17 AI 风控复核输出已标准化：启发式评估返回 `evidence_summary`、`false_positive_risk`、`questions_for_admin`、`prompt_version=heuristic-risk-v2`，前端待复核列表和单次评估结果均展示这些证据字段；策略仍为 `pending_review_first`。
 - 2026-05-17 风控中心小号工作台已收敛：共享 IP 不再保留第二套 `SharedIPAltAccountPanel` 前端入口，而是作为 `shared_ip` 案件进入 `AltAccountCasesPanel`；该工作台展示完整 IP、可展开用户、AI 行内研判、封禁全部、撤销上一次和单用户分析/封禁。
 - 2026-05-17 `/api/ip/shared-users` Go/Python 兼容接口已为共享 IP 小号研判补充 `unbanned_count`，用户明细补充 `used_quota`、`total_request_count`、`topup_count`，Python 端额外返回 `has_successful_topup`；前端可据此标注未充值账号。

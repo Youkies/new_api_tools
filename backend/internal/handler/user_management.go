@@ -18,6 +18,8 @@ func RegisterUserManagementRoutes(r *gin.RouterGroup) {
 		g.GET("", GetUsers)
 		g.DELETE("/:user_id", DeleteUser)
 		g.POST("/batch-delete", BatchDeleteInactiveUsers)
+		g.GET("/soft-deleted/search", SearchSoftDeletedUsers)
+		g.POST("/soft-deleted/restore", RestoreSoftDeletedUser)
 		g.GET("/soft-deleted/count", GetSoftDeletedCount)
 		g.POST("/soft-deleted/purge", PurgeSoftDeletedUsers)
 		g.POST("/:user_id/ban", BanUser)
@@ -133,6 +135,47 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 		return
 	}
 
+	message, _ := result["message"].(string)
+	c.JSON(http.StatusOK, gin.H{"success": true, "message": message, "data": result})
+}
+
+// GET /api/users/soft-deleted/search
+func SearchSoftDeletedUsers(c *gin.Context) {
+	email := c.Query("email")
+	limit, _ := strconv.Atoi(c.DefaultQuery("limit", "20"))
+
+	svc := service.NewUserManagementService()
+	result, err := svc.SearchSoftDeletedUsers(email, limit)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
+}
+
+// POST /api/users/soft-deleted/restore
+func RestoreSoftDeletedUser(c *gin.Context) {
+	var req struct {
+		UserID        int64  `json:"user_id"`
+		Email         string `json:"email"`
+		RestoreTokens *bool  `json:"restore_tokens"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
+		return
+	}
+
+	restoreTokens := true
+	if req.RestoreTokens != nil {
+		restoreTokens = *req.RestoreTokens
+	}
+
+	svc := service.NewUserManagementService()
+	result, err := svc.RestoreSoftDeletedUser(req.UserID, req.Email, restoreTokens)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("RESTORE_ERROR", err.Error(), ""))
+		return
+	}
 	message, _ := result["message"].(string)
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": message, "data": result})
 }
