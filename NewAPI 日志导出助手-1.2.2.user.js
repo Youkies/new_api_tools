@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         NewAPI 日志导出助手
 // @namespace    https://newapi.youkies.space/
-// @version      1.2.15
-// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出和使用上传专用 Key 上传到 NewAPI Tools 日志对账
+// @version      1.2.16
+// @description  兼容 NewAPI 经典版 /console/log 与 /legacy/console/log 的使用日志导出工具，支持 CSV/JSON 导出、按流异常筛选、使用上传专用 Key 上传到 NewAPI Tools 日志对账
 // @author       Youkies
 // @match        *://*/*
 // @grant        none
@@ -385,6 +385,7 @@
       channel,
       group,
       requestId,
+      streamError,
     } = options;
 
     const baseParams = {};
@@ -397,6 +398,7 @@
     if (channel) baseParams.channel = channel;
     if (group) baseParams.group = group;
     if (requestId) baseParams.request_id = requestId;
+    if (streamError) baseParams.stream_error = 1;
 
     onStatus("正在检测权限...");
     const apiPath = await detectApiPath();
@@ -482,6 +484,12 @@
       "补全倍率",
       "Request ID",
       "详情",
+      "流状态",
+      "断流原因",
+      "已推chunks",
+      "已流(ms)",
+      "客户端UA",
+      "客户端IP",
     ];
 
     const typeMap = {
@@ -499,6 +507,7 @@
       const inputTokens = Number(log.prompt_tokens || 0);
       const outputTokens = Number(log.completion_tokens || 0);
       const quota = Number(log.quota || 0);
+      const ss = other.stream_status || null;
 
       return [
         formatTimestamp(log.created_at),
@@ -521,6 +530,12 @@
         other.completion_ratio ?? "",
         log.request_id || "",
         log.content || "",
+        ss ? ss.status || "" : "",
+        ss ? ss.end_reason || "" : "",
+        ss && typeof ss.chunks === "number" ? ss.chunks : "",
+        ss && typeof ss.elapsed_ms === "number" ? ss.elapsed_ms : "",
+        ss ? ss.ua || "" : "",
+        ss ? ss.ip || "" : "",
       ];
     });
 
@@ -563,6 +578,12 @@
         totalInput + totalOutput,
         totalQuota,
         (totalQuota / quotaPerUnit).toFixed(6),
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
         "",
         "",
         "",
@@ -1101,6 +1122,13 @@
 
           <div class="lex-row full">
             <label class="lex-check">
+              <input type="checkbox" id="lex-stream-error">
+              仅导出流异常（截断/超时/scanner_error 等，后端 LIKE 过滤，需配合时间区间）
+            </label>
+          </div>
+
+          <div class="lex-row full">
+            <label class="lex-check">
               <input type="checkbox" id="lex-upload-tools" ${tools.uploadEnabled ? "checked" : ""}>
               导出后上传到 NewAPI Tools 日志对账
             </label>
@@ -1194,6 +1222,11 @@
     setFieldValue("lex-channel", params.channel);
     setFieldValue("lex-group", params.group);
     setFieldValue("lex-request-id", params.request_id);
+    const streamErrorCb = $id("lex-stream-error");
+    if (streamErrorCb) {
+      streamErrorCb.checked =
+        params.stream_error === "1" || params.stream_error === 1 || params.stream_error === true;
+    }
 
     if (showMessage) {
       showResult("已从页面同步筛选条件。", false);
@@ -1252,6 +1285,7 @@
       channel: $id("lex-channel").value.trim(),
       group: $id("lex-group").value.trim(),
       requestId: $id("lex-request-id").value.trim(),
+      streamError: $id("lex-stream-error").checked,
     };
 
     const quotaPerUnit =
