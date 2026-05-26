@@ -28,7 +28,6 @@ func RegisterAIAutoBanRoutes(r *gin.RouterGroup) {
 		g.GET("/suspicious", GetSuspiciousUsers)
 		g.GET("/suspicious-users", GetSuspiciousUsers)
 		g.POST("/assess", ManualAssess)
-		g.POST("/assess-shared-ip", AssessSharedIPCase)
 		g.POST("/scan", RunAIBanScan)
 		g.POST("/test-connection", TestAIConnection)
 		g.GET("/whitelist", GetAIBanWhitelist)
@@ -212,31 +211,6 @@ func ManualAssess(c *gin.Context) {
 	}
 	svc := service.NewAIAutoBanService()
 	data := svc.ManualAssess(req.UserID, req.Window)
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
-}
-
-// POST /api/ai-ban/assess-shared-ip
-func AssessSharedIPCase(c *gin.Context) {
-	var req struct {
-		IP      string `json:"ip"`
-		Window  string `json:"window"`
-		BaseURL string `json:"base_url"`
-		APIKey  string `json:"api_key"`
-		Model   string `json:"model"`
-	}
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request", err.Error()))
-		return
-	}
-	if req.Window == "" {
-		req.Window = "24h"
-	}
-	svc := service.NewAIAutoBanService()
-	data := svc.AssessSharedIPCase(req.IP, req.Window, req.BaseURL, req.APIKey, req.Model)
-	if success, _ := data["success"].(bool); !success {
-		c.JSON(http.StatusBadRequest, gin.H{"success": false, "data": data, "message": data["message"]})
-		return
-	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 

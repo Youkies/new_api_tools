@@ -14,7 +14,6 @@ from .main import InvalidParamsError
 from .risk_monitoring_service import WINDOW_SECONDS, get_risk_monitoring_service
 from .local_storage import get_local_storage
 from .user_management_service import get_user_management_service
-from .ai_auto_ban_service import get_ai_auto_ban_service
 
 router = APIRouter(prefix="/api/risk", tags=["Risk Monitoring"])
 _RISK_ACTION_BATCHES: dict[str, dict] = {}
@@ -38,66 +37,6 @@ class BanRecordsResponse(BaseModel):
 class RiskActionBatchResponse(BaseModel):
     success: bool
     data: dict
-
-
-@router.get("/alt-account/cases", response_model=LeaderboardsResponse)
-def get_alt_account_cases(
-    case_type: str = Query(default="all", description="案件类型 shared_ip/rotating_pool/invite_chain/token_rotation/all"),
-    window: str = Query(default="30d", description="分析窗口"),
-    limit: int = Query(default=50, ge=1, le=200, description="返回数量"),
-    offset: int = Query(default=0, ge=0, description="偏移量"),
-    no_cache: bool = Query(default=False, description="强制刷新，跳过缓存"),
-    _: str = Depends(verify_auth),
-):
-    if window not in WINDOW_SECONDS:
-        raise InvalidParamsError(message=f"Invalid window: {window}")
-    service = get_risk_monitoring_service()
-    data = service.get_alt_account_cases(
-        case_type=case_type,
-        window=window,
-        limit=limit,
-        offset=offset,
-        use_cache=not no_cache,
-    )
-    return LeaderboardsResponse(success=True, data=data)
-
-
-@router.get("/alt-account/cases/{case_id}", response_model=LeaderboardsResponse)
-def get_alt_account_case(
-    case_id: str,
-    window: str = Query(default="30d", description="分析窗口"),
-    _: str = Depends(verify_auth),
-):
-    if window not in WINDOW_SECONDS:
-        raise InvalidParamsError(message=f"Invalid window: {window}")
-    service = get_risk_monitoring_service()
-    item = service.get_alt_account_case(case_id=case_id, window=window)
-    if not item:
-        raise InvalidParamsError(message="Case not found")
-    return LeaderboardsResponse(success=True, data=item)
-
-
-@router.post("/alt-account/cases/{case_id}/assess", response_model=LeaderboardsResponse)
-async def assess_alt_account_case(
-    case_id: str,
-    request: dict[str, Any] = Body(default_factory=dict),
-    _: str = Depends(verify_auth),
-):
-    window = str(request.get("window") or "30d")
-    if window not in WINDOW_SECONDS:
-        raise InvalidParamsError(message=f"Invalid window: {window}")
-    risk_service = get_risk_monitoring_service()
-    item = risk_service.get_alt_account_case(case_id=case_id, window=window)
-    if not item:
-        raise InvalidParamsError(message="Case not found")
-    ai_service = get_ai_auto_ban_service()
-    data = await ai_service.assess_alt_account_case(
-        case_data=item,
-        base_url=request.get("base_url"),
-        api_key=request.get("api_key"),
-        model=request.get("model"),
-    )
-    return LeaderboardsResponse(success=True, data=data)
 
 
 @router.get("/leaderboards", response_model=LeaderboardsResponse)

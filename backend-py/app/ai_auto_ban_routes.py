@@ -9,7 +9,6 @@ from typing import Optional
 from .auth import verify_auth
 from .ai_auto_ban_service import get_ai_auto_ban_service
 from .risk_monitoring_service import get_risk_monitoring_service, WINDOW_SECONDS
-from .ip_monitoring_service import get_ip_monitoring_service
 
 
 router = APIRouter(prefix="/api/ai-ban", tags=["AI Auto Ban"])
@@ -19,15 +18,6 @@ class ManualAssessRequest(BaseModel):
     """手动评估请求"""
     user_id: int
     window: str = "1h"
-
-
-class SharedIPAssessRequest(BaseModel):
-    """共享 IP 小号案件评估请求"""
-    ip: str
-    window: str = "24h"
-    base_url: Optional[str] = None
-    api_key: Optional[str] = None
-    model: Optional[str] = None
 
 
 class SaveConfigRequest(BaseModel):
@@ -396,43 +386,6 @@ async def manual_assess(
             ),
         },
     }
-
-
-@router.post("/assess-shared-ip")
-async def assess_shared_ip_case(
-    request: SharedIPAssessRequest,
-    _: str = Depends(verify_auth),
-):
-    """针对多用户共享 IP 的小号/账号池案件做 AI 研判。"""
-    window_seconds = WINDOW_SECONDS.get(request.window, WINDOW_SECONDS["24h"])
-    ip_service = get_ip_monitoring_service()
-    shared_data = ip_service.get_shared_user_ips(
-        window_seconds=window_seconds,
-        min_users=2,
-        limit=500,
-        use_cache=False,
-    )
-    target = None
-    for item in shared_data.get("items", []):
-        if item.get("ip") == request.ip:
-            target = item
-            break
-    if not target:
-        raise HTTPException(status_code=404, detail="未找到该 IP 的多用户共享记录，请确认时间窗口或刷新 IP 数据")
-
-    service = get_ai_auto_ban_service()
-    try:
-        result = await service.assess_shared_ip_case(
-            target,
-            request.window,
-            base_url=request.base_url,
-            api_key=request.api_key,
-            model=request.model,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"共享 IP AI 研判失败: {exc}") from exc
-
-    return {"success": True, "data": result}
 
 
 @router.post("/scan")
