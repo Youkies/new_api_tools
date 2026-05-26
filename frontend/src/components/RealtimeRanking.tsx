@@ -11,6 +11,7 @@ import { Select } from './ui/select'
 import { Input } from './ui/input'
 import { cn, isCloudflareIp } from '../lib/utils'
 import { UserAnalysisDialog, BAN_REASONS, UNBAN_REASONS, RISK_FLAG_LABELS } from './UserAnalysisDialog'
+import { SharedIPAltAccountPanel } from './risk/SharedIPAltAccountPanel'
 import { AltAccountCasesPanel } from './risk/AltAccountCasesPanel'
 import type { AltAccountAIResult, AltAccountCase, BulkBanRecord, IPStats, MultiIPTokenItem, MultiIPUserItem, SharedIPItem, WindowKey } from './risk/types'
 
@@ -458,6 +459,7 @@ export function RealtimeRanking() {
   const [aiLoading, setAiLoading] = useState(false)
   const [aiScanning, setAiScanning] = useState(false)
   const [aiAssessing, setAiAssessing] = useState<number | null>(null)
+  const [sharedIpAiAssessing, setSharedIpAiAssessing] = useState<string | null>(null)
   const [pendingResolveAfterBan, setPendingResolveAfterBan] = useState<string | null>(null)
   const [aiAssessResult, setAiAssessResult] = useState<{
     user_id: number
@@ -474,6 +476,7 @@ export function RealtimeRanking() {
       prompt_version?: string
     }
   } | null>(null)
+  const [sharedIpAiResult, setSharedIpAiResult] = useState<any | null>(null)
 
   // AI 配置编辑状态
   const [aiConfigEdit, setAiConfigEdit] = useState({
@@ -1369,6 +1372,30 @@ export function RealtimeRanking() {
       showToast('error', 'AI 评估失败')
     } finally {
       setAiAssessing(null)
+    }
+  }
+
+  const handleSharedIpAiAssess = async (item: SharedIPItem) => {
+    setSharedIpAiAssessing(item.ip)
+    setSharedIpAiResult(null)
+    try {
+      const response = await fetch(`${apiUrl}/api/ai-ban/assess-shared-ip`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+        body: JSON.stringify({ ip: item.ip, window: ipWindow }),
+      })
+      const res = await response.json()
+      if (res.success) {
+        setSharedIpAiResult(res.data)
+        showToast('success', '共享 IP AI 研判完成')
+      } else {
+        showToast('error', res.message || res.data?.message || '共享 IP AI 研判失败')
+      }
+    } catch (e) {
+      console.error('Failed to assess shared IP case:', e)
+      showToast('error', '共享 IP AI 研判失败')
+    } finally {
+      setSharedIpAiAssessing(null)
     }
   }
 
@@ -3066,19 +3093,28 @@ export function RealtimeRanking() {
                   refreshing={altAccountCasesRefreshing}
                   assessingCaseId={altAccountAssessingCaseId}
                   aiResult={altAccountAiResult}
-                  expandedCaseIds={expandedSharedIps}
+                  onRefresh={handleRefreshAltAccountCases}
+                  onAssess={handleAltAccountAiAssess}
+                  formatNumber={formatNumber}
+                  formatTime={formatTime}
+                />
+
+                <SharedIPAltAccountPanel
+                  sharedIps={sharedIps}
+                  page={ipPage.shared}
+                  pageSize={ipPageSize}
+                  expandedIps={expandedSharedIps}
+                  bulkBanRecords={bulkBanRecords}
                   latestUndoableBulkBanRecord={latestUndoableBulkBanRecord}
                   bulkBanLoadingIp={bulkBanLoadingIp}
                   undoBulkBanLoading={undoBulkBanLoading}
-                  title="小号风险案件工作台"
-                  description="把共享 IP、30 天轮换账号池、邀请链和 token 轮换放在同一条证据链里处理；共享 IP 案件可展开用户、AI 研判、封禁全部和撤销。"
-                  onRefresh={() => {
-                    handleRefreshAltAccountCases()
-                    handleRefreshSharedIps()
-                  }}
-                  onAssess={handleAltAccountAiAssess}
+                  refreshing={ipRefreshing.shared}
+                  onPageChange={(nextPage) => setIpPage((prev) => ({ ...prev, shared: nextPage }))}
                   onToggleExpand={toggleSharedIpExpand}
-                  onBulkBanSharedIP={handleBulkBanSharedIp}
+                  onRefresh={handleRefreshSharedIps}
+                  onBulkBan={handleBulkBanSharedIp}
+                  aiAssessingIp={sharedIpAiAssessing}
+                  onAssessWithAI={handleSharedIpAiAssess}
                   onUndoBulkBan={handleUndoBulkBan}
                   onOpenUserAnalysis={openUserAnalysisFromIP}
                   onOpenBanDialog={(user, displayName) => setBanConfirmDialog({
@@ -3087,7 +3123,7 @@ export function RealtimeRanking() {
                     userId: user.user_id,
                     username: user.username || displayName,
                     displayName,
-                    reason: '小号风险案件处理',
+                    reason: '多用户共用 IP 异常 (MULTI_USER_SHARED_IP)',
                     disableTokens: true,
                     enableTokens: false,
                   })}
@@ -4199,6 +4235,173 @@ export function RealtimeRanking() {
               </CardContent>
             </Card>
           )}
+
+          {sharedIpAiResult && (() => {
+            const assessment = sharedIpAiResult.assessment || {}
+            const stats = sharedIpAiResult.case_stats || {}
+            const likelyUsers = Array.isArray(assessment.likely_alt_account_users)
+              ? assessment.likely_alt_account_users
+              : []
+            const evidence = Array.isArray(assessment.evidence_summary)
+              ? assessment.evidence_summary
+              : []
+            const questions = Array.isArray(assessment.questions_for_admin)
+              ? assessment.questions_for_admin
+              : []
+            const actionLabel =
+              assessment.action === 'ban' ? '建议封禁' :
+                assessment.action === 'review' ? '进入待处理' :
+                  assessment.action === 'monitor' ? '继续观察' : '正常'
+
+            return (
+              <Card className="rounded-xl shadow-lg border-2 border-blue-200/70">
+                <CardHeader className="pb-3 border-b bg-blue-50/70">
+                  <div className="flex items-center justify-between">
+                    <CardTitle className="text-lg flex items-center gap-2">
+                      <Activity className="h-5 w-5 text-blue-600" />
+                      共享 IP AI 研判
+                    </CardTitle>
+                    <Button variant="ghost" size="sm" onClick={() => setSharedIpAiResult(null)}>
+                      关闭
+                    </Button>
+                  </div>
+                </CardHeader>
+                <CardContent className="p-4 space-y-4">
+                  <div className="flex flex-wrap items-center gap-2 text-sm">
+                    <Badge variant="outline" className="rounded font-mono">
+                      {sharedIpAiResult.case?.ip}
+                    </Badge>
+                    <Badge variant="secondary" className="rounded">
+                      窗口：{sharedIpAiResult.window || ipWindow}
+                    </Badge>
+                    {assessment.prompt_version && (
+                      <Badge variant="outline" className="rounded">
+                        Prompt：{assessment.prompt_version}
+                      </Badge>
+                    )}
+                    {(sharedIpAiResult.model || assessment.model) && (
+                      <Badge variant="outline" className="rounded">
+                        模型：{sharedIpAiResult.model || assessment.model}
+                      </Badge>
+                    )}
+                  </div>
+
+                  <div className="grid gap-3 md:grid-cols-4">
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className={cn(
+                        "text-2xl font-bold",
+                        Number(assessment.risk_score || 0) >= 8 ? "text-red-600" :
+                          Number(assessment.risk_score || 0) >= 5 ? "text-amber-600" : "text-green-600"
+                      )}>
+                        {assessment.risk_score ?? 0}/10
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">风险评分</div>
+                    </div>
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className="text-2xl font-bold">
+                        {Math.round(Number(assessment.confidence || 0) * 100)}%
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">置信度</div>
+                    </div>
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className={cn(
+                        "text-lg font-bold",
+                        assessment.action === 'ban' ? "text-red-600" :
+                          assessment.action === 'review' ? "text-amber-600" : "text-blue-600"
+                      )}>
+                        {actionLabel}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">处置建议</div>
+                    </div>
+                    <div className="rounded-lg border p-3 text-center">
+                      <div className="text-2xl font-bold text-slate-800">
+                        {stats.no_topup_user_count ?? 0}/{stats.user_count ?? 0}
+                      </div>
+                      <div className="text-xs text-muted-foreground mt-1">未充值账号</div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-lg border p-3 bg-muted/30">
+                    <div className="text-xs text-muted-foreground mb-1">AI 分析理由:</div>
+                    <div className="text-sm">{assessment.reason || '未返回理由'}</div>
+                  </div>
+
+                  {(evidence.length > 0 || questions.length > 0) && (
+                    <div className="grid gap-3 md:grid-cols-2">
+                      {evidence.length > 0 && (
+                        <div className="rounded-lg border p-3 bg-white">
+                          <div className="text-xs font-medium text-muted-foreground mb-2">证据摘要</div>
+                          <div className="space-y-1">
+                            {evidence.slice(0, 6).map((item: string, idx: number) => (
+                              <div key={`shared-ip-evidence-${idx}`} className="text-xs text-slate-600">
+                                - {item}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+
+                      {questions.length > 0 && (
+                        <div className="rounded-lg border p-3 bg-white">
+                          <div className="text-xs font-medium text-muted-foreground mb-2">复核问题</div>
+                          <div className="space-y-1">
+                            {questions.slice(0, 5).map((item: string, idx: number) => (
+                              <div key={`shared-ip-question-${idx}`} className="text-xs text-slate-600">
+                                - {item}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {likelyUsers.length > 0 && (
+                    <div className="rounded-lg border p-3 bg-white">
+                      <div className="text-xs font-medium text-muted-foreground mb-2">疑似小号账号</div>
+                      <div className="grid gap-2 md:grid-cols-2">
+                        {likelyUsers.slice(0, 8).map((user: any, idx: number) => (
+                          <div key={`shared-ip-likely-user-${idx}`} className="rounded-md border bg-slate-50 px-3 py-2 text-xs">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-semibold">User#{user.user_id ?? 'unknown'}</span>
+                              {user.confidence !== undefined && (
+                                <Badge variant="outline" className="rounded">
+                                  {Math.round(Number(user.confidence || 0) * 100)}%
+                                </Badge>
+                              )}
+                            </div>
+                            <div className="mt-1 text-slate-600">{user.reason || '未返回账号级理由'}</div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+                    <Badge variant="outline" className="rounded">
+                      用户 {stats.user_count ?? 0}
+                    </Badge>
+                    <Badge variant="outline" className="rounded">
+                      未封禁 {stats.unbanned_count ?? 0}
+                    </Badge>
+                    <Badge variant="outline" className="rounded">
+                      首次跨度 {stats.first_seen_spread_seconds !== undefined ? `${Math.round(Number(stats.first_seen_spread_seconds || 0) / 60)} 分钟` : '未知'}
+                    </Badge>
+                    {assessment.false_positive_risk && (
+                      <Badge variant="outline" className="rounded">
+                        误报风险：{assessment.false_positive_risk}
+                      </Badge>
+                    )}
+                    {(sharedIpAiResult.usage?.total_tokens !== undefined || assessment.total_tokens !== undefined) && (
+                      <Badge variant="outline" className="rounded">
+                        Tokens：{sharedIpAiResult.usage?.total_tokens ?? assessment.total_tokens}
+                      </Badge>
+                    )}
+                  </div>
+                </CardContent>
+              </Card>
+            )
+          })()}
 
           {/* AI 审查记录 */}
           <Card className="rounded-xl shadow-sm border border-slate-200 overflow-hidden">

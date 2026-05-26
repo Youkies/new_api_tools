@@ -6,7 +6,7 @@
 
 ## 1. 背景
 
-NewAPI Tools 已具备风险排行、IP 监控、AI 自动封禁配置、待复核、审计日志、白名单、共享 IP 批量封禁等基础能力。2026-05-17 已落地共享 IP 案件级 AI 研判兼容接口：
+NewAPI Tools 已具备风险排行、IP 监控、AI 自动封禁配置、待复核、审计日志、白名单、共享 IP 批量封禁等基础能力。2026-05-17 已新增共享 IP 小号研判面板，并落地共享 IP 案件级 AI 研判接口：
 
 ```http
 POST /api/ai-ban/assess-shared-ip
@@ -14,7 +14,7 @@ POST /api/ai-ban/assess-shared-ip
 
 该接口当前使用 `shared-ip-alt-account-v1` prompt，围绕“同 IP 多用户、未充值、低调用、首次出现集中、误报风险”生成 AI 复核建议。
 
-同日已进一步落地实时“小号风险案件 v1”：规则层可生成共享 IP、30d 轮换账号池、邀请链、Token 轮换四类候选案件，前端已收敛为统一的“小号风险案件工作台”。共享 IP 不再作为第二套独立面板展示，而是小号证据链中的 `shared_ip` 案件类型，可在同一行内查看完整 IP、展开用户、AI 研判、封禁全部和撤销上一次。Go/Python 兼容后端提供通用案件列表、详情和 AI 研判接口：
+同日已进一步落地实时“小号风险案件 v1”：规则层可生成共享 IP、30d 轮换账号池、邀请链、Token 轮换四类候选案件，前端新增案件面板，Go/Python 兼容后端提供通用案件列表、详情和 AI 研判接口：
 
 ```http
 GET /api/risk/alt-account/cases
@@ -51,7 +51,7 @@ POST /api/risk/alt-account/cases/{case_id}/assess
 截至 2026-05-17：
 
 - 已实现 live rules 案件列表：`shared_ip`、`rotating_pool`、`invite_chain`、`token_rotation`。
-- 已实现案件详情和通用 AI 研判接口，AI 请求发送聚合摘要、用户摘要和完整 IP，便于判断网段、出口和重复行为。
+- 已实现案件详情和通用 AI 研判接口，AI 请求只发送聚合摘要和脱敏 IP。
 - 已实现前端 `AltAccountCasesPanel`，展示案件类型、风险分、未充值数、用户数、触发原因和 AI 研判结果。
 - 已支持 30d 风控窗口，用于识别“每 24h 轮换一个账号”的接力型小号池。
 - 已用真实数据库和真实 AI 网关验证：30d 可生成 127 个候选案件；24h 共享 IP 样本命中 15 个未充值账号，AI 输出 86/100、`review`、中等以上置信度。
@@ -70,7 +70,7 @@ POST /api/risk/alt-account/cases/{case_id}/assess
 | `user_id` | 账号聚类、用户画像、跨窗口关联 |
 | `created_at` | 时间窗口、首次出现、轮换节奏、突增判断 |
 | `type` | 区分消费、充值、管理、系统、错误日志 |
-| `username` | 管理员展示；按当前风控策略，通用案件 AI 可接收用户摘要，但不应发送邮箱、手机号、token 明文 |
+| `username` | 管理员展示，不建议发送给外部 AI |
 | `token_name` / `token_id` | token 数量、token 轮换、同 token 多 IP |
 | `model_name` | 模型习惯、同模型账号池 |
 | `quota` | 消耗额度、免费额度消耗、成本异常 |
@@ -376,11 +376,11 @@ case_fingerprint = hash(case_type + primary_key + window + top_user_ids + eviden
 
 ### 7.1 总原则
 
-发送给 AI 的内容应是案件级聚合证据，不是原始日志。
+发送给 AI 的内容应是聚合证据，不是原始日志。
 
 允许发送：
 
-- 完整 IP、网段和 IP 指纹，用于判断共享出口、账号池轮换和重复出现。
+- 脱敏 IP 或 IP 指纹。
 - 用户 ID。
 - 用户状态、角色、分组。
 - 是否成功充值、充值次数。
@@ -406,7 +406,7 @@ case_fingerprint = hash(case_type + primary_key + window + top_user_ids + eviden
   "prompt_version": "shared-ip-alt-account-v1",
   "window": "24h",
   "case": {
-    "ip": "223.160.168.98",
+    "ip_masked": "223.160.*.*",
     "is_whitelisted_ip": false,
     "known_network_type": "unknown"
   },
@@ -691,7 +691,6 @@ api_tools_alt_account_cases(
   risk_score,
   risk_level,
   window,
-  primary_ip,
   primary_ip_hash,
   primary_user_id,
   primary_inviter_id,
@@ -790,7 +789,7 @@ frontend/src/components/risk/
   IPCaseList.tsx
   AltAccountCaseList.tsx
   AltAccountCaseDetail.tsx
-  AltAccountCasesPanel.tsx
+  SharedIPAltAccountPanel.tsx
   AltAccountAIResultCard.tsx
   RiskActionHistory.tsx
   RiskPolicySettings.tsx
@@ -798,19 +797,20 @@ frontend/src/components/risk/
   hooks/
     useRiskQueue.ts
     useAltAccountCases.ts
+    useSharedIPAI.ts
     useRiskActions.ts
 ```
 
 已存在：
 
-- `AltAccountCasesPanel.tsx`
+- `SharedIPAltAccountPanel.tsx`
 - `risk/types.ts`
 
 下一步重点：
 
-- 从 `RealtimeRanking.tsx` 继续拆出 AI 结果卡片和风险 action hooks。
-- 将 `AltAccountCasesPanel.tsx` 进一步拆成 `AltAccountCaseList`、`AltAccountCaseDetail` 和 `AltAccountAIResultCard`。
-- 保持共享 IP 作为 `shared_ip` 案件类型，不再恢复第二套共享 IP 小号面板。
+- 从 `RealtimeRanking.tsx` 继续拆出 AI 结果卡片。
+- 新增 `AltAccountCaseList` 和 `AltAccountCaseDetail`。
+- 将共享 IP 面板纳入统一案件体系。
 
 ### 10.2 案件列表
 
@@ -900,13 +900,13 @@ request_id
 risk_case_id
 ```
 
-管理员风控台默认展示完整 IP；共享 IP 是小号案件证据链的一部分，不在前端做脱敏。若未来增加低权限只读角色，可再按角色权限隐藏原始 IP，并通过 `risk_case_id` 在服务端还原筛选条件。
+如果因隐私原因前端不展示原始 IP，则后端可通过 `risk_case_id` 在服务端还原筛选条件。
 
 ## 12. 安全与隐私
 
 - 数据库连接串、AI Key、上传专用 Key 永远不写入文档、记忆库、前端日志或审计明文。
-- 按当前管理员风控口径，AI 小号案件研判可以发送完整 IP、网段和案件用户摘要。
-- 邮箱、手机号、OAuth 标识、用户 token、API Key、数据库连接串不得发送给外部 AI。
+- AI 请求默认使用脱敏 IP 或 hash。
+- 用户名、邮箱、手机号、OAuth 标识默认不发送给外部 AI。
 - prompt/response 原文不发送给 AI；如需内容相似性，只发送 hash 或模板指纹。
 - AI 原始输出可保存，但不得包含 secret；保存前应截断异常长内容。
 - 所有管理员动作写审计日志。
@@ -916,10 +916,8 @@ risk_case_id
 ### 13.1 共享 IP 小号
 
 - 系统能列出 24h 内同 IP 多用户案件。
-- 每个案件展示完整 IP、用户数、未充值数、token 数、请求数、首次出现跨度。
-- 管理员可展开案件用户列表，查看账号状态、充值线索、请求数、token 数、首次/最近出现时间。
+- 每个案件展示用户数、未充值数、token 数、请求数、首次出现跨度。
 - 管理员可对案件触发 AI 研判。
-- 管理员可在同一个工作台执行单用户分析/封禁、共享 IP 案件封禁全部和撤销上一次批量封禁。
 - AI 输出包含风险分、建议动作、证据、误报风险、复核问题。
 - 危险动作默认进入 dry-run 预览。
 

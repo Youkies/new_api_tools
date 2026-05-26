@@ -855,7 +855,18 @@ func callAltAccountAI(baseURL, apiKey, model, prompt string) (map[string]interfa
 func cloneCaseForAI(caseData map[string]interface{}) map[string]interface{} {
 	clone := map[string]interface{}{}
 	for k, v := range caseData {
-		clone[k] = v
+		switch k {
+		case "primary_ip":
+			clone["primary_ip_masked"] = maskIP(toString(v))
+		case "case_key":
+			if toString(caseData["case_type"]) == "shared_ip" || toString(caseData["case_type"]) == "rotating_pool" {
+				clone[k] = maskIP(toString(v))
+			} else {
+				clone[k] = v
+			}
+		default:
+			clone[k] = v
+		}
 	}
 	return clone
 }
