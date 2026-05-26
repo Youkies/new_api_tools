@@ -96,6 +96,16 @@ const todayStartValue = () => {
 
 const nowValue = () => toDatetimeLocalValue(new Date())
 
+const EXPORT_FILTERS_KEY = 'analytics_export_filters_v1'
+
+const readStoredExportFilters = () => {
+  try {
+    return JSON.parse(localStorage.getItem(EXPORT_FILTERS_KEY) || '{}') as Record<string, string>
+  } catch {
+    return {}
+  }
+}
+
 const filenameFromDisposition = (disposition: string | null, fallback: string) => {
   if (!disposition) return fallback
   const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i)
@@ -107,6 +117,7 @@ const filenameFromDisposition = (disposition: string | null, fallback: string) =
 export function Analytics() {
   const { token } = useAuth()
   const { showToast } = useToast()
+  const exportDefaultsRef = useRef(readStoredExportFilters())
 
   // Auto refresh interval in seconds - will be updated based on system scale
   const DEFAULT_REFRESH_INTERVAL = 60
@@ -151,16 +162,46 @@ export function Analytics() {
   const [exporting, setExporting] = useState(false)
   const [exportStart, setExportStart] = useState(todayStartValue)
   const [exportEnd, setExportEnd] = useState(nowValue)
-  const [exportType, setExportType] = useState('2')
-  const [exportFormat, setExportFormat] = useState<'csv' | 'json'>('csv')
-  const [exportModelName, setExportModelName] = useState('')
-  const [exportUsername, setExportUsername] = useState('')
-  const [exportTokenName, setExportTokenName] = useState('')
-  const [exportChannel, setExportChannel] = useState('')
-  const [exportGroup, setExportGroup] = useState('')
-  const [exportRequestId, setExportRequestId] = useState('')
-  const [exportQuotaPerUnit, setExportQuotaPerUnit] = useState('500000')
-  const [exportMaxRows, setExportMaxRows] = useState('')
+  const [exportType, setExportType] = useState(exportDefaultsRef.current.type || '2')
+  const [exportFormat, setExportFormat] = useState<'csv' | 'json'>((exportDefaultsRef.current.format as 'csv' | 'json') || 'csv')
+  const [exportModelName, setExportModelName] = useState(exportDefaultsRef.current.model_name || '')
+  const [exportUsername, setExportUsername] = useState(exportDefaultsRef.current.username || '')
+  const [exportTokenName, setExportTokenName] = useState(exportDefaultsRef.current.token_name || '')
+  const [exportChannel, setExportChannel] = useState(exportDefaultsRef.current.channel || '')
+  const [exportGroup, setExportGroup] = useState(exportDefaultsRef.current.group || '')
+  const [exportRequestId, setExportRequestId] = useState(exportDefaultsRef.current.request_id || '')
+  const [exportQuotaPerUnit, setExportQuotaPerUnit] = useState(exportDefaultsRef.current.quota_per_unit || '500000')
+  const [exportMaxRows, setExportMaxRows] = useState(exportDefaultsRef.current.max_rows || '')
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(EXPORT_FILTERS_KEY, JSON.stringify({
+        type: exportType,
+        format: exportFormat,
+        model_name: exportModelName,
+        username: exportUsername,
+        token_name: exportTokenName,
+        channel: exportChannel,
+        group: exportGroup,
+        request_id: exportRequestId,
+        quota_per_unit: exportQuotaPerUnit,
+        max_rows: exportMaxRows,
+      }))
+    } catch {
+      // Ignore private-mode storage failures.
+    }
+  }, [
+    exportType,
+    exportFormat,
+    exportModelName,
+    exportUsername,
+    exportTokenName,
+    exportChannel,
+    exportGroup,
+    exportRequestId,
+    exportQuotaPerUnit,
+    exportMaxRows,
+  ])
 
   // 从 localStorage 恢复倒计时，或使用默认值
   const [countdown, setCountdown] = useState(() => {
@@ -333,7 +374,7 @@ export function Analytics() {
     syncStatusRef.current = syncStatus
   }, [syncStatus])
 
-  // 浏览器刷新时自动处理新日志
+  // 浏览器刷新时自动刷新统计缓存
   useEffect(() => {
     // 等待 loading 完成和 syncStatus 加载
     if (loading || !syncStatus) return
@@ -345,7 +386,7 @@ export function Analytics() {
       return
     }
 
-    // 浏览器刷新且已初始化，自动处理新日志
+    // 浏览器刷新且已初始化，自动刷新统计缓存
     const autoProcess = async () => {
       try {
         const response = await fetch(`${apiUrl}/api/analytics/process`, {
@@ -384,7 +425,7 @@ export function Analytics() {
 
     const doAutoRefresh = async () => {
       const currentStatus = syncStatusRef.current
-      // Only auto process new logs when already synced (>= 95% progress)
+      // Only refresh analytics cache when already synced (>= 95% progress)
       if (currentStatus?.is_synced) {
         try {
           const response = await fetch(`${apiUrl}/api/analytics/process`, {
@@ -434,19 +475,21 @@ export function Analytics() {
       })
       const data = await response.json()
       if (data.success) {
-        if (data.processed > 0) {
-          showToast('success', `已处理 ${data.processed} 条日志`)
+        if (data.action === 'cache_refresh') {
+          showToast('success', data.message || '统计缓存已刷新')
+        } else if (data.processed > 0) {
+          showToast('success', `已更新 ${data.processed} 条日志统计`)
         } else {
           showToast('info', '没有新日志需要处理')
         }
         fetchAnalytics()
         fetchSyncStatus()
       } else {
-        showToast('error', data.message || '处理失败')
+        showToast('error', data.message || '刷新失败')
       }
     } catch (error) {
       console.error('Failed to process logs:', error)
-      showToast('error', '处理日志失败')
+      showToast('error', '刷新统计缓存失败')
     } finally {
       setProcessing(false)
     }
@@ -456,8 +499,8 @@ export function Analytics() {
     if (!isAutoSync) {
       setConfirmDialog({
         isOpen: true,
-        title: '批量同步',
-        message: '确定要进行批量处理吗？这将处理所有历史日志，可能需要几分钟时间。',
+        title: '刷新统计缓存',
+        message: '确定要重新计算日志摘要吗？Go 后端会直接从 logs 表读取数据并刷新缓存；大数据量下可能需要一些时间。',
         type: 'info',
         onConfirm: () => {
           setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -500,7 +543,11 @@ export function Analytics() {
             await fetchSyncStatus()
 
             if (data.completed) {
-              showToast('success', `同步完成！共处理 ${batchTotalProcessedRef.current.toLocaleString()} 条日志`)
+              if (data.action === 'cache_refresh') {
+                showToast('success', data.message || '统计缓存已刷新')
+              } else {
+                showToast('success', `计算完成！共更新 ${batchTotalProcessedRef.current.toLocaleString()} 条日志统计`)
+              }
               await fetchAnalytics()
               break
             }
@@ -510,7 +557,7 @@ export function Analytics() {
             consecutiveFailures++
             console.error('Batch process failed:', data.message)
             if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-              showToast('error', `连续 ${MAX_CONSECUTIVE_FAILURES} 次批处理失败，已停止。请检查后端日志。`)
+              showToast('error', `连续 ${MAX_CONSECUTIVE_FAILURES} 次批量计算失败，已停止。请检查后端日志。`)
               break
             }
             // Wait longer before retry on failure
@@ -547,7 +594,7 @@ export function Analytics() {
     setConfirmDialog({
       isOpen: true,
       title: '重置分析数据',
-      message: '确定要重置所有分析数据吗？此操作不可恢复，需要重新同步所有日志。',
+      message: '确定要重置所有分析缓存吗？此操作会清空本工具缓存，随后需要重新计算日志摘要。',
       type: 'danger',
       onConfirm: async () => {
         setConfirmDialog(prev => ({ ...prev, isOpen: false }))
@@ -609,7 +656,38 @@ export function Analytics() {
 
     setExporting(true)
     try {
-      const response = await fetch(`${apiUrl}/api/analytics/export?${params.toString()}`, {
+      const jobResponse = await fetch(`${apiUrl}/api/analytics/export-jobs?${params.toString()}`, {
+        method: 'POST',
+        headers: getAuthHeaders(),
+      })
+      const jobData = await jobResponse.json()
+      if (!jobResponse.ok || !jobData.success) {
+        throw new Error(jobData.message || jobData.error?.message || `HTTP ${jobResponse.status}`)
+      }
+
+      const jobId = jobData.data?.job_id
+      if (!jobId) throw new Error('导出任务创建失败')
+      showToast('info', '导出任务已创建，正在生成文件...')
+
+      let job = jobData.data
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        if (job.status === 'completed' || job.status === 'failed') break
+        await new Promise(resolve => setTimeout(resolve, 1000))
+        const statusResponse = await fetch(`${apiUrl}/api/analytics/export-jobs/${encodeURIComponent(jobId)}`, {
+          headers: getAuthHeaders(),
+        })
+        const statusData = await statusResponse.json()
+        if (!statusResponse.ok || !statusData.success) {
+          throw new Error(statusData.message || statusData.error?.message || '导出任务状态查询失败')
+        }
+        job = statusData.data
+      }
+
+      if (job.status !== 'completed') {
+        throw new Error(job.error_message || job.error || '导出任务未完成，请稍后重试')
+      }
+
+      const response = await fetch(`${apiUrl}/api/analytics/export-jobs/${encodeURIComponent(jobId)}/download`, {
         headers: getAuthHeaders(),
       })
       if (!response.ok) {
@@ -705,12 +783,12 @@ export function Analytics() {
               <RefreshCw className={`h-5 w-5 mt-0.5 ${syncStatus.is_initializing ? 'text-primary' : 'text-yellow-600'}`} />
               <div className="flex-1">
                 <h3 className={`font-medium ${syncStatus.is_initializing ? 'text-primary' : 'text-yellow-800'}`}>
-                  {syncStatus.is_initializing ? '正在初始化同步...' : '需要初始化同步'}
+                  {syncStatus.is_initializing ? '正在初始化统计...' : '需要初始化统计'}
                 </h3>
                 <p className={`text-sm mt-1 ${syncStatus.is_initializing ? 'text-primary/80' : 'text-yellow-700'}`}>
                   {syncStatus.is_initializing
-                    ? `初始化截止点: #${syncStatus.init_cutoff_id}，已处理到 #${syncStatus.last_log_id}`
-                    : `数据库共有 ${formatNumber(syncStatus.total_logs_in_db)} 条日志，已处理 ${formatNumber(syncStatus.total_processed)} 条`
+                    ? `初始化截止点: #${syncStatus.init_cutoff_id}，已计算到 #${syncStatus.last_log_id}`
+                    : `数据库共有 ${formatNumber(syncStatus.total_logs_in_db)} 条日志，已计算 ${formatNumber(syncStatus.total_processed)} 条`
                   } ({displayProgress.toFixed(2)}%)
                 </p>
                 <div className="mt-3">
@@ -720,7 +798,7 @@ export function Analytics() {
                     indicatorClassName={syncStatus.is_initializing ? 'bg-primary' : 'bg-yellow-500'}
                   />
                   <p className={`text-xs mt-2 ${syncStatus.is_initializing ? 'text-primary/70' : 'text-yellow-600'}`}>
-                    剩余 {formatNumber(syncStatus.remaining_logs)} 条待处理
+                    剩余 {formatNumber(syncStatus.remaining_logs)} 条待计算
                   </p>
                 </div>
               </div>
@@ -731,7 +809,7 @@ export function Analytics() {
                 disabled={batchProcessing}
               >
                 {batchProcessing ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-1" />}
-                {batchProcessing ? '同步中...' : syncStatus.is_initializing ? '继续同步' : '开始同步'}
+                {batchProcessing ? '计算中...' : syncStatus.is_initializing ? '继续计算' : '开始计算'}
               </Button>
               {batchProcessing && (
                 <Button
@@ -754,10 +832,10 @@ export function Analytics() {
             <div>
               <div className="flex items-center gap-3">
                 <h2 className="text-lg font-medium">日志分析</h2>
-                {syncStatus?.is_synced && <Badge variant="success">已同步</Badge>}
+                {syncStatus?.is_synced && <Badge variant="success">直接读取 DB</Badge>}
               </div>
               <p className="text-sm text-muted-foreground mt-1">
-                已处理 <span className="font-medium text-primary">{formatNumber(state?.total_processed || 0)}</span> 条日志
+                已统计 <span className="font-medium text-primary">{formatNumber(state?.total_processed || 0)}</span> 条日志
                 {state?.last_processed_at && <span className="ml-2">· 上次更新: {formatTimestamp(state.last_processed_at)}</span>}
               </p>
             </div>
@@ -814,7 +892,7 @@ export function Analytics() {
               </Button>
               <Button onClick={processLogs} disabled={processing || batchProcessing}>
                 {processing ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-                处理新日志
+                刷新统计
               </Button>
               <Button variant="destructive" onClick={resetAnalytics}>
                 <Trash2 className="h-4 w-4 mr-2" />
@@ -950,7 +1028,7 @@ export function Analytics() {
               </TableBody>
             </Table>
           ) : (
-            <div className="py-12 text-center text-muted-foreground">暂无数据，请先处理日志</div>
+            <div className="py-12 text-center text-muted-foreground">暂无数据，请先刷新统计</div>
           )}
         </CardContent>
       </Card>

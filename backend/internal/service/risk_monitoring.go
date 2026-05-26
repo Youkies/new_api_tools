@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"sort"
@@ -16,6 +17,19 @@ import (
 // RiskMonitoringService handles risk detection queries
 type RiskMonitoringService struct {
 	db *database.Manager
+}
+
+// RiskActionBatchRequest describes a server-side moderation batch.
+type RiskActionBatchRequest struct {
+	Action                string                 `json:"action"`
+	DryRun                bool                   `json:"dry_run"`
+	Reason                string                 `json:"reason"`
+	DisableTokens         bool                   `json:"disable_tokens"`
+	EnableTokens          bool                   `json:"enable_tokens"`
+	Source                string                 `json:"source"`
+	UserIDs               []int64                `json:"user_ids"`
+	Condition             map[string]interface{} `json:"condition"`
+	ExcludeProtectedRoles bool                   `json:"exclude_protected_roles"`
 }
 
 // NewRiskMonitoringService creates a new RiskMonitoringService
@@ -83,6 +97,15 @@ func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sor
 			continue
 		}
 
+		for _, row := range rows {
+			s.enrichRiskRow(row, seconds)
+		}
+		if sortBy == "risk_score" {
+			sort.Slice(rows, func(i, j int) bool {
+				return toFloat64(rows[i]["risk_score"]) > toFloat64(rows[j]["risk_score"])
+			})
+		}
+
 		windowsData[window] = rows
 	}
 
@@ -93,6 +116,246 @@ func (s *RiskMonitoringService) GetLeaderboards(windows []string, limit int, sor
 
 	cm.Set(cacheKey, result, 3*time.Minute)
 	return result, nil
+}
+
+// GetRiskQueue returns a unified evidence-first queue sorted by risk score.
+func (s *RiskMonitoringService) GetRiskQueue(window string, page, pageSize int, sortBy string, useCache bool) (map[string]interface{}, error) {
+	seconds, ok := WindowSeconds[window]
+	if !ok {
+		seconds = WindowSeconds["24h"]
+		window = "24h"
+	}
+	if page <= 0 {
+		page = 1
+	}
+	if pageSize <= 0 {
+		pageSize = 50
+	}
+
+	cm := cache.Get()
+	cacheKey := fmt.Sprintf("risk:queue:%s:%d:%d:%s", window, page, pageSize, sortBy)
+	if useCache {
+		var cached map[string]interface{}
+		found, _ := cm.GetJSON(cacheKey, &cached)
+		if found {
+			cached["cache_hit"] = true
+			return cached, nil
+		}
+	}
+
+	now := time.Now().Unix()
+	startTime := now - seconds
+	candidateLimit := page * pageSize * 3
+	if candidateLimit < 100 {
+		candidateLimit = 100
+	}
+	if candidateLimit > 1000 {
+		candidateLimit = 1000
+	}
+
+	query := s.db.RebindQuery(`
+		SELECT l.user_id as user_id,
+			COALESCE(
+				NULLIF(MAX(u.display_name), ''),
+				NULLIF(MAX(u.username), ''),
+				NULLIF(MAX(l.username), '')
+			) as username,
+			COALESCE(MAX(u.status), 0) as user_status,
+			COUNT(*) as request_count,
+			SUM(CASE WHEN l.type = 5 THEN 1 ELSE 0 END) as failure_requests,
+			(SUM(CASE WHEN l.type = 5 THEN 1 ELSE 0 END) * 1.0) / NULLIF(COUNT(*), 0) as failure_rate,
+			COALESCE(SUM(l.quota), 0) as quota_used,
+			COALESCE(SUM(l.prompt_tokens), 0) as prompt_tokens,
+			COALESCE(SUM(l.completion_tokens), 0) as completion_tokens,
+			COALESCE(COUNT(DISTINCT NULLIF(l.ip, '')), 0) as unique_ips,
+			COALESCE(COUNT(DISTINCT l.token_id), 0) as unique_tokens
+		FROM logs l
+		LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+		WHERE l.created_at >= ? AND l.created_at <= ?
+			AND l.type IN (2, 5)
+			AND l.user_id IS NOT NULL
+		GROUP BY l.user_id
+		ORDER BY request_count DESC
+		LIMIT ?`)
+
+	rows, err := s.db.QueryWithTimeout(25*time.Second, query, startTime, now, candidateLimit)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, row := range rows {
+		s.enrichRiskRow(row, seconds)
+	}
+
+	sort.Slice(rows, func(i, j int) bool {
+		switch sortBy {
+		case "requests":
+			return toInt64(rows[i]["request_count"]) > toInt64(rows[j]["request_count"])
+		case "quota":
+			return toInt64(rows[i]["quota_used"]) > toInt64(rows[j]["quota_used"])
+		case "failure_rate":
+			return toFloat64(rows[i]["failure_rate"]) > toFloat64(rows[j]["failure_rate"])
+		default:
+			return toFloat64(rows[i]["risk_score"]) > toFloat64(rows[j]["risk_score"])
+		}
+	})
+
+	start := (page - 1) * pageSize
+	if start > len(rows) {
+		start = len(rows)
+	}
+	end := start + pageSize
+	if end > len(rows) {
+		end = len(rows)
+	}
+	items := rows[start:end]
+
+	result := map[string]interface{}{
+		"items":          items,
+		"page":           page,
+		"page_size":      pageSize,
+		"total":          len(rows),
+		"window":         window,
+		"sort":           sortBy,
+		"generated_at":   now,
+		"snapshot_time":  now,
+		"candidate_size": candidateLimit,
+		"cache_hit":      false,
+	}
+
+	cm.Set(cacheKey, result, 2*time.Minute)
+	return result, nil
+}
+
+func (s *RiskMonitoringService) enrichRiskRow(row map[string]interface{}, windowSeconds int64) {
+	requestCount := toInt64(row["request_count"])
+	failureRate := toFloat64(row["failure_rate"])
+	quotaUsed := toInt64(row["quota_used"])
+	uniqueIPs := toInt64(row["unique_ips"])
+	uniqueTokens := toInt64(row["unique_tokens"])
+	if uniqueTokens == 0 {
+		uniqueTokens = 1
+	}
+
+	windowMinutes := math.Max(float64(windowSeconds)/60.0, 1)
+	requestsPerMinute := float64(requestCount) / windowMinutes
+
+	reasons := buildRiskReasons(requestCount, requestsPerMinute, failureRate, quotaUsed, uniqueIPs, uniqueTokens)
+	score := calculateRiskScore(requestCount, requestsPerMinute, failureRate, quotaUsed, uniqueIPs, uniqueTokens)
+	level := "low"
+	suggestedAction := "monitor"
+	if score >= 80 {
+		level = "high"
+		suggestedAction = "review"
+	} else if score >= 50 {
+		level = "medium"
+		suggestedAction = "review"
+	}
+
+	row["requests_per_minute"] = math.Round(requestsPerMinute*100) / 100
+	row["risk_score"] = score
+	row["risk_level"] = level
+	row["risk_reasons"] = reasons
+	row["reasons"] = reasons
+	row["suggested_action"] = suggestedAction
+	row["metrics"] = map[string]interface{}{
+		"request_count":       requestCount,
+		"requests_per_minute": math.Round(requestsPerMinute*100) / 100,
+		"failure_rate":        failureRate,
+		"quota_used":          quotaUsed,
+		"unique_ips":          uniqueIPs,
+		"unique_tokens":       uniqueTokens,
+	}
+}
+
+func calculateRiskScore(requestCount int64, rpm float64, failureRate float64, quotaUsed int64, uniqueIPs int64, uniqueTokens int64) int {
+	velocityScore := math.Min(rpm/10.0*100, 100)
+	requestVolumeScore := math.Min(float64(requestCount)/3000.0*100, 100)
+	failureScore := math.Min(failureRate/0.5*100, 100)
+	ipScore := math.Min(float64(uniqueIPs)/12.0*100, 100)
+	tokenScore := math.Min(float64(uniqueTokens)/8.0*100, 100)
+	costScore := math.Min(float64(quotaUsed)/5000000.0*100, 100)
+
+	score := velocityScore*0.25 +
+		requestVolumeScore*0.10 +
+		failureScore*0.20 +
+		ipScore*0.20 +
+		tokenScore*0.10 +
+		costScore*0.15
+
+	if score < 0 {
+		return 0
+	}
+	if score > 100 {
+		return 100
+	}
+	return int(math.Round(score))
+}
+
+func buildRiskReasons(requestCount int64, rpm float64, failureRate float64, quotaUsed int64, uniqueIPs int64, uniqueTokens int64) []map[string]interface{} {
+	reasons := []map[string]interface{}{}
+	add := func(code, label, severity, evidence, suggestion string) {
+		reasons = append(reasons, map[string]interface{}{
+			"code":       code,
+			"label":      label,
+			"severity":   severity,
+			"evidence":   evidence,
+			"suggestion": suggestion,
+		})
+	}
+
+	if rpm >= 10 {
+		add("HIGH_RPM", "短时间高频请求", "high",
+			fmt.Sprintf("当前窗口平均 %.2f RPM", rpm),
+			"检查是否为异常脚本或被盗用令牌")
+	} else if rpm >= 5 {
+		add("ELEVATED_RPM", "请求频率偏高", "medium",
+			fmt.Sprintf("当前窗口平均 %.2f RPM", rpm),
+			"结合 IP 和失败率继续观察")
+	}
+	if requestCount >= 3000 {
+		add("HIGH_REQUEST_VOLUME", "请求量异常偏高", "high",
+			fmt.Sprintf("当前窗口累计 %d 次请求", requestCount),
+			"优先查看用户详情和原始日志")
+	} else if requestCount >= 1000 {
+		add("ELEVATED_REQUEST_VOLUME", "请求量偏高", "medium",
+			fmt.Sprintf("当前窗口累计 %d 次请求", requestCount),
+			"确认是否为正常业务流量")
+	}
+	if failureRate >= 0.5 && requestCount >= 20 {
+		add("HIGH_FAILURE_RATE", "失败率过高", "high",
+			fmt.Sprintf("失败率 %.1f%%", failureRate*100),
+			"检查模型、渠道或恶意探测请求")
+	} else if failureRate >= 0.25 && requestCount >= 20 {
+		add("ELEVATED_FAILURE_RATE", "失败率偏高", "medium",
+			fmt.Sprintf("失败率 %.1f%%", failureRate*100),
+			"结合模型和渠道分布确认原因")
+	}
+	if uniqueIPs >= 12 {
+		add("MANY_IPS", "多 IP 访问", "high",
+			fmt.Sprintf("当前窗口出现 %d 个不同 IP", uniqueIPs),
+			"检查是否存在代理池或账号共享")
+	} else if uniqueIPs >= 5 {
+		add("MULTIPLE_IPS", "IP 数偏多", "medium",
+			fmt.Sprintf("当前窗口出现 %d 个不同 IP", uniqueIPs),
+			"结合地理位置和令牌使用继续观察")
+	}
+	if uniqueTokens >= 8 {
+		add("TOKEN_ROTATION", "令牌轮换明显", "medium",
+			fmt.Sprintf("当前窗口使用 %d 个不同令牌", uniqueTokens),
+			"检查是否存在批量分发或泄露")
+	}
+	if quotaUsed >= 5000000 {
+		add("HIGH_QUOTA_USAGE", "额度消耗较高", "medium",
+			fmt.Sprintf("当前窗口消耗 %d quota", quotaUsed),
+			"结合充值和成本核算确认业务合理性")
+	}
+	if len(reasons) == 0 {
+		add("NORMAL_TRAFFIC", "未命中明显风险", "low",
+			"请求量、失败率、IP 和额度消耗均未超过主要阈值",
+			"保持观察")
+	}
+	return reasons
 }
 
 // GetUserAnalysis returns detailed risk analysis for a user
@@ -254,7 +517,7 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 	if uniqueIPs > 10 {
 		riskFlags = append(riskFlags, "MANY_IPS")
 	}
-	if failureRate > 50.0 && totalRequests > 10 {
+	if failureRate > 0.5 && totalRequests > 10 {
 		riskFlags = append(riskFlags, "HIGH_FAILURE_RATE")
 	}
 
@@ -294,10 +557,22 @@ func (s *RiskMonitoringService) GetUserAnalysis(userID int64, windowSeconds int6
 		}
 	}
 
+	riskProbe := map[string]interface{}{
+		"request_count": totalRequests,
+		"failure_rate":  failureRate,
+		"quota_used":    quotaUsed,
+		"unique_ips":    uniqueIPs,
+		"unique_tokens": uniqueTokens,
+	}
+	s.enrichRiskRow(riskProbe, windowSeconds)
+
 	risk := map[string]interface{}{
 		"requests_per_minute":   requestsPerMinute,
 		"avg_quota_per_request": avgQuotaPerRequest,
 		"risk_flags":            riskFlags,
+		"risk_score":            riskProbe["risk_score"],
+		"risk_level":            riskProbe["risk_level"],
+		"risk_reasons":          riskProbe["risk_reasons"],
 		"ip_switch_analysis":    ipSwitchAnalysis,
 		"shared_ip_analysis":    sharedIPAnalysis,
 	}
@@ -576,6 +851,270 @@ func (s *RiskMonitoringService) GetSameIPRegistrations(window string, minUsers, 
 
 	cm.Set(cacheKey, result, 10*time.Minute)
 	return result, nil
+}
+
+// ExecuteRiskActionBatch previews or executes a server-side moderation batch.
+func (s *RiskMonitoringService) ExecuteRiskActionBatch(req RiskActionBatchRequest) (map[string]interface{}, error) {
+	if req.Action == "" {
+		req.Action = "ban"
+	}
+	if req.Reason == "" {
+		req.Reason = "risk_center_batch"
+	}
+	if req.Source == "" {
+		req.Source = "risk_center"
+	}
+	if req.Action == "ban" && !req.DisableTokens {
+		req.DisableTokens = true
+	}
+	if req.Action == "unban" && !req.EnableTokens {
+		req.EnableTokens = true
+	}
+	if !req.ExcludeProtectedRoles {
+		req.ExcludeProtectedRoles = true
+	}
+
+	targets, err := s.resolveRiskBatchTargets(req)
+	if err != nil {
+		return nil, err
+	}
+
+	batchID := fmt.Sprintf("risk-%s-%d", req.Action, time.Now().UnixNano())
+	result := map[string]interface{}{
+		"batch_id":       batchID,
+		"action":         req.Action,
+		"dry_run":        req.DryRun,
+		"affected_count": len(targets),
+		"skipped_count":  0,
+		"users":          targets,
+		"message":        "预览完成，未修改用户状态",
+	}
+	if req.DryRun {
+		return result, nil
+	}
+
+	userSvc := NewUserManagementService()
+	succeeded := []map[string]interface{}{}
+	failed := []map[string]interface{}{}
+	for _, target := range targets {
+		userID := toInt64(target["user_id"])
+		context := map[string]interface{}{
+			"source":     req.Source,
+			"batch_id":   batchID,
+			"condition":  req.Condition,
+			"risk_batch": true,
+		}
+		if req.Action == "unban" {
+			err = userSvc.UnbanUserWithAudit(userID, req.EnableTokens, req.Reason, "Admin", context)
+		} else {
+			err = userSvc.BanUserWithAudit(userID, req.DisableTokens, req.Reason, "Admin", context)
+		}
+		if err != nil {
+			failed = append(failed, map[string]interface{}{"user_id": userID, "error": err.Error()})
+			continue
+		}
+		succeeded = append(succeeded, target)
+	}
+
+	if err := s.ensureRiskActionBatchTable(); err == nil {
+		_ = s.insertRiskActionBatch(batchID, req, succeeded, failed)
+	}
+
+	result["dry_run"] = false
+	result["affected_count"] = len(succeeded)
+	result["failed_count"] = len(failed)
+	result["users"] = succeeded
+	result["failed"] = failed
+	result["message"] = fmt.Sprintf("已执行批量%s，成功 %d 个，失败 %d 个", riskActionLabel(req.Action), len(succeeded), len(failed))
+	invalidateRiskCaches()
+	return result, nil
+}
+
+// RevertRiskActionBatch reverts a previously executed ban batch when possible.
+func (s *RiskMonitoringService) RevertRiskActionBatch(batchID string) (map[string]interface{}, error) {
+	if batchID == "" {
+		return nil, fmt.Errorf("batch_id is required")
+	}
+	if err := s.ensureRiskActionBatchTable(); err != nil {
+		return nil, err
+	}
+	row, err := s.db.QueryOne(s.db.RebindQuery(`
+		SELECT batch_id, action, affected_users_snapshot, reverted_at
+		FROM api_tools_risk_action_batches WHERE batch_id = ?`), batchID)
+	if err != nil {
+		return nil, err
+	}
+	if row == nil {
+		return nil, fmt.Errorf("batch not found")
+	}
+	if toInt64(row["reverted_at"]) > 0 {
+		return nil, fmt.Errorf("batch already reverted")
+	}
+	if toString(row["action"]) != "ban" {
+		return nil, fmt.Errorf("only ban batches can be reverted automatically")
+	}
+
+	var users []map[string]interface{}
+	if err := json.Unmarshal([]byte(toString(row["affected_users_snapshot"])), &users); err != nil {
+		return nil, err
+	}
+
+	userSvc := NewUserManagementService()
+	succeeded := 0
+	failed := []map[string]interface{}{}
+	for _, user := range users {
+		userID := toInt64(user["user_id"])
+		err := userSvc.UnbanUserWithAudit(userID, true, "撤销批量封禁", "Admin", map[string]interface{}{
+			"source":        "risk_batch_revert",
+			"undo_batch_id": batchID,
+		})
+		if err != nil {
+			failed = append(failed, map[string]interface{}{"user_id": userID, "error": err.Error()})
+			continue
+		}
+		succeeded++
+	}
+
+	now := time.Now().Unix()
+	_, _ = s.db.Execute(s.db.RebindQuery(`
+		UPDATE api_tools_risk_action_batches SET reverted_at = ? WHERE batch_id = ?`), now, batchID)
+	invalidateRiskCaches()
+	return map[string]interface{}{
+		"batch_id":       batchID,
+		"reverted_at":    now,
+		"success_count":  succeeded,
+		"failed_count":   len(failed),
+		"failed":         failed,
+		"message":        fmt.Sprintf("已撤销批量封禁，成功解封 %d 个，失败 %d 个", succeeded, len(failed)),
+		"affected_count": succeeded,
+	}, nil
+}
+
+func (s *RiskMonitoringService) resolveRiskBatchTargets(req RiskActionBatchRequest) ([]map[string]interface{}, error) {
+	protectedCondition := "AND COALESCE(u.role, 0) < 10"
+	if !req.ExcludeProtectedRoles {
+		protectedCondition = ""
+	}
+	userIDCast := "CAST(u.id AS CHAR)"
+	logUserIDCast := "CAST(l.user_id AS CHAR)"
+	if s.db.IsPG {
+		userIDCast = "CAST(u.id AS TEXT)"
+		logUserIDCast = "CAST(l.user_id AS TEXT)"
+	}
+	if len(req.UserIDs) > 0 {
+		placeholders := make([]string, 0, len(req.UserIDs))
+		args := make([]interface{}, 0, len(req.UserIDs))
+		for _, id := range req.UserIDs {
+			placeholders = append(placeholders, "?")
+			args = append(args, id)
+		}
+		query := s.db.RebindQuery(fmt.Sprintf(`
+			SELECT u.id as user_id, COALESCE(NULLIF(u.display_name, ''), u.username, %s) as username,
+				u.status as user_status, u.role
+			FROM users u
+			WHERE u.deleted_at IS NULL %s AND u.id IN (%s) AND u.status <> 2
+			ORDER BY u.id ASC`, userIDCast, protectedCondition, strings.Join(placeholders, ",")))
+		return s.db.Query(query, args...)
+	}
+
+	conditionType := toString(req.Condition["type"])
+	if conditionType == "" {
+		conditionType = toString(req.Condition["case_type"])
+	}
+	if conditionType == "shared_ip" || req.Condition["ip"] != nil {
+		ip := toString(req.Condition["ip"])
+		if ip == "" {
+			return nil, fmt.Errorf("condition.ip is required for shared_ip batch")
+		}
+		window := toString(req.Condition["window"])
+		if window == "" {
+			window = "24h"
+		}
+		seconds, ok := WindowSeconds[window]
+		if !ok {
+			seconds = WindowSeconds["24h"]
+		}
+		startTime := time.Now().Unix() - seconds
+		query := s.db.RebindQuery(fmt.Sprintf(`
+			SELECT l.user_id as user_id,
+				COALESCE(NULLIF(MAX(u.display_name), ''), NULLIF(MAX(u.username), ''), NULLIF(MAX(l.username), ''), %s) as username,
+				COALESCE(MAX(u.status), 0) as user_status,
+				COALESCE(MAX(u.role), 0) as role,
+				COUNT(*) as request_count,
+				COUNT(DISTINCT l.token_id) as token_count
+			FROM logs l
+			INNER JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
+			WHERE l.created_at >= ? AND l.ip = ? AND l.type IN (2, 5)
+				AND l.user_id IS NOT NULL AND u.status <> 2 %s
+			GROUP BY l.user_id
+			ORDER BY request_count DESC
+			LIMIT 500`, logUserIDCast, protectedCondition))
+		return s.db.Query(query, startTime, ip)
+	}
+
+	return nil, fmt.Errorf("unsupported batch condition")
+}
+
+func (s *RiskMonitoringService) ensureRiskActionBatchTable() error {
+	var query string
+	if s.db.IsPG {
+		query = `
+			CREATE TABLE IF NOT EXISTS api_tools_risk_action_batches (
+				batch_id TEXT PRIMARY KEY,
+				action TEXT NOT NULL,
+				operator TEXT NOT NULL,
+				reason TEXT,
+				source TEXT,
+				condition_snapshot TEXT,
+				affected_users_snapshot TEXT,
+				failed_users_snapshot TEXT,
+				success_count BIGINT NOT NULL DEFAULT 0,
+				failed_count BIGINT NOT NULL DEFAULT 0,
+				created_at BIGINT NOT NULL,
+				reverted_at BIGINT
+			)`
+		return s.db.ExecuteDDL(query)
+	}
+	query = `
+		CREATE TABLE IF NOT EXISTS api_tools_risk_action_batches (
+			batch_id VARCHAR(128) PRIMARY KEY,
+			action VARCHAR(32) NOT NULL,
+			operator VARCHAR(128) NOT NULL,
+			reason VARCHAR(255),
+			source VARCHAR(128),
+			condition_snapshot JSON,
+			affected_users_snapshot JSON,
+			failed_users_snapshot JSON,
+			success_count BIGINT NOT NULL DEFAULT 0,
+			failed_count BIGINT NOT NULL DEFAULT 0,
+			created_at BIGINT NOT NULL,
+			reverted_at BIGINT NULL,
+			KEY idx_api_tools_risk_batches_created (created_at),
+			KEY idx_api_tools_risk_batches_action (action)
+		)`
+	_, err := s.db.Execute(query)
+	return err
+}
+
+func (s *RiskMonitoringService) insertRiskActionBatch(batchID string, req RiskActionBatchRequest, succeeded, failed []map[string]interface{}) error {
+	conditionJSON, _ := json.Marshal(req.Condition)
+	succeededJSON, _ := json.Marshal(succeeded)
+	failedJSON, _ := json.Marshal(failed)
+	query := s.db.RebindQuery(`
+		INSERT INTO api_tools_risk_action_batches
+			(batch_id, action, operator, reason, source, condition_snapshot, affected_users_snapshot,
+			 failed_users_snapshot, success_count, failed_count, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+	_, err := s.db.Execute(query, batchID, req.Action, "Admin", req.Reason, req.Source,
+		string(conditionJSON), string(succeededJSON), string(failedJSON), len(succeeded), len(failed), time.Now().Unix())
+	return err
+}
+
+func riskActionLabel(action string) string {
+	if action == "unban" {
+		return "解封"
+	}
+	return "封禁"
 }
 
 // ListBanRecords returns ban/unban audit records stored by moderation actions.

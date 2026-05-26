@@ -28,6 +28,84 @@ WINDOW_SECONDS: dict[str, int] = {
 }
 
 
+def _risk_reasons(
+    request_count: int,
+    rpm: float,
+    failure_rate: float,
+    quota_used: int,
+    unique_ips: int,
+    unique_tokens: int,
+) -> List[Dict[str, Any]]:
+    """Build structured risk reasons matching the Go backend contract."""
+    reasons: List[Dict[str, Any]] = []
+
+    def add(code: str, label: str, severity: str, evidence: str, suggestion: str):
+        reasons.append({
+            "code": code,
+            "label": label,
+            "severity": severity,
+            "evidence": evidence,
+            "suggestion": suggestion,
+        })
+
+    if rpm >= 10:
+        add("HIGH_RPM", "短时间高频请求", "high", f"当前窗口平均 {rpm:.2f} RPM", "检查是否为异常脚本或被盗用令牌")
+    elif rpm >= 5:
+        add("ELEVATED_RPM", "请求频率偏高", "medium", f"当前窗口平均 {rpm:.2f} RPM", "结合 IP 和失败率继续观察")
+
+    if request_count >= 3000:
+        add("HIGH_REQUEST_VOLUME", "请求量异常偏高", "high", f"当前窗口累计 {request_count} 次请求", "优先查看用户详情和原始日志")
+    elif request_count >= 1000:
+        add("ELEVATED_REQUEST_VOLUME", "请求量偏高", "medium", f"当前窗口累计 {request_count} 次请求", "确认是否为正常业务流量")
+
+    if failure_rate >= 0.5 and request_count >= 20:
+        add("HIGH_FAILURE_RATE", "失败率过高", "high", f"失败率 {failure_rate * 100:.1f}%", "检查模型、渠道或恶意探测请求")
+    elif failure_rate >= 0.25 and request_count >= 20:
+        add("ELEVATED_FAILURE_RATE", "失败率偏高", "medium", f"失败率 {failure_rate * 100:.1f}%", "结合模型和渠道分布确认原因")
+
+    if unique_ips >= 12:
+        add("MANY_IPS", "多 IP 访问", "high", f"当前窗口出现 {unique_ips} 个不同 IP", "检查是否存在代理池或账号共享")
+    elif unique_ips >= 5:
+        add("MULTIPLE_IPS", "IP 数偏多", "medium", f"当前窗口出现 {unique_ips} 个不同 IP", "结合地理位置和令牌使用继续观察")
+
+    if unique_tokens >= 8:
+        add("TOKEN_ROTATION", "令牌轮换明显", "medium", f"当前窗口使用 {unique_tokens} 个不同令牌", "检查是否存在批量分发或泄露")
+
+    if quota_used >= 5_000_000:
+        add("HIGH_QUOTA_USAGE", "额度消耗较高", "medium", f"当前窗口消耗 {quota_used} quota", "结合充值和成本核算确认业务合理性")
+
+    if not reasons:
+        add("NORMAL_TRAFFIC", "未命中明显风险", "low", "请求量、失败率、IP 和额度消耗均未超过主要阈值", "保持观察")
+
+    return reasons
+
+
+def _risk_score(
+    request_count: int,
+    rpm: float,
+    failure_rate: float,
+    quota_used: int,
+    unique_ips: int,
+    unique_tokens: int,
+) -> int:
+    """Calculate explainable 0-100 risk score matching the Go backend weights."""
+    velocity_score = min(rpm / 10.0 * 100, 100)
+    volume_score = min(request_count / 3000.0 * 100, 100)
+    failure_score = min(failure_rate / 0.5 * 100, 100)
+    ip_score = min(unique_ips / 12.0 * 100, 100)
+    token_score = min(unique_tokens / 8.0 * 100, 100)
+    cost_score = min(quota_used / 5_000_000.0 * 100, 100)
+    score = (
+        velocity_score * 0.25
+        + volume_score * 0.10
+        + failure_score * 0.20
+        + ip_score * 0.20
+        + token_score * 0.10
+        + cost_score * 0.15
+    )
+    return max(0, min(100, int(round(score))))
+
+
 def _get_cache_ttl() -> int:
     """Get cache TTL based on system scale (lazy import to avoid circular dependency)."""
     try:
@@ -201,7 +279,7 @@ class RiskMonitoringService:
             data[w] = []
             for item in raw_data:
                 user_info = user_info_map.get(item["user_id"], {})
-                data[w].append({
+                row = {
                     "user_id": item["user_id"],
                     "username": user_info.get("display_name") or user_info.get("username") or item.get("username") or "",
                     "user_status": user_info.get("status", 0),
@@ -212,12 +290,80 @@ class RiskMonitoringService:
                     "prompt_tokens": item["prompt_tokens"],
                     "completion_tokens": item["completion_tokens"],
                     "unique_ips": item["unique_ips"],
-                })
+                    "unique_tokens": item.get("unique_tokens", 1),
+                }
+                self._enrich_risk_row(row, WINDOW_SECONDS.get(w, 24 * 3600))
+                data[w].append(row)
+
+            if sort_by == "risk_score":
+                data[w].sort(key=lambda row: row.get("risk_score", 0), reverse=True)
         
         result = {"generated_at": now, "windows": data}
 
         # Per-window cache already updated above, no need for combined cache
         return result
+
+    def _enrich_risk_row(self, row: Dict[str, Any], window_seconds: int):
+        """Attach explainable risk score and reasons to a leaderboard row."""
+        request_count = int(row.get("request_count") or 0)
+        failure_rate = float(row.get("failure_rate") or 0)
+        quota_used = int(row.get("quota_used") or 0)
+        unique_ips = int(row.get("unique_ips") or 0)
+        unique_tokens = int(row.get("unique_tokens") or 1)
+        window_minutes = max(window_seconds / 60.0, 1)
+        rpm = request_count / window_minutes
+        reasons = _risk_reasons(request_count, rpm, failure_rate, quota_used, unique_ips, unique_tokens)
+        score = _risk_score(request_count, rpm, failure_rate, quota_used, unique_ips, unique_tokens)
+        level = "high" if score >= 80 else "medium" if score >= 50 else "low"
+
+        row["requests_per_minute"] = round(rpm, 2)
+        row["risk_score"] = score
+        row["risk_level"] = level
+        row["risk_reasons"] = reasons
+        row["reasons"] = reasons
+        row["suggested_action"] = "review" if score >= 50 else "monitor"
+        row["metrics"] = {
+            "request_count": request_count,
+            "requests_per_minute": round(rpm, 2),
+            "failure_rate": failure_rate,
+            "quota_used": quota_used,
+            "unique_ips": unique_ips,
+            "unique_tokens": unique_tokens,
+        }
+
+    def get_risk_queue(
+        self,
+        window: str = "24h",
+        page: int = 1,
+        page_size: int = 50,
+        sort_by: str = "risk_score",
+        use_cache: bool = True,
+    ) -> Dict[str, Any]:
+        """Return a paged explainable risk queue."""
+        page = max(page, 1)
+        page_size = min(max(page_size, 1), 200)
+        fetch_limit = min(max(page * page_size, page_size), 500)
+        data = self.get_leaderboards(
+            windows=[window],
+            limit=fetch_limit,
+            sort_by=sort_by,
+            use_cache=use_cache,
+        )
+        items = data.get("windows", {}).get(window, [])
+        if sort_by == "risk_score":
+            items = sorted(items, key=lambda row: row.get("risk_score", 0), reverse=True)
+        start = (page - 1) * page_size
+        end = start + page_size
+        return {
+            "items": items[start:end],
+            "total": len(items),
+            "page": page,
+            "page_size": page_size,
+            "window": window,
+            "sort_by": sort_by,
+            "snapshot_time": data.get("generated_at", int(time.time())),
+            "source": "python-risk-queue",
+        }
 
     def _get_leaderboard_incremental(
         self,
@@ -316,7 +462,8 @@ class RiskMonitoringService:
                 COALESCE(SUM(quota), 0) as quota_used,
                 COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0) as completion_tokens,
-                COUNT(DISTINCT NULLIF(ip, '')) as unique_ips
+                COUNT(DISTINCT NULLIF(ip, '')) as unique_ips,
+                COUNT(DISTINCT token_id) as unique_tokens
             FROM logs
             WHERE created_at >= :start_time AND created_at < :end_time
                 AND type IN (2, 5)
@@ -344,6 +491,7 @@ class RiskMonitoringService:
                 "prompt_tokens": int(r.get("prompt_tokens") or 0),
                 "completion_tokens": int(r.get("completion_tokens") or 0),
                 "unique_ips": int(r.get("unique_ips") or 0),
+                "unique_tokens": int(r.get("unique_tokens") or 0),
             }
             for r in rows
         ]
@@ -378,7 +526,8 @@ class RiskMonitoringService:
                 COALESCE(SUM(quota), 0) as quota_used,
                 COALESCE(SUM(prompt_tokens), 0) as prompt_tokens,
                 COALESCE(SUM(completion_tokens), 0) as completion_tokens,
-                COUNT(DISTINCT NULLIF(ip, '')) as unique_ips
+                COUNT(DISTINCT NULLIF(ip, '')) as unique_ips,
+                COUNT(DISTINCT token_id) as unique_tokens
             FROM logs
             WHERE created_at >= :start_time AND created_at <= :end_time
                 AND type IN (2, 5)
@@ -406,6 +555,7 @@ class RiskMonitoringService:
                 "prompt_tokens": int(r.get("prompt_tokens") or 0),
                 "completion_tokens": int(r.get("completion_tokens") or 0),
                 "unique_ips": int(r.get("unique_ips") or 0),
+                "unique_tokens": int(r.get("unique_tokens") or 0),
             }
             for r in rows
         ]
@@ -488,7 +638,8 @@ class RiskMonitoringService:
                 COALESCE(SUM(l.quota), 0) as quota_used,
                 COALESCE(SUM(l.prompt_tokens), 0) as prompt_tokens,
                 COALESCE(SUM(l.completion_tokens), 0) as completion_tokens,
-                COALESCE(COUNT(DISTINCT NULLIF(l.ip, '')), 0) as unique_ips
+                COALESCE(COUNT(DISTINCT NULLIF(l.ip, '')), 0) as unique_ips,
+                COALESCE(COUNT(DISTINCT l.token_id), 0) as unique_tokens
             FROM logs l
             LEFT JOIN users u ON u.id = l.user_id AND u.deleted_at IS NULL
             WHERE l.created_at >= :start_time AND l.created_at <= :end_time
@@ -518,6 +669,7 @@ class RiskMonitoringService:
                 "prompt_tokens": int(r.get("prompt_tokens") or 0),
                 "completion_tokens": int(r.get("completion_tokens") or 0),
                 "unique_ips": int(r.get("unique_ips") or 0),
+                "unique_tokens": int(r.get("unique_tokens") or 0),
             }
             for r in rows
         ]

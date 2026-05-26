@@ -45,6 +45,7 @@ logs/
 .env
 .env.local
 .env.*.local
+数据库地址*
 
 # Node.js
 node_modules/

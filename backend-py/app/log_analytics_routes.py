@@ -3,11 +3,15 @@ Log Analytics API Routes for NewAPI Middleware Tool.
 Implements endpoints for user rankings and model statistics.
 """
 import time
+import os
+import threading
+import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from .auth import verify_auth
@@ -15,6 +19,10 @@ from .log_analytics_service import get_log_analytics_service
 from .logger import logger
 
 router = APIRouter(prefix="/api/analytics", tags=["Log Analytics"])
+
+_EXPORT_JOBS: dict[str, dict] = {}
+_EXPORT_JOBS_LOCK = threading.Lock()
+_EXPORT_DIR = Path(os.environ.get("DATA_DIR", "/app/data")) / "analytics_exports"
 
 
 # Response Models
@@ -305,6 +313,169 @@ async def export_logs(
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.post("/export-jobs")
+async def create_export_job(
+    request: Request,
+    _: str = Depends(verify_auth),
+):
+    """Create an asynchronous log export job."""
+    params = request.query_params
+    export_format, options = _parse_export_options_from_params(params)
+    job_id = f"export-{datetime.now().strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    suffix = "json" if export_format == "json" else "csv"
+    filename = f"newapi_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{job_id[-8:]}.{suffix}"
+    file_path = _EXPORT_DIR / filename
+    now = int(time.time())
+    job = {
+        "job_id": job_id,
+        "status": "queued",
+        "progress": 0.0,
+        "rows_written": 0,
+        "estimated_total_rows": 0,
+        "file_size": 0,
+        "format": suffix,
+        "filename": filename,
+        "created_at": now,
+        "updated_at": now,
+        "expires_at": now + 24 * 3600,
+        "download_url": None,
+        "error": None,
+    }
+    with _EXPORT_JOBS_LOCK:
+        _EXPORT_JOBS[job_id] = job
+
+    thread = threading.Thread(
+        target=_run_export_job,
+        args=(job_id, export_format, options, file_path),
+        daemon=True,
+    )
+    thread.start()
+
+    return {"success": True, "data": job}
+
+
+@router.get("/export-jobs/{job_id}")
+async def get_export_job(
+    job_id: str,
+    _: str = Depends(verify_auth),
+):
+    """Get asynchronous export job status."""
+    with _EXPORT_JOBS_LOCK:
+        job = dict(_EXPORT_JOBS.get(job_id) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    return {"success": True, "data": job}
+
+
+@router.get("/export-jobs/{job_id}/download")
+async def download_export_job(
+    job_id: str,
+    _: str = Depends(verify_auth),
+):
+    """Download a completed export job file."""
+    with _EXPORT_JOBS_LOCK:
+        job = dict(_EXPORT_JOBS.get(job_id) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    if job.get("status") != "completed":
+        raise HTTPException(status_code=409, detail="Export job is not completed")
+
+    file_path = Path(job.get("file_path") or "")
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Export file not found")
+
+    media_type = "application/json; charset=utf-8" if job.get("format") == "json" else "text/csv; charset=utf-8"
+    return FileResponse(
+        str(file_path),
+        media_type=media_type,
+        filename=job.get("filename") or file_path.name,
+    )
+
+
+def _parse_export_options_from_params(params) -> tuple[str, dict]:
+    """Parse export options from query params shared by async export jobs."""
+    def get_int(name: str, default: int = 0) -> int:
+        value = params.get(name)
+        try:
+            return int(value) if value not in (None, "") else default
+        except ValueError:
+            return default
+
+    export_format = (params.get("format") or "csv").strip().lower()
+    if export_format != "json":
+        export_format = "csv"
+
+    start = get_int("start_time") or get_int("start_timestamp")
+    end = get_int("end_time") or get_int("end_timestamp")
+    if start <= 0 and end <= 0:
+        now = datetime.now()
+        start = int(datetime(now.year, now.month, now.day).timestamp())
+        end = int(time.time())
+
+    options = {
+        "start_time": start,
+        "end_time": end,
+        "type": max(0, get_int("type")),
+        "model_name": (params.get("model_name") or "").strip(),
+        "username": (params.get("username") or "").strip(),
+        "token_name": (params.get("token_name") or "").strip(),
+        "channel": ((params.get("channel") or params.get("channel_id") or "")).strip(),
+        "group": (params.get("group") or "").strip(),
+        "request_id": (params.get("request_id") or "").strip(),
+        "quota_per_unit": max(1, get_int("quota_per_unit", 500000)),
+        "max_rows": max(0, min(get_int("max_rows"), 5_000_000)),
+    }
+    return export_format, options
+
+
+def _run_export_job(job_id: str, export_format: str, options: dict, file_path: Path):
+    """Run export job in a background thread."""
+    service = get_log_analytics_service()
+    try:
+        _EXPORT_DIR.mkdir(parents=True, exist_ok=True)
+        with _EXPORT_JOBS_LOCK:
+            _EXPORT_JOBS[job_id].update({
+                "status": "running",
+                "progress": 0.05,
+                "updated_at": int(time.time()),
+            })
+
+        stream = service.export_logs_json(options) if export_format == "json" else service.export_logs_csv(options)
+        bytes_written = 0
+        with file_path.open("wb") as fp:
+            for chunk in stream:
+                fp.write(chunk)
+                bytes_written += len(chunk)
+                if bytes_written and bytes_written % (1024 * 1024) < len(chunk):
+                    with _EXPORT_JOBS_LOCK:
+                        _EXPORT_JOBS[job_id].update({
+                            "file_size": bytes_written,
+                            "progress": 0.5,
+                            "updated_at": int(time.time()),
+                        })
+
+        file_size = file_path.stat().st_size
+        with _EXPORT_JOBS_LOCK:
+            _EXPORT_JOBS[job_id].update({
+                "status": "completed",
+                "progress": 1.0,
+                "file_size": file_size,
+                "file_path": str(file_path),
+                "download_url": f"/api/analytics/export-jobs/{job_id}/download",
+                "updated_at": int(time.time()),
+            })
+    except Exception as exc:
+        logger.error(f"Export job failed: {exc}")
+        with _EXPORT_JOBS_LOCK:
+            if job_id in _EXPORT_JOBS:
+                _EXPORT_JOBS[job_id].update({
+                    "status": "failed",
+                    "progress": 0.0,
+                    "error": str(exc),
+                    "updated_at": int(time.time()),
+                })
 
 
 @router.post("/reset", response_model=ResetResponse)

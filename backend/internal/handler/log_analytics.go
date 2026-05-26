@@ -28,6 +28,9 @@ func RegisterLogAnalyticsRoutes(r *gin.RouterGroup) {
 		g.GET("/models", GetModelStatistics)
 		g.GET("/summary", GetAnalyticsSummary)
 		g.GET("/export", ExportLogs)
+		g.POST("/export-jobs", CreateLogExportJob)
+		g.GET("/export-jobs/:job_id", GetLogExportJob)
+		g.GET("/export-jobs/:job_id/download", DownloadLogExportJob)
 		g.POST("/reset", ResetAnalytics)
 		g.GET("/sync-status", GetSyncStatus)
 		g.POST("/check-consistency", CheckDataConsistency)
@@ -119,45 +122,7 @@ func ExportLogs(c *gin.Context) {
 		format = "csv"
 	}
 
-	startTime := parseOptionalInt64(c.Query("start_time"), c.Query("start_timestamp"))
-	endTime := parseOptionalInt64(c.Query("end_time"), c.Query("end_timestamp"))
-	if startTime <= 0 && endTime <= 0 {
-		startTime, endTime = service.DefaultCostRange()
-	}
-
-	logType := 0
-	if rawType := strings.TrimSpace(c.Query("type")); rawType != "" {
-		if parsed, err := strconv.Atoi(rawType); err == nil && parsed > 0 {
-			logType = parsed
-		}
-	}
-
-	quotaPerUnit := parseOptionalInt64(c.Query("quota_per_unit"), "")
-	if quotaPerUnit <= 0 {
-		quotaPerUnit = 500000
-	}
-
-	maxRows := 0
-	if rawMaxRows := strings.TrimSpace(c.Query("max_rows")); rawMaxRows != "" {
-		parsed, _ := strconv.Atoi(rawMaxRows)
-		if parsed > 0 {
-			maxRows = clampInt(parsed, 1, 5000000)
-		}
-	}
-
-	opts := service.LogExportOptions{
-		StartTime:    startTime,
-		EndTime:      endTime,
-		Type:         logType,
-		ModelName:    strings.TrimSpace(c.Query("model_name")),
-		Username:     strings.TrimSpace(c.Query("username")),
-		TokenName:    strings.TrimSpace(c.Query("token_name")),
-		Channel:      strings.TrimSpace(firstNonEmpty(c.Query("channel"), c.Query("channel_id"))),
-		Group:        strings.TrimSpace(c.Query("group")),
-		RequestID:    strings.TrimSpace(c.Query("request_id")),
-		QuotaPerUnit: quotaPerUnit,
-		MaxRows:      maxRows,
-	}
+	opts := parseLogExportOptions(c)
 
 	svc := service.NewLogAnalyticsService()
 	rows, err := svc.OpenLogExport(c.Request.Context(), opts)
@@ -182,6 +147,47 @@ func ExportLogs(c *gin.Context) {
 		_ = c.Error(err)
 		return
 	}
+}
+
+// POST /api/analytics/export-jobs
+func CreateLogExportJob(c *gin.Context) {
+	format := strings.ToLower(strings.TrimSpace(c.DefaultQuery("format", "csv")))
+	if format != "json" {
+		format = "csv"
+	}
+	opts := parseLogExportOptions(c)
+
+	svc := service.NewLogAnalyticsService()
+	data, err := svc.StartLogExportJob(format, opts)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, models.ErrorResp("EXPORT_JOB_ERROR", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data, "message": "导出任务已创建"})
+}
+
+// GET /api/analytics/export-jobs/:job_id
+func GetLogExportJob(c *gin.Context) {
+	svc := service.NewLogAnalyticsService()
+	data, err := svc.GetLogExportJob(c.Param("job_id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, models.ErrorResp("EXPORT_JOB_NOT_FOUND", err.Error(), ""))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+// GET /api/analytics/export-jobs/:job_id/download
+func DownloadLogExportJob(c *gin.Context) {
+	svc := service.NewLogAnalyticsService()
+	path, filename, mime, err := svc.GetLogExportJobFile(c.Param("job_id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, models.ErrorResp("EXPORT_JOB_DOWNLOAD_ERROR", err.Error(), ""))
+		return
+	}
+	c.Header("Content-Type", mime)
+	c.Header("X-Accel-Buffering", "no")
+	c.FileAttachment(path, filename)
 }
 
 // POST /api/analytics/reset
@@ -218,6 +224,48 @@ func CheckDataConsistency(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
+}
+
+func parseLogExportOptions(c *gin.Context) service.LogExportOptions {
+	startTime := parseOptionalInt64(c.Query("start_time"), c.Query("start_timestamp"))
+	endTime := parseOptionalInt64(c.Query("end_time"), c.Query("end_timestamp"))
+	if startTime <= 0 && endTime <= 0 {
+		startTime, endTime = service.DefaultCostRange()
+	}
+
+	logType := 0
+	if rawType := strings.TrimSpace(c.Query("type")); rawType != "" {
+		if parsed, err := strconv.Atoi(rawType); err == nil && parsed > 0 {
+			logType = parsed
+		}
+	}
+
+	quotaPerUnit := parseOptionalInt64(c.Query("quota_per_unit"), "")
+	if quotaPerUnit <= 0 {
+		quotaPerUnit = 500000
+	}
+
+	maxRows := 0
+	if rawMaxRows := strings.TrimSpace(c.Query("max_rows")); rawMaxRows != "" {
+		parsed, _ := strconv.Atoi(rawMaxRows)
+		if parsed > 0 {
+			maxRows = clampInt(parsed, 1, 5000000)
+		}
+	}
+
+	return service.LogExportOptions{
+		StartTime:    startTime,
+		EndTime:      endTime,
+		Type:         logType,
+		ModelName:    strings.TrimSpace(c.Query("model_name")),
+		Username:     strings.TrimSpace(c.Query("username")),
+		TokenName:    strings.TrimSpace(c.Query("token_name")),
+		Channel:      strings.TrimSpace(firstNonEmpty(c.Query("channel"), c.Query("channel_id"))),
+		Group:        strings.TrimSpace(c.Query("group")),
+		RequestID:    strings.TrimSpace(c.Query("request_id")),
+		QuotaPerUnit: quotaPerUnit,
+		MaxRows:      maxRows,
+	}
 }
 
 func parseOptionalInt64(primary, fallback string) int64 {
