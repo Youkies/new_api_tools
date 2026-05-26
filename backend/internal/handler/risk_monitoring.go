@@ -15,9 +15,6 @@ func RegisterRiskMonitoringRoutes(r *gin.RouterGroup) {
 	g := r.Group("/risk")
 	{
 		g.GET("/leaderboards", GetLeaderboards)
-		g.GET("/queue", GetRiskQueue)
-		g.POST("/actions/batches", ExecuteRiskActionBatch)
-		g.POST("/actions/batches/:batch_id/revert", RevertRiskActionBatch)
 		g.GET("/users/:user_id/analysis", GetUserRiskAnalysis)
 		g.GET("/ban-records", ListBanRecords)
 		g.GET("/token-rotation", GetTokenRotationUsers)
@@ -34,7 +31,7 @@ func GetLeaderboards(c *gin.Context) {
 	sortBy := c.DefaultQuery("sort_by", "requests")
 	useCache := c.DefaultQuery("no_cache", "false") != "true"
 
-	if sortBy != "risk_score" && sortBy != "requests" && sortBy != "quota" && sortBy != "failure_rate" {
+	if sortBy != "requests" && sortBy != "quota" && sortBy != "failure_rate" {
 		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid sort_by: "+sortBy, ""))
 		return
 	}
@@ -46,71 +43,6 @@ func GetLeaderboards(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
-}
-
-// GET /api/risk/queue
-func GetRiskQueue(c *gin.Context) {
-	window := c.DefaultQuery("window", "24h")
-	if !validWindow(window) {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid window value", ""))
-		return
-	}
-	page := parsePage(c)
-	pageSize := parsePageSize(c, 50, 200)
-	sortBy := c.DefaultQuery("sort", "risk_score")
-	useCache := c.DefaultQuery("no_cache", "false") != "true"
-
-	if sortBy != "risk_score" && sortBy != "requests" && sortBy != "quota" && sortBy != "failure_rate" {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid sort: "+sortBy, ""))
-		return
-	}
-
-	svc := service.NewRiskMonitoringService()
-	data, err := svc.GetRiskQueue(window, page, pageSize, sortBy, useCache)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, models.ErrorResp("QUERY_ERROR", err.Error(), ""))
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
-}
-
-// POST /api/risk/actions/batches
-func ExecuteRiskActionBatch(c *gin.Context) {
-	var req service.RiskActionBatchRequest
-	req.Action = "ban"
-	req.DryRun = true
-	req.DisableTokens = true
-	req.ExcludeProtectedRoles = true
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid request body", err.Error()))
-		return
-	}
-	if req.Action != "ban" && req.Action != "unban" {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("INVALID_PARAMS", "Invalid action", ""))
-		return
-	}
-
-	svc := service.NewRiskMonitoringService()
-	data, err := svc.ExecuteRiskActionBatch(req)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("BATCH_ACTION_ERROR", err.Error(), ""))
-		return
-	}
-	message, _ := data["message"].(string)
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": message, "data": data})
-}
-
-// POST /api/risk/actions/batches/:batch_id/revert
-func RevertRiskActionBatch(c *gin.Context) {
-	batchID := c.Param("batch_id")
-	svc := service.NewRiskMonitoringService()
-	data, err := svc.RevertRiskActionBatch(batchID)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, models.ErrorResp("BATCH_REVERT_ERROR", err.Error(), ""))
-		return
-	}
-	message, _ := data["message"].(string)
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": message, "data": data})
 }
 
 // GET /api/risk/users/:user_id/analysis

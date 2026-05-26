@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from .database import DatabaseEngine, get_db_manager
+from .database import get_db_manager
 from .logger import logger
 from .local_storage import get_local_storage
 
@@ -65,7 +65,6 @@ class ActivityStats:
     inactive_users: int     # 7-30 天
     very_inactive_users: int  # 30 天以上
     never_requested: int    # 从未请求
-    never_unpaid: int       # 未充值且从未请求
 
 
 class UserManagementService:
@@ -133,7 +132,6 @@ class UserManagementService:
                 inactive_users=cached.get("inactive_users", 0),
                 very_inactive_users=cached.get("very_inactive_users", 0),
                 never_requested=cached.get("never_requested", 0),
-                never_unpaid=cached.get("never_unpaid", 0),
             )
 
         # 快速模式：只返回基础统计（不 JOIN logs）
@@ -150,7 +148,6 @@ class UserManagementService:
             "inactive_users": stats.inactive_users,
             "very_inactive_users": stats.very_inactive_users,
             "never_requested": stats.never_requested,
-            "never_unpaid": stats.never_unpaid,
         }, ttl=STATS_CACHE_TTL)
 
         return stats
@@ -177,7 +174,6 @@ class UserManagementService:
                 row = result[0]
                 total = int(row.get("total") or 0)
                 never = int(row.get("never_count") or 0)
-                never_unpaid = self._count_never_unpaid_users()
                 has_requests = int(row.get("has_requests") or 0)
                 return ActivityStats(
                     total_users=total,
@@ -185,7 +181,6 @@ class UserManagementService:
                     inactive_users=0,
                     very_inactive_users=0,
                     never_requested=never,
-                    never_unpaid=never_unpaid,
                 )
         except Exception as e:
             logger.db_error(f"快速统计失败: {e}")
@@ -196,7 +191,6 @@ class UserManagementService:
             inactive_users=0,
             very_inactive_users=0,
             never_requested=0,
-            never_unpaid=0,
         )
 
         return stats
@@ -228,7 +222,6 @@ class UserManagementService:
             basic_result = self._db.execute(basic_sql, {})
             total_users = int(basic_result[0]["total"]) if basic_result else 0
             never_count = int(basic_result[0]["never_count"]) if basic_result else 0
-            never_unpaid_count = self._count_never_unpaid_users()
 
             # 2. 统计活跃用户（7天内有请求）- 使用 EXISTS 更高效
             active_sql = """
@@ -282,7 +275,6 @@ class UserManagementService:
                 inactive_users=inactive_count,
                 very_inactive_users=max(0, very_inactive_count),  # 防止负数
                 never_requested=never_count,
-                never_unpaid=never_unpaid_count,
             )
         except Exception as e:
             logger.db_error(f"获取活跃度统计失败: {e}")
@@ -293,53 +285,7 @@ class UserManagementService:
             inactive_users=0,
             very_inactive_users=0,
             never_requested=0,
-            never_unpaid=0,
         )
-
-    def _table_exists(self, table_name: str) -> bool:
-        try:
-            if self._db.config.engine == DatabaseEngine.POSTGRESQL:
-                rows = self._db.execute("""
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_name = :table_name
-                    LIMIT 1
-                """, {"table_name": table_name})
-            else:
-                rows = self._db.execute("""
-                    SELECT 1 FROM information_schema.tables
-                    WHERE table_schema = :db_name AND table_name = :table_name
-                    LIMIT 1
-                """, {"db_name": self._db.config.database, "table_name": table_name})
-            return bool(rows)
-        except Exception:
-            return False
-
-    def _no_successful_topup_condition(self, user_id_ref: str) -> str:
-        if not self._table_exists("top_ups"):
-            return "1 = 0"
-        return f"""
-            NOT EXISTS (
-                SELECT 1 FROM top_ups tu
-                WHERE tu.user_id = {user_id_ref}
-                  AND (LOWER(tu.status) IN ('success', 'completed') OR tu.status = '1')
-            )
-        """
-
-    def _count_never_unpaid_users(self) -> int:
-        sql = f"""
-            SELECT COUNT(*) as cnt
-            FROM users u
-            WHERE u.deleted_at IS NULL
-              AND u.role != 100
-              AND u.request_count = 0
-              AND {self._no_successful_topup_condition("u.id")}
-        """
-        try:
-            result = self._db.execute(sql, {})
-            return int(result[0]["cnt"]) if result else 0
-        except Exception as e:
-            logger.db_error(f"统计未充值且从未请求用户失败: {e}")
-            return 0
 
     def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
         """根据 ID 获取用户信息"""
@@ -1088,14 +1034,12 @@ class UserManagementService:
                 """
                 params: Dict[str, Any] = {"cutoff": inactive_cutoff}
             elif activity_level == ActivityLevel.NEVER:
-                # 从未请求且未成功充值
-                find_sql = f"""
+                # 从未请求：request_count = 0
+                find_sql = """
                     SELECT u.id, u.username
                     FROM users u
                     WHERE u.deleted_at IS NULL
-                      AND u.role != 100
                       AND u.request_count = 0
-                      AND {self._no_successful_topup_condition("u.id")}
                 """
                 params = {}
             elif activity_level == ActivityLevel.INACTIVE:
@@ -1126,20 +1070,19 @@ class UserManagementService:
             usernames = [row.get("username", "") for row in result]
 
             if dry_run:
-                action = "彻底删除" if hard_delete else "注销"
                 return {
                     "success": True,
                     "dry_run": True,
                     "count": len(user_ids),
                     "users": usernames[:20],
-                    "message": f"预览：将{action} {len(user_ids)} 个用户",
+                    "message": f"预览：将{'彻底' if hard_delete else ''}删除 {len(user_ids)} 个用户",
                 }
 
             if not user_ids:
                 return {
                     "success": True,
                     "count": 0,
-                    "message": "没有需要处理的用户",
+                    "message": "没有需要删除的用户",
                 }
 
             # 执行批量删除
@@ -1156,7 +1099,7 @@ class UserManagementService:
             self._storage.cache_delete(STATS_CACHE_KEY)
             self.invalidate_activity_list_cache()
 
-            action = "彻底删除" if hard_delete else "注销"
+            action = "彻底删除" if hard_delete else "删除"
             logger.business(f"批量{action}不活跃用户", count=deleted_count, activity=activity_level.value, hard_delete=hard_delete)
 
             return {

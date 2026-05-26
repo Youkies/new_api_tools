@@ -12,7 +12,6 @@ import (
 func RegisterDashboardRoutes(r *gin.RouterGroup) {
 	g := r.Group("/dashboard")
 	{
-		g.GET("/snapshot", GetDashboardSnapshot)
 		g.GET("/overview", GetSystemOverview)
 		g.GET("/usage", GetUsageStatistics)
 		g.GET("/models", GetModelUsage)
@@ -25,23 +24,6 @@ func RegisterDashboardRoutes(r *gin.RouterGroup) {
 		g.GET("/system-info", GetDashboardSystemInfo)
 		g.GET("/ip-distribution", GetIPDistribution)
 	}
-}
-
-// GET /api/dashboard/snapshot
-func GetDashboardSnapshot(c *gin.Context) {
-	period := c.DefaultQuery("period", "24h")
-	trendDays, _ := strconv.Atoi(c.DefaultQuery("trend_days", "7"))
-	trendDays = clampInt(trendDays, 1, 90)
-	topLimit := parseLimit(c, 10, 200)
-	noCache := c.Query("no_cache") == "true"
-	svc := service.NewDashboardService()
-
-	data, err := svc.GetDashboardSnapshot(period, trendDays, topLimit, noCache)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"success": false, "error": gin.H{"message": err.Error()}})
-		return
-	}
-	c.JSON(http.StatusOK, gin.H{"success": true, "data": data})
 }
 
 // GET /api/dashboard/overview

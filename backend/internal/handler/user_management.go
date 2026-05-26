@@ -120,7 +120,7 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 		DryRun        bool   `json:"dry_run"`
 		HardDelete    bool   `json:"hard_delete"`
 	}
-	req.ActivityLevel = "never"
+	req.ActivityLevel = "very_inactive"
 	req.DryRun = true
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -135,8 +135,7 @@ func BatchDeleteInactiveUsers(c *gin.Context) {
 		return
 	}
 
-	message, _ := result["message"].(string)
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": message, "data": result})
+	c.JSON(http.StatusOK, gin.H{"success": true, "data": result})
 }
 
 // GET /api/users/soft-deleted/search

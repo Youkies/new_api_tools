@@ -76,32 +76,6 @@ interface RefreshEstimate {
   warning?: string
 }
 
-interface DataFreshness {
-  source: string
-  logs_max_created_at: number
-  lag_seconds: number
-  total_logs: number
-  status: 'fresh' | 'delayed' | 'stale' | 'empty' | 'unknown'
-}
-
-interface DashboardSnapshot {
-  period: string
-  snapshot_time: number
-  cache_hit: boolean
-  overview: SystemOverview
-  usage: UsageStatistics
-  models: ModelUsage[]
-  trends: DailyTrend[]
-  trends_kind: 'hourly' | 'daily'
-  top_users: Array<{ user_id: number; username: string; request_count: number; quota_used: number }>
-  data_freshness: DataFreshness
-  refresh_hint?: {
-    recommended_interval_seconds: number
-    reason: string
-    force_refresh_requires_confirm: boolean
-  }
-}
-
 type PeriodType = '24h' | '3d' | '7d' | '14d'
 
 export function Dashboard() {
@@ -130,9 +104,6 @@ export function Dashboard() {
   const [lastRefreshTime, setLastRefreshTime] = useState<Date | null>(null)
   const [showIntervalDropdown, setShowIntervalDropdown] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
-  const [dashboardFreshness, setDashboardFreshness] = useState<DataFreshness | null>(null)
-  const [snapshotTime, setSnapshotTime] = useState<number | null>(null)
-  const [snapshotCacheHit, setSnapshotCacheHit] = useState(false)
 
   // Ref to always call the latest handleRefresh from timer
   const handleRefreshRef = useRef<() => void>(() => { })
@@ -149,71 +120,6 @@ export function Dashboard() {
     'Content-Type': 'application/json',
     'Authorization': `Bearer ${token}`,
   }), [token])
-
-  const openAnalyticsDrilldown = useCallback((target: string) => {
-    const params = new URLSearchParams({
-      period,
-      source: 'dashboard',
-      target,
-    })
-    window.history.pushState(null, '', `/analytics?${params.toString()}`)
-    window.dispatchEvent(new PopStateEvent('popstate'))
-  }, [period])
-
-  const applyTopUsers = useCallback((topUsers: DashboardSnapshot['top_users'] = []) => {
-    if (topUsers.length > 0) {
-      const sortedByRequest = [...topUsers].sort((a, b) => b.request_count - a.request_count)
-      const sortedByQuota = [...topUsers].sort((a, b) => b.quota_used - a.quota_used)
-
-      setAnalyticsSummary({
-        request_king: sortedByRequest.length > 0 ? {
-          user_id: sortedByRequest[0].user_id,
-          username: sortedByRequest[0].username,
-          request_count: sortedByRequest[0].request_count,
-        } : null,
-        quota_king: sortedByQuota.length > 0 ? {
-          user_id: sortedByQuota[0].user_id,
-          username: sortedByQuota[0].username,
-          quota_used: sortedByQuota[0].quota_used,
-        } : null,
-      })
-    } else {
-      setAnalyticsSummary(null)
-    }
-  }, [])
-
-  const applySnapshot = useCallback((snapshot: DashboardSnapshot) => {
-    setOverview(snapshot.overview)
-    setUsage(snapshot.usage)
-    setModels(snapshot.models || [])
-    setDailyTrends(snapshot.trends || [])
-    applyTopUsers(snapshot.top_users || [])
-    setDashboardFreshness(snapshot.data_freshness || null)
-    setSnapshotTime(snapshot.snapshot_time || null)
-    setSnapshotCacheHit(Boolean(snapshot.cache_hit))
-    if (snapshot.snapshot_time) {
-      setLastRefreshTime(new Date(snapshot.snapshot_time * 1000))
-    }
-  }, [applyTopUsers])
-
-  const fetchSnapshot = useCallback(async (noCache = false, signal?: AbortSignal): Promise<boolean> => {
-    try {
-      const cacheParam = noCache ? '&no_cache=true' : ''
-      const trendDays = period === '3d' ? 3 : period === '7d' ? 7 : 14
-      const response = await fetch(
-        `${apiUrl}/api/dashboard/snapshot?period=${period}&trend_days=${trendDays}&top_limit=10${cacheParam}`,
-        { headers: getAuthHeaders(), signal },
-      )
-      const data = await response.json()
-      if (data.success) {
-        applySnapshot(data.data)
-        return true
-      }
-    } catch (error) {
-      console.error('Failed to fetch dashboard snapshot:', error)
-    }
-    return false
-  }, [apiUrl, applySnapshot, getAuthHeaders, period])
 
   const fetchOverview = useCallback(async (noCache = false, signal?: AbortSignal): Promise<boolean> => {
     try {
@@ -315,9 +221,6 @@ export function Dashboard() {
   }, [apiUrl, getAuthHeaders, period])
 
   const fetchAll = useCallback(async (noCache = false, signal?: AbortSignal): Promise<boolean> => {
-    const snapshotOk = await fetchSnapshot(noCache, signal)
-    if (snapshotOk) return true
-
     const results = await Promise.all([
       fetchOverview(noCache, signal),
       fetchUsage(noCache, signal),
@@ -326,12 +229,9 @@ export function Dashboard() {
       fetchAnalyticsSummary(noCache, signal),
     ])
     return results.every(Boolean)
-  }, [fetchSnapshot, fetchOverview, fetchUsage, fetchModels, fetchTrends, fetchAnalyticsSummary])
+  }, [fetchOverview, fetchUsage, fetchModels, fetchTrends, fetchAnalyticsSummary])
 
   const refreshAll = useCallback(async (signal?: AbortSignal): Promise<boolean> => {
-    const snapshotOk = await fetchSnapshot(true, signal)
-    if (snapshotOk) return true
-
     const results = await Promise.all([
       fetchOverview(true, signal),
       fetchUsage(true, signal),
@@ -340,7 +240,7 @@ export function Dashboard() {
       fetchAnalyticsSummary(true, signal),
     ])
     return results.every(Boolean)
-  }, [fetchSnapshot, fetchOverview, fetchUsage, fetchModels, fetchTrends, fetchAnalyticsSummary])
+  }, [fetchOverview, fetchUsage, fetchModels, fetchTrends, fetchAnalyticsSummary])
 
   // 获取系统规模信息（仅首次加载）
   const fetchSystemInfo = useCallback(async () => {
@@ -538,35 +438,6 @@ export function Dashboard() {
     return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
   }
 
-  const formatUnixTime = (ts?: number | null) => {
-    if (!ts) return '暂无'
-    return new Date(ts * 1000).toLocaleString('zh-CN', {
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    })
-  }
-
-  const formatFreshnessLag = (seconds?: number) => {
-    if (!seconds || seconds <= 0) return '实时'
-    if (seconds < 60) return `${seconds} 秒`
-    if (seconds < 3600) return `${Math.round(seconds / 60)} 分钟`
-    return `${(seconds / 3600).toFixed(1)} 小时`
-  }
-
-  const getFreshnessLabel = () => {
-    if (!dashboardFreshness) return '未获取'
-    switch (dashboardFreshness.status) {
-      case 'fresh': return '新鲜'
-      case 'delayed': return '轻微延迟'
-      case 'stale': return '延迟较高'
-      case 'empty': return '无日志'
-      default: return '未知'
-    }
-  }
-
   const getIntervalLabel = (interval: RefreshInterval) => {
     switch (interval) {
       case 0: return '关闭'
@@ -685,25 +556,6 @@ export function Dashboard() {
         <div>
           <h2 className="text-3xl font-bold tracking-tight">仪表盘</h2>
           <p className="text-muted-foreground mt-1">系统运行状态与实时数据概览</p>
-          <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-            <span className="inline-flex items-center gap-1 rounded-full border bg-background px-2 py-1">
-              <Clock className="h-3 w-3" />
-              快照：{formatUnixTime(snapshotTime)}
-            </span>
-            <span className="inline-flex items-center gap-1 rounded-full border bg-background px-2 py-1">
-              <Database className="h-3 w-3" />
-              最近日志：{formatUnixTime(dashboardFreshness?.logs_max_created_at)}
-            </span>
-            <span className="inline-flex items-center gap-1 rounded-full border bg-background px-2 py-1">
-              <Activity className="h-3 w-3" />
-              {getFreshnessLabel()} · 延迟 {formatFreshnessLag(dashboardFreshness?.lag_seconds)}
-            </span>
-            {snapshotCacheHit && (
-              <span className="inline-flex items-center gap-1 rounded-full border bg-background px-2 py-1">
-                缓存命中
-              </span>
-            )}
-          </div>
         </div>
         <div className="flex items-center gap-3 flex-wrap">
           {/* 刷新按钮和自动刷新控制 */}
@@ -839,7 +691,6 @@ export function Dashboard() {
             icon={BarChart3}
             color="indigo"
             variant="compact"
-            onClick={() => openAnalyticsDrilldown('requests')}
           />
           <StatCard
             title="消耗额度"
@@ -848,7 +699,6 @@ export function Dashboard() {
             icon={Zap}
             color="amber"
             variant="compact"
-            onClick={() => openAnalyticsDrilldown('quota')}
           />
           <StatCard
             title="总 Token"
@@ -880,7 +730,6 @@ export function Dashboard() {
             icon={Clock}
             color="rose"
             variant="compact"
-            onClick={() => openAnalyticsDrilldown('latency')}
           />
         </div>
       </section>
@@ -974,10 +823,9 @@ interface StatCardProps {
   color: string
   variant?: 'default' | 'compact'
   customLabel?: string
-  onClick?: () => void
 }
 
-function StatCard({ title, value, rawValue, subValue, icon: Icon, color, variant = 'default', customLabel, onClick }: StatCardProps) {
+function StatCard({ title, value, rawValue, subValue, icon: Icon, color, variant = 'default', customLabel }: StatCardProps) {
   // Map color names to Tailwind classes
   const colorMap: Record<string, { bg: string, text: string, ring: string }> = {
     blue: { bg: 'bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300', text: 'text-blue-600', ring: 'group-hover:ring-blue-200' },
@@ -1000,18 +848,7 @@ function StatCard({ title, value, rawValue, subValue, icon: Icon, color, variant
     const valueStr = String(value)
     const fontSize = valueStr.length > 14 ? 'text-sm' : valueStr.length > 10 ? 'text-base' : valueStr.length > 7 ? 'text-lg' : 'text-xl'
     return (
-      <Card
-        className={cn("glass-card overflow-hidden hover:shadow-lg hover:-translate-y-0.5 transition-all duration-300 group border-l-4", onClick && "cursor-pointer", `border-l-${color}-500`)}
-        onClick={onClick}
-        role={onClick ? "button" : undefined}
-        tabIndex={onClick ? 0 : undefined}
-        onKeyDown={(event) => {
-          if (onClick && (event.key === 'Enter' || event.key === ' ')) {
-            event.preventDefault()
-            onClick()
-          }
-        }}
-      >
+      <Card className={cn("glass-card overflow-hidden hover:shadow-lg hover:-translate-y-0.5 transition-all duration-300 group border-l-4", `border-l-${color}-500`)}>
         <CardContent className="p-4 flex items-center justify-between relative overflow-hidden">
           <div className={cn("absolute -right-4 -top-4 w-16 h-16 rounded-full opacity-10 group-hover:opacity-20 transition-opacity duration-300 blur-xl", theme.bg.split(' ')[0])} />
           <div className="space-y-1 min-w-0 flex-1 mr-2 relative z-10">
@@ -1032,18 +869,7 @@ function StatCard({ title, value, rawValue, subValue, icon: Icon, color, variant
   }
 
   return (
-    <Card
-      className={cn("glass-card overflow-hidden hover:shadow-lg hover:-translate-y-1 transition-all duration-300 group", onClick && "cursor-pointer")}
-      onClick={onClick}
-      role={onClick ? "button" : undefined}
-      tabIndex={onClick ? 0 : undefined}
-      onKeyDown={(event) => {
-        if (onClick && (event.key === 'Enter' || event.key === ' ')) {
-          event.preventDefault()
-          onClick()
-        }
-      }}
-    >
+    <Card className="glass-card overflow-hidden hover:shadow-lg hover:-translate-y-1 transition-all duration-300 group">
       <CardContent className="p-5 relative overflow-hidden">
         <div className={cn("absolute -right-6 -top-6 w-24 h-24 rounded-full opacity-10 group-hover:opacity-20 transition-opacity duration-300 blur-2xl", theme.bg.split(' ')[0])} />
         <div className="flex justify-between items-start relative z-10">

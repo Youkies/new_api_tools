@@ -7,16 +7,12 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/new-api-tools/backend/internal/cache"
-	"github.com/new-api-tools/backend/internal/config"
 	"github.com/new-api-tools/backend/internal/database"
 	"github.com/new-api-tools/backend/internal/logger"
 )
@@ -27,26 +23,6 @@ const (
 	defaultMaxIterations = 100
 	defaultQuotaPerUSD   = 500000
 )
-
-type LogExportJob struct {
-	mu                 sync.Mutex
-	ID                 string
-	Status             string
-	Format             string
-	Filename           string
-	FilePath           string
-	RowsWritten        int64
-	EstimatedTotalRows int64
-	FileSize           int64
-	ErrorMessage       string
-	CreatedAt          int64
-	UpdatedAt          int64
-	CompletedAt        int64
-	ExpiresAt          int64
-	Options            LogExportOptions
-}
-
-var logExportJobs sync.Map
 
 // LogExportOptions controls direct log exports from the logs table.
 type LogExportOptions struct {
@@ -288,8 +264,8 @@ func (s *LogAnalyticsService) GetSummary() (map[string]interface{}, error) {
 	}, nil
 }
 
-// ProcessLogs clears caches and returns actual total count.
-// In Go implementation, data is queried live from DB; this endpoint refreshes analytics caches.
+// ProcessLogs clears caches and returns actual total count
+// In Go implementation, data is queried live from DB — "processing" means refreshing cache
 func (s *LogAnalyticsService) ProcessLogs() (map[string]interface{}, error) {
 	s.clearAllCaches()
 
@@ -305,15 +281,13 @@ func (s *LogAnalyticsService) ProcessLogs() (map[string]interface{}, error) {
 		maxID = toInt64(row["max_id"])
 	}
 
-	logger.L.Business(fmt.Sprintf("日志分析缓存已刷新，共 %d 条日志", total))
+	logger.L.Business(fmt.Sprintf("日志分析处理完成，共 %d 条日志", total))
 
 	return map[string]interface{}{
 		"success":        true,
-		"action":         "cache_refresh",
 		"processed":      total,
-		"message":        "已刷新统计缓存，Go 后端直接从 logs 表读取数据",
+		"message":        "Analytics cache refreshed, data will reload on next query",
 		"last_log_id":    maxID,
-		"total_logs":     total,
 		"users_updated":  0,
 		"models_updated": 0,
 	}, nil
@@ -348,10 +322,8 @@ func (s *LogAnalyticsService) BatchProcess(maxIterations int) (map[string]interf
 	}
 
 	return map[string]interface{}{
-		"action":           "cache_refresh",
 		"success":          true,
 		"total_processed":  total,
-		"message":          "已刷新统计缓存，Go 后端直接从 logs 表读取数据",
 		"iterations":       1,
 		"batch_size":       defaultBatchSize,
 		"elapsed_seconds":  math.Round(elapsed*100) / 100,
@@ -420,156 +392,6 @@ func (s *LogAnalyticsService) CheckDataConsistency(autoReset bool) (map[string]i
 		"needs_reset":       false,
 		"details":           syncStatus,
 	}, nil
-}
-
-// StartLogExportJob starts a background export job and returns its initial status.
-func (s *LogAnalyticsService) StartLogExportJob(format string, opts LogExportOptions) (map[string]interface{}, error) {
-	format = strings.ToLower(strings.TrimSpace(format))
-	if format != "json" {
-		format = "csv"
-	}
-	jobID := fmt.Sprintf("export-%d", time.Now().UnixNano())
-	dataDir := strings.TrimSpace(config.Get().DataDir)
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-	exportDir := filepath.Join(dataDir, "analytics_exports")
-	if err := os.MkdirAll(exportDir, 0o700); err != nil {
-		return nil, err
-	}
-
-	filename := fmt.Sprintf("newapi_logs_%s.%s", time.Now().Format("20060102_150405"), format)
-	job := &LogExportJob{
-		ID:        jobID,
-		Status:    "queued",
-		Format:    format,
-		Filename:  filename,
-		FilePath:  filepath.Join(exportDir, jobID+"."+format),
-		CreatedAt: time.Now().Unix(),
-		UpdatedAt: time.Now().Unix(),
-		ExpiresAt: time.Now().Add(24 * time.Hour).Unix(),
-		Options:   opts,
-	}
-	logExportJobs.Store(jobID, job)
-
-	go s.runLogExportJob(job)
-	return job.ToMap(), nil
-}
-
-// GetLogExportJob returns a job status snapshot.
-func (s *LogAnalyticsService) GetLogExportJob(jobID string) (map[string]interface{}, error) {
-	value, ok := logExportJobs.Load(jobID)
-	if !ok {
-		return nil, fmt.Errorf("export job not found")
-	}
-	return value.(*LogExportJob).ToMap(), nil
-}
-
-// GetLogExportJobFile returns metadata for downloading a completed export file.
-func (s *LogAnalyticsService) GetLogExportJobFile(jobID string) (string, string, string, error) {
-	value, ok := logExportJobs.Load(jobID)
-	if !ok {
-		return "", "", "", fmt.Errorf("export job not found")
-	}
-	job := value.(*LogExportJob)
-	job.mu.Lock()
-	defer job.mu.Unlock()
-	if job.Status != "completed" {
-		return "", "", "", fmt.Errorf("export job is not completed")
-	}
-	mime := "text/csv; charset=utf-8"
-	if job.Format == "json" {
-		mime = "application/json; charset=utf-8"
-	}
-	return job.FilePath, job.Filename, mime, nil
-}
-
-func (s *LogAnalyticsService) runLogExportJob(job *LogExportJob) {
-	job.setStatus("running", "")
-
-	rows, err := s.OpenLogExport(context.Background(), job.Options)
-	if err != nil {
-		job.setStatus("failed", err.Error())
-		return
-	}
-
-	file, err := os.Create(job.FilePath)
-	if err != nil {
-		_ = rows.Close()
-		job.setStatus("failed", err.Error())
-		return
-	}
-	defer file.Close()
-
-	if job.Format == "json" {
-		rowsWritten, writeErr := s.WriteLogExportJSON(rows, file, job.Options)
-		job.setProgress(rowsWritten, 0)
-		err = writeErr
-	} else {
-		_, _ = file.Write([]byte{0xEF, 0xBB, 0xBF})
-		rowsWritten, writeErr := s.WriteLogExportCSV(rows, file, job.Options)
-		job.setProgress(rowsWritten, 0)
-		err = writeErr
-	}
-	if err != nil {
-		job.setStatus("failed", err.Error())
-		return
-	}
-	if stat, statErr := file.Stat(); statErr == nil {
-		job.setProgress(0, stat.Size())
-	}
-	job.setStatus("completed", "")
-}
-
-func (j *LogExportJob) setStatus(status, message string) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	now := time.Now().Unix()
-	j.Status = status
-	j.ErrorMessage = message
-	j.UpdatedAt = now
-	if status == "completed" || status == "failed" || status == "cancelled" {
-		j.CompletedAt = now
-	}
-}
-
-func (j *LogExportJob) setProgress(rowsWritten int64, fileSize int64) {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	if rowsWritten > 0 {
-		j.RowsWritten = rowsWritten
-	}
-	if fileSize > 0 {
-		j.FileSize = fileSize
-	}
-	j.UpdatedAt = time.Now().Unix()
-}
-
-func (j *LogExportJob) ToMap() map[string]interface{} {
-	j.mu.Lock()
-	defer j.mu.Unlock()
-	progress := 0.0
-	if j.Status == "completed" {
-		progress = 1
-	} else if j.Status == "running" {
-		progress = 0.5
-	}
-	return map[string]interface{}{
-		"job_id":               j.ID,
-		"status":               j.Status,
-		"format":               j.Format,
-		"filename":             j.Filename,
-		"rows_written":         j.RowsWritten,
-		"estimated_total_rows": j.EstimatedTotalRows,
-		"progress":             progress,
-		"file_size":            j.FileSize,
-		"error_message":        j.ErrorMessage,
-		"created_at":           j.CreatedAt,
-		"updated_at":           j.UpdatedAt,
-		"completed_at":         j.CompletedAt,
-		"expires_at":           j.ExpiresAt,
-		"download_url":         fmt.Sprintf("/api/analytics/export-jobs/%s/download", j.ID),
-	}
 }
 
 // clearAllCaches removes all analytics-related caches

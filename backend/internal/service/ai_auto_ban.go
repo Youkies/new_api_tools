@@ -393,20 +393,6 @@ func (s *AIAutoBanService) assessUserHeuristically(userID int64, window string, 
 		score = 10
 	}
 
-	evidenceSummary := append([]string{}, reasons...)
-	if totalRequests > 0 {
-		evidenceSummary = append(evidenceSummary, fmt.Sprintf("%s 内请求 %d 次", window, totalRequests))
-	}
-	if uniqueIPs > 0 {
-		evidenceSummary = append(evidenceSummary, fmt.Sprintf("使用 %d 个不同 IP", uniqueIPs))
-	}
-	if failureRate > 0 {
-		evidenceSummary = append(evidenceSummary, fmt.Sprintf("失败率 %.1f%%", failureRate*100))
-	}
-	if maxSharedIPUsers > 0 {
-		evidenceSummary = append(evidenceSummary, fmt.Sprintf("单 IP 最多关联 %d 个用户", maxSharedIPUsers))
-	}
-
 	confidence := 0.45 + float64(score)*0.045
 	if sharedIPCount > 0 {
 		confidence += 0.08
@@ -430,24 +416,6 @@ func (s *AIAutoBanService) assessUserHeuristically(userID int64, window string, 
 		action = "warn"
 	}
 
-	falsePositiveRisk := "medium"
-	if score >= 9 && confidence >= 0.9 && (maxSharedIPUsers >= 10 || rapidSwitches >= 8) {
-		falsePositiveRisk = "low"
-	} else if score <= 4 || (sharedIPCount == 0 && uniqueIPs <= 3) {
-		falsePositiveRisk = "high"
-	}
-
-	questionsForAdmin := []string{
-		"该用户是否为已知企业客户或高并发业务账号？",
-		"相关 IP 是否来自可信代理、企业出口或服务器集群？",
-	}
-	if sharedIPCount > 0 {
-		questionsForAdmin = append(questionsForAdmin, "同 IP 关联用户之间是否存在正常团队或公司关系？")
-	}
-	if failureRate >= 0.5 {
-		questionsForAdmin = append(questionsForAdmin, "高失败率是否由渠道故障或模型异常引起？")
-	}
-
 	username := ""
 	if user != nil {
 		username = toString(user["username"])
@@ -464,10 +432,6 @@ func (s *AIAutoBanService) assessUserHeuristically(userID int64, window string, 
 		"action":                action,
 		"policy":                "pending_review_first",
 		"username":              username,
-		"evidence_summary":      evidenceSummary,
-		"false_positive_risk":   falsePositiveRisk,
-		"questions_for_admin":   questionsForAdmin,
-		"prompt_version":        "heuristic-risk-v2",
 		"risk_flags":            riskFlags,
 		"total_requests":        totalRequests,
 		"unique_ips":            uniqueIPs,
@@ -498,10 +462,6 @@ func (s *AIAutoBanService) queuePendingReview(userID int64, username, window, so
 		"confidence":          assessment["confidence"],
 		"reason":              assessment["reason"],
 		"action":              assessment["action"],
-		"evidence_summary":    assessment["evidence_summary"],
-		"false_positive_risk": assessment["false_positive_risk"],
-		"questions_for_admin": assessment["questions_for_admin"],
-		"prompt_version":      assessment["prompt_version"],
 		"risk_flags":          assessment["risk_flags"],
 		"total_requests":      assessment["total_requests"],
 		"unique_ips":          assessment["unique_ips"],
