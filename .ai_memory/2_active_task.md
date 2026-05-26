@@ -21,7 +21,7 @@
   - AI 复核输出新增 `evidence_summary`、`false_positive_risk`、`questions_for_admin`、`prompt_version`，前端已展示。
   - 多用户共享 IP 已升级为小号证据链的一部分：前端按用户聚集度、未封禁数量、令牌密度、请求量、首次出现跨度、充值线索计算风险等级；Go/Python `/api/ip/shared-users` 已补充未封禁数、用户已用额度、总调用数和成功充值次数。
   - 共享 IP 小号案件新增 AI 兼容研判：Go/Python `/api/ai-ban/assess-shared-ip` 保留；Prompt 版本 `shared-ip-alt-account-v1`，后端对模型返回的分数、动作、误报风险和数组字段做归一化。
-  - 小号风险案件 v1 已落地并收敛为统一工作台：Go/Python 新增 `/api/risk/alt-account/cases`、详情和 `/{case_id}/assess`；规则层实时生成共享 IP、30d 轮换账号池、邀请链、Token 轮换四类案件；前端 `AltAccountCasesPanel` 支持完整 IP、展开用户、AI 行内研判、封禁全部、撤销上一次、单用户分析/封禁。
+  - ~~小号风险案件 v1 已落地并收敛为统一工作台~~（**2026-05-27 已 revert，等待重做**）：原方案在 Go/Python 新增 `/api/risk/alt-account/cases`、详情和 `/{case_id}/assess`；规则层实时生成共享 IP、30d 轮换账号池、邀请链、Token 轮换四类案件；前端 `AltAccountCasesPanel`。v1 实现不符合预期，方向不变，需重新设计后再做。保留的基础设施可复用：`/api/ip/shared-users`（用户维度查询）、`/api/risk/queue`（风险队列）、`/api/risk/actions/batches`（批量动作可撤销）、AI 复核 schema（evidence_summary/false_positive_risk/questions_for_admin/prompt_version）。
 - 日志分析：
   - Go `/api/analytics/process` 和 `/batch` 文案/响应语义改为“刷新统计缓存”。
   - Go/Python 新增 `/api/analytics/export-jobs`、状态查询和下载接口。
@@ -49,8 +49,9 @@
 
 - 新讨论方向：运营预警/运营健康预案。用户关注“高消费用户突然不使用、不充值”这类运营异常，需要先形成产品预案；用户倾向单独做一个页面，建议定位为“运营预警/运营健康”独立页面，并与仪表盘异常入口、日志分析、用户画像和支付异常联动，而不是并入自动封禁。收入/毛利异常暂不纳入 v1，因为当前没有接入上游真实价格系统，避免输出不可靠的成本/利润判断。运营预警页点开用户详情时应直接展示注册邮箱，便于管理员联系；注意邮箱只做管理员详情字段，不发送给外部 AI、不默认导出。
 - 风控中心 `RealtimeRanking.tsx` 已完成共享 IP 证据链并入小号案件工作台；仍需继续拆风险队列、AI 面板、审计记录和 hooks。
-- 小号案件 AI 结果仍可继续组件化，后续可拆为 `AltAccountAIResultCard` 或放入 `AltAccountCaseList` 体系。
-- 小号风控下一阶段应按 `docs/ai-risk-alt-account-requirements.md` 实现案件持久化表、AI 研判历史、处置状态、管理员反馈闭环和后台定时扫描。
+- ~~小号案件 AI 结果仍可继续组件化，后续可拆为 `AltAccountAIResultCard` 或放入 `AltAccountCaseList` 体系。~~（与小号案件工作台一并搁置，待重做时一并考虑）
+- ~~小号风控下一阶段应按 `docs/ai-risk-alt-account-requirements.md` 实现案件持久化表、AI 研判历史、处置状态、管理员反馈闭环和后台定时扫描。~~（v1 已 revert，下一版重新设计需求文档可能也需要重写）
+- **下一步：重做「小号风险案件 + AI 研判」**。v1 不符合预期的具体点尚未明确记录；新方案需先澄清 v1 哪里不对，再决定数据结构、规则层、UI 形态。
 - 运营预警下一阶段可将“已处理/忽略/观察中”从前端 localStorage 升级为服务端持久化，并增加阈值配置页。
 - 真正的 `api_tools_usage_rollup_hourly/daily` 增量聚合表仍未落地。
 - 日志分析的失败率、耗时、消费突增异常视图仍未新增。
